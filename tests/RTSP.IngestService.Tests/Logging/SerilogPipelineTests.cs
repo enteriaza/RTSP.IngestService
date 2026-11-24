@@ -1,0 +1,188 @@
+// Tests for the Serilog pipeline: file-sink activation per hosting mode, log path resolution, structured JSON file
+// output with the identity properties, and the journald-oriented systemd console formatter.
+
+using System.Text.Json;
+using Microsoft.Extensions.Hosting;
+using RTSP.IngestService.Configuration;
+using RTSP.IngestService.Hosting;
+using RTSP.IngestService.Logging;
+using Serilog.Events;
+using Serilog.Parsing;
+
+namespace RTSP.IngestService.Tests.Logging;
+
+/// <summary>
+/// Tests for <see cref="SerilogPipeline"/> and <see cref="SystemdConsoleFormatter"/>.
+/// </summary>
+public sealed class SerilogPipelineTests : IDisposable
+{
+    /// <summary>Per-test temporary directory used as content root for file sink tests.</summary>
+    private readonly string _directory = Path.Combine(Path.GetTempPath(), "rtsp-ingest-service-tests", Guid.NewGuid().ToString("N"));
+
+    /// <summary>Verifies the file-sink activation matrix for every file logging and hosting mode combination.</summary>
+    /// <param name="fileMode">The configured file logging mode.</param>
+    /// <param name="hostingMode">The hosting mode.</param>
+    /// <param name="expected">Whether the file sink is enabled.</param>
+    [Theory]
+    [InlineData(FileLoggingMode.Auto, HostingMode.WindowsService, true)]
+    [InlineData(FileLoggingMode.Auto, HostingMode.Console, false)]
+    [InlineData(FileLoggingMode.Auto, HostingMode.Systemd, false)]
+    [InlineData(FileLoggingMode.Enabled, HostingMode.Console, true)]
+    [InlineData(FileLoggingMode.Enabled, HostingMode.Systemd, true)]
+    [InlineData(FileLoggingMode.Disabled, HostingMode.WindowsService, false)]
+    public void IsFileLoggingEnabled_FollowsModeMatrix(FileLoggingMode fileMode, HostingMode hostingMode, bool expected) =>
+        Assert.Equal(expected, SerilogPipeline.IsFileLoggingEnabled(fileMode, hostingMode));
+
+    /// <summary>Verifies that relative log paths resolve against the content root and absolute paths are kept.</summary>
+    [Fact]
+    public void ResolveLogFilePath_HandlesRelativeAndAbsolutePaths()
+    {
+        var contentRoot = Path.Combine(_directory, "app");
+        var absolute = Path.Combine(_directory, "elsewhere", "x-.log");
+
+        Assert.Equal(Path.Combine(contentRoot, "logs", "service-.log"), SerilogPipeline.ResolveLogFilePath("logs/service-.log", contentRoot));
+        Assert.Equal(absolute, SerilogPipeline.ResolveLogFilePath(absolute, contentRoot));
+    }
+
+    /// <summary>
+    /// Verifies that with file logging enabled the log directory is created and each event is written as a JSON line
+    /// carrying the rendered message and the Application, Environment and HostingMode properties.
+    /// </summary>
+    [Fact]
+    public void CreateLogger_FileEnabled_WritesStructuredJson()
+    {
+        var environment = new TestEnvironment { EnvironmentName = "Staging", ContentRootPath = _directory };
+        var fileOptions = new FileLoggingOptions { Mode = FileLoggingMode.Enabled, Path = "nested/logs/test-.log" };
+
+        using (var logger = SerilogPipeline.CreateLogger(new ApplicationOptions { Name = "PipelineTest" }, fileOptions, environment, HostingMode.WindowsService))
+        {
+            Assert.True(Directory.Exists(Path.Combine(_directory, "nested", "logs")));
+            logger.Information("Processed {Count} items", 3);
+        }
+
+        var line = Assert.Single(File.ReadAllLines(Assert.Single(Directory.GetFiles(Path.Combine(_directory, "nested", "logs")))));
+        using var json = JsonDocument.Parse(line);
+        var root = json.RootElement;
+        Assert.Equal("Processed 3 items", root.GetProperty("RenderedMessage").GetString());
+        var properties = root.GetProperty("Properties");
+        Assert.Equal(3, properties.GetProperty("Count").GetInt32());
+        Assert.Equal("PipelineTest", properties.GetProperty("Application").GetString());
+        Assert.Equal("Staging", properties.GetProperty("Environment").GetString());
+        Assert.Equal("WindowsService", properties.GetProperty("HostingMode").GetString());
+    }
+
+    /// <summary>Verifies that no file is written when file logging is disabled.</summary>
+    [Fact]
+    public void CreateLogger_FileDisabled_WritesNoFile()
+    {
+        var environment = new TestEnvironment { ContentRootPath = _directory };
+        var fileOptions = new FileLoggingOptions { Mode = FileLoggingMode.Disabled, Path = "logs/test-.log" };
+
+        using (var logger = SerilogPipeline.CreateLogger(new ApplicationOptions { Name = "PipelineTest" }, fileOptions, environment, HostingMode.WindowsService))
+        {
+            logger.Information("Not written to a file");
+        }
+
+        Assert.False(Directory.Exists(Path.Combine(_directory, "logs")));
+    }
+
+    /// <summary>Verifies the syslog priority mapping used for journald.</summary>
+    /// <param name="level">The Serilog level.</param>
+    /// <param name="priority">The expected syslog priority.</param>
+    [Theory]
+    [InlineData(LogEventLevel.Verbose, 7)]
+    [InlineData(LogEventLevel.Debug, 7)]
+    [InlineData(LogEventLevel.Information, 6)]
+    [InlineData(LogEventLevel.Warning, 4)]
+    [InlineData(LogEventLevel.Error, 3)]
+    [InlineData(LogEventLevel.Fatal, 2)]
+    public void SystemdFormatter_MapsSyslogPriority(LogEventLevel level, int priority) =>
+        Assert.Equal(priority, SystemdConsoleFormatter.GetSyslogPriority(level));
+
+    /// <summary>
+    /// Verifies that the systemd formatter writes one priority-prefixed line containing the source context, message
+    /// and the folded exception, terminated by a single newline.
+    /// </summary>
+    [Fact]
+    public void SystemdFormatter_WritesSingleLineWithPriorityPrefix()
+    {
+        Exception exception;
+        try
+        {
+            throw new InvalidOperationException("line one" + Environment.NewLine + "line two");
+        }
+        catch (InvalidOperationException ex)
+        {
+            exception = ex;
+        }
+
+        var logEvent = new LogEvent(
+            DateTimeOffset.UnixEpoch,
+            LogEventLevel.Error,
+            exception,
+            new MessageTemplateParser().Parse("Failed after {Attempts} attempts"),
+            [
+                new LogEventProperty("Attempts", new ScalarValue(3)),
+                new LogEventProperty("SourceContext", new ScalarValue("RTSP.IngestService.Test")),
+            ]);
+        using var output = new StringWriter();
+
+        new SystemdConsoleFormatter().Format(logEvent, output);
+
+        var text = output.ToString();
+        Assert.StartsWith("<3>RTSP.IngestService.Test: Failed after 3 attempts System.InvalidOperationException: line one line two", text, StringComparison.Ordinal);
+        Assert.EndsWith("\n", text, StringComparison.Ordinal);
+        Assert.Equal(1, text.Count(static c => c == '\n'));
+        Assert.DoesNotContain('\r', text);
+    }
+
+    /// <summary>
+    /// Verifies that the systemd formatter renders string, enum and TimeSpan property values without quotes, matching
+    /// the console output.
+    /// </summary>
+    [Fact]
+    public void SystemdFormatter_RendersScalarValuesUnquoted()
+    {
+        var logEvent = new LogEvent(
+            DateTimeOffset.UnixEpoch,
+            LogEventLevel.Information,
+            exception: null,
+            new MessageTemplateParser().Parse("{Name} in {Mode} mode after {Elapsed}"),
+            [
+                new LogEventProperty("Name", new ScalarValue("svc")),
+                new LogEventProperty("Mode", new ScalarValue(HostingMode.Systemd)),
+                new LogEventProperty("Elapsed", new ScalarValue(TimeSpan.FromSeconds(90))),
+                new LogEventProperty("SourceContext", new ScalarValue("RTSP.IngestService.Test")),
+            ]);
+        using var output = new StringWriter();
+
+        new SystemdConsoleFormatter().Format(logEvent, output);
+
+        Assert.Equal("<6>RTSP.IngestService.Test: svc in Systemd mode after 00:01:30\n", output.ToString());
+    }
+
+    /// <summary>Deletes the temporary directory.</summary>
+    public void Dispose()
+    {
+        if (Directory.Exists(_directory))
+        {
+            Directory.Delete(_directory, recursive: true);
+        }
+    }
+
+    /// <summary>Minimal host environment for pipeline tests.</summary>
+    private sealed class TestEnvironment : IHostEnvironment
+    {
+        /// <inheritdoc />
+        public string EnvironmentName { get; set; } = "Testing";
+
+        /// <inheritdoc />
+        public string ApplicationName { get; set; } = "RTSP.IngestService.Tests";
+
+        /// <inheritdoc />
+        public string ContentRootPath { get; set; } = AppContext.BaseDirectory;
+
+        /// <inheritdoc />
+        public Microsoft.Extensions.FileProviders.IFileProvider ContentRootFileProvider { get; set; } = new Microsoft.Extensions.FileProviders.NullFileProvider();
+    }
+}

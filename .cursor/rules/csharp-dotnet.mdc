@@ -1,0 +1,18 @@
+---
+description: C# / .NET conventions for NMS source and tests
+globs: "**/*.{cs,csproj}"
+alwaysApply: false
+---
+
+# C# and .NET
+
+- Target `net10.0` unless an existing project documents otherwise.
+- Keep nullable reference types and implicit usings enabled.
+- Prefer `TreatWarningsAsErrors` and modern analysis levels on production projects.
+- Use constructor injection and options validation (`ValidateOnStart` / data annotations) for host apps.
+- Prefer structured logging; do not log secrets or connection strings.
+- Honor `CancellationToken` on async APIs; do not invent fire-and-forget work without ownership.
+- Dispose/`await using` owned resources; document shared ownership explicitly.
+- Treat concurrency and thread-safety as part of the contract, not an afterthought.
+- Performance-sensitive paths need measured evidence before micro-optimization claims.
+- Do not add NuGet packages without a concrete need; prefer framework packages already in use.

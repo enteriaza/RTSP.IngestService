@@ -1,0 +1,13 @@
+---
+description: Git and change-management discipline for NMS agent work
+alwaysApply: true
+---
+
+# Git discipline
+
+- Never stage, commit, or push unless the user explicitly instructs it.
+- Never reset, clean, stash, or discard unrelated working-tree changes.
+- Preserve existing staged changes (including staged deletions).
+- Review the diff before claiming completion.
+- Avoid unrelated refactoring and silent contract changes.
+- Do not modify reference repositories used only for study.

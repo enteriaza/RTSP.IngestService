@@ -1,0 +1,50 @@
+# systemd unit for RTSP.IngestService. Install to /etc/systemd/system/rtsp-ingest-service.service.
+# See docs/deployment/linux.md for installation, verification and operations.
+
+[Unit]
+Description=RTSP Ingest Service
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# The host sends READY=1 once every hosted service has started and STOPPING=1 when shutdown begins.
+Type=notify
+NotifyAccess=main
+ExecStart=/opt/rtsp-ingest-service/RTSP.IngestService
+WorkingDirectory=/opt/rtsp-ingest-service
+User=rtsp-ingest-service
+Group=rtsp-ingest-service
+Environment=DOTNET_ENVIRONMENT=Production
+
+# Must exceed Lifetime:StartupTimeout and Lifetime:ShutdownTimeout in appsettings.json.
+TimeoutStartSec=90
+TimeoutStopSec=45
+KillSignal=SIGTERM
+KillMode=mixed
+
+# The service sends WATCHDOG=1 every WatchdogSec/2 while it is starting, running or stopping.
+WatchdogSec=30
+
+# Restart after crashes, failures and watchdog timeouts, but not after configuration errors (EX_CONFIG).
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=78
+
+SyslogIdentifier=rtsp-ingest-service
+
+# Hardening.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+---
+description: Configuration, credentials, and security conventions for NMS
+alwaysApply: true
+---
+
+# Configuration and credentials
+
+Established convention (do not redesign):
+
+| File | Role | Git |
+|------|------|-----|
+| `appsettings.json` | Non-sensitive defaults | Tracked |
+| `appsettings.Development.json` | Local Development credentials | **Ignored** |
+| `appsettings.Production.json` | Local Production credentials | **Ignored** |
+| `appsettings.*.example.json` | Templates with `CHANGE_ME` | Tracked |
+
+Rules:
+
+- Do not introduce environment-variable-based credential storage, User Secrets, or encrypted secret stores unless the user explicitly redesigns this.
+- Do not commit real credentials or print them in logs/reports.
+- Development configuration must remain available for local `dotnet run` / IDE execution and must **never** be copied into publish output (`CopyToPublishDirectory=Never`).
+- Production configuration follows each project's existing deployment packaging convention.
+- Local protection is filesystem permissions on ignored JSON files.

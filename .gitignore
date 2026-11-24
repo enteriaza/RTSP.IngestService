@@ -1,0 +1,14 @@
+bin/
+obj/
+/packages/
+riderModule.iml
+/_ReSharper.Caches/
+
+# Generated evidence and on-demand release packages
+/.artifacts/
+/release/
+TestResults/
+
+# Local environment configuration (tracked templates use *.example.json)
+appsettings.Development.json
+appsettings.Production.json
