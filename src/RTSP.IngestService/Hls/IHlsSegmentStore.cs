@@ -119,8 +119,12 @@ public interface IHlsSegmentStore
     /// <param name="streamIdentity">The non-secret stream identity.</param>
     /// <param name="targetDurationSeconds">The playlist's <c>#EXT-X-TARGETDURATION</c>, fixed for its lifetime.</param>
     /// <param name="numbering">The numbering the writer must use for segment sequence numbers and URIs.</param>
+    /// <param name="incarnationId">
+    /// The publication's public incarnation identifier, reported on the stream's playlist-withdrawn and drained
+    /// lifecycle events; <see langword="null"/> to report none.
+    /// </param>
     /// <returns><see langword="false"/> if the stream limit is reached or the key is being written by another session.</returns>
-    bool TryOpenStream(Guid sessionId, string application, string streamIdentity, int targetDurationSeconds, out HlsStreamNumbering numbering);
+    bool TryOpenStream(Guid sessionId, string application, string streamIdentity, int targetDurationSeconds, out HlsStreamNumbering numbering, string? incarnationId = null);
 
     /// <summary>Stores an initialization segment, before any media segment that references it.</summary>
     /// <param name="sessionId">The writer's session ID.</param>

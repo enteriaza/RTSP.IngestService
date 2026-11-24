@@ -6,6 +6,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Rtmp.Publishing;
+using RTSP.IngestService.Streams;
 
 namespace RTSP.IngestService.Media;
 
@@ -36,7 +37,9 @@ public static class MediaServiceCollectionExtensions
             sp.GetRequiredService<IOptions<MediaOptions>>(),
             sp.GetRequiredService<IMediaSessionHandler>(),
             sp.GetRequiredService<MediaMetrics>(),
-            sp.GetRequiredService<ILogger<MediaPublishSessionHandler>>()));
+            sp.GetRequiredService<ILogger<MediaPublishSessionHandler>>(),
+            sp.GetService<IStreamEventPublisher>(),
+            sp.GetService<TimeProvider>()));
 
         return services;
     }

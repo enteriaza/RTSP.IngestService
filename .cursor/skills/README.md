@@ -1,8 +1,8 @@
-# NMS Cursor skills index
+# RTSP.IngestService Cursor skills index
 
 Project-local Agent Skills live under `.cursor/skills/<skill-name>/SKILL.md`.
 
-- Core rules: [`.cursor/rules/nms-core.mdc`](../rules/nms-core.mdc)
+- Core rules: [`.cursor/rules/rtsp-core.mdc`](../rules/rtsp-core.mdc)
 - Layout: [`.cursor/rules/repository-layout.mdc`](../rules/repository-layout.mdc)
 - Entry: [`AGENTS.md`](../../AGENTS.md)
 

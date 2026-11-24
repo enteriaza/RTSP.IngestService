@@ -1,5 +1,5 @@
 ---
-description: NMS directory layout and artifact placement
+description: RTSP.IngestService directory layout and artifact placement
 alwaysApply: true
 ---
 
@@ -7,9 +7,8 @@ alwaysApply: true
 
 | Kind | Location |
 |------|----------|
-| Production applications | `src/<App>/` |
-| Tests | `tests/<App>.Tests/` |
-| Standalone tools / benches | `tools/` (not in `NMS.slnx`) |
+| Production service | `src/RTSP.IngestService/` |
+| Tests | `tests/RTSP.IngestService.Tests/` |
 | Deployment scripts | `deploy/<area>/` |
 | Local evidence, CodeQL DBs, disposable reports | `.artifacts/` (gitignored) |
 | On-demand Native AOT release packages | `release/` (gitignored) |
@@ -17,10 +16,8 @@ alwaysApply: true
 
 ## Boundaries
 
-- Applications must not depend on unrelated applications without an explicit shared ownership model.
-- Tools must not become production dependencies of applications.
 - Tests stay out of production projects.
-- Do not write generated logs, SARIF, publish trees, or operator output into `src/`, `tests/`, `tools/`, or `.github/`.
+- Do not write generated logs, SARIF, publish trees, or operator output into `src/`, `tests/`, or `.github/`.
 - CodeQL evidence defaults to `.artifacts/codeql/`.
 
 Promotion of material from `.artifacts/` into `docs/` or `src/` requires an explicit user decision.

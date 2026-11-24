@@ -40,6 +40,9 @@ public sealed partial class HlsHttpOrigin : IHostedService, IAsyncDisposable
     /// <summary>The running server, set by <see cref="StartAsync"/>.</summary>
     private KestrelServer? _server;
 
+    /// <summary>Whether the listener is bound and accepting; see <see cref="IsListening"/>.</summary>
+    private volatile bool _listening;
+
     /// <summary>Initializes a new instance of the <see cref="HlsHttpOrigin"/> class.</summary>
     /// <param name="options">The HTTP options.</param>
     /// <param name="application">The request pipeline.</param>
@@ -61,6 +64,12 @@ public sealed partial class HlsHttpOrigin : IHostedService, IAsyncDisposable
 
     /// <summary>Gets the bound local endpoint (with the actual port when <see cref="HttpOriginOptions.Port"/> is 0), or <see langword="null"/> before start.</summary>
     public IPEndPoint? LocalEndPoint { get; private set; }
+
+    /// <summary>
+    /// Gets a value indicating whether the listener is bound and accepting connections: <see langword="true"/> from a
+    /// successful <see cref="StartAsync"/> until <see cref="StopAsync"/> begins.
+    /// </summary>
+    public bool IsListening => _listening;
 
     /// <summary>Binds and starts serving.</summary>
     /// <param name="cancellationToken">The host startup token.</param>
@@ -95,6 +104,7 @@ public sealed partial class HlsHttpOrigin : IHostedService, IAsyncDisposable
         var port = bound is null ? options.Port : new Uri(bound).Port;
         LocalEndPoint = new IPEndPoint(address, port);
         LogListening(LocalEndPoint);
+        _listening = true;
     }
 
     /// <summary>Stops accepting connections and drains in-flight requests until <paramref name="cancellationToken"/> fires.</summary>
@@ -102,6 +112,7 @@ public sealed partial class HlsHttpOrigin : IHostedService, IAsyncDisposable
     /// <returns>A task that completes when the server has stopped.</returns>
     public async Task StopAsync(CancellationToken cancellationToken)
     {
+        _listening = false;
         if (_server is { } server)
         {
             await server.StopAsync(cancellationToken).ConfigureAwait(false);
@@ -112,6 +123,7 @@ public sealed partial class HlsHttpOrigin : IHostedService, IAsyncDisposable
     /// <inheritdoc />
     public ValueTask DisposeAsync()
     {
+        _listening = false;
         _server?.Dispose();
         _server = null;
         return ValueTask.CompletedTask;

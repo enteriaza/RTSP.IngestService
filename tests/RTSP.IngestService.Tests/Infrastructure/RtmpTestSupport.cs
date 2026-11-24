@@ -93,6 +93,9 @@ internal sealed class RecordingPublishSessionHandler : IPublishSessionHandler
     /// <summary>Gets or sets a value indicating whether <see cref="OnMessageAsync"/> throws.</summary>
     public bool FailMessages { get; set; }
 
+    /// <summary>Gets or sets a value indicating whether <see cref="OnSessionStartedAsync"/> throws, rejecting the publish.</summary>
+    public bool FailStarts { get; set; }
+
     /// <summary>Gets or sets a value indicating whether <see cref="OnMessageAsync"/> keeps messages undisposed.</summary>
     public bool RetainMessages { get; set; }
 
@@ -105,6 +108,11 @@ internal sealed class RecordingPublishSessionHandler : IPublishSessionHandler
     /// <returns>A completed task.</returns>
     public ValueTask OnSessionStartedAsync(PublisherSession session, CancellationToken cancellationToken)
     {
+        if (FailStarts)
+        {
+            throw new InvalidOperationException("Simulated start failure");
+        }
+
         Record(new HandlerEvent("started", session));
         return ValueTask.CompletedTask;
     }
@@ -220,8 +228,11 @@ internal sealed class RtmpTestServer : IDisposable
         TimeProvider = timeProvider ?? TimeProvider.System;
         LoggerFactory = new LoggerFactory([new FakeLoggerProvider(Logs)]);
         SessionHandler = sessionHandler?.Invoke(MeterFactory, LoggerFactory) ?? Handler;
-        Context = new RtmpServerContext(Options, Authenticator, SessionHandler, Registry, new RtmpMetrics(MeterFactory), TimeProvider, LoggerFactory, Pool);
+        Context = new RtmpServerContext(Options, Authenticator, SessionHandler, Registry, new RtmpMetrics(MeterFactory), TimeProvider, LoggerFactory, Pool, StreamEvents);
     }
+
+    /// <summary>Gets the recorder of stream lifecycle events published by the server's sessions.</summary>
+    public RecordingStreamEventPublisher StreamEvents { get; } = new();
 
     /// <summary>Gets the publish session handler the server uses.</summary>
     public IPublishSessionHandler SessionHandler { get; }
@@ -291,7 +302,7 @@ internal sealed class RtmpTestServer : IDisposable
     /// <summary>Creates a TCP listener sharing this server's options and dependencies; payloads use the shared pool.</summary>
     /// <returns>The listener, not started.</returns>
     public RtmpListener CreateListener() =>
-        new(Microsoft.Extensions.Options.Options.Create(Options), Authenticator, SessionHandler, Registry, Context.Metrics, TimeProvider, LoggerFactory);
+        new(Microsoft.Extensions.Options.Options.Create(Options), Authenticator, SessionHandler, Registry, Context.Metrics, TimeProvider, LoggerFactory, StreamEvents);
 
     /// <summary>Disposes the logger factory and meter factory.</summary>
     public void Dispose()

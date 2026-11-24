@@ -39,13 +39,12 @@ public sealed class OptionsTests
         Assert.Equal(TimeSpan.FromMinutes(1), lifetime.StartupTimeout);
         Assert.Equal(TimeSpan.FromSeconds(30), lifetime.ShutdownTimeout);
 
-        Assert.Equal(TimeSpan.FromMinutes(1), provider.GetRequiredService<IOptions<HeartbeatOptions>>().Value.Interval);
-
         var fileLogging = provider.GetRequiredService<IOptions<FileLoggingOptions>>().Value;
         Assert.Equal(FileLoggingMode.Auto, fileLogging.Mode);
         Assert.Equal("logs/rtsp-ingest-service-.log", fileLogging.Path);
         Assert.Equal(31, fileLogging.RetainedFileCountLimit);
         Assert.Equal(100, fileLogging.FileSizeLimitMegabytes);
+        Assert.True(provider.GetRequiredService<IOptions<ManagementOptions>>().Value.Enabled);
     }
 
     /// <summary>Verifies the code defaults applied when only the mandatory application name is configured.</summary>
@@ -57,13 +56,13 @@ public sealed class OptionsTests
         var lifetime = provider.GetRequiredService<IOptions<LifetimeOptions>>().Value;
         Assert.Equal(TimeSpan.FromMinutes(1), lifetime.StartupTimeout);
         Assert.Equal(TimeSpan.FromSeconds(30), lifetime.ShutdownTimeout);
-        Assert.Equal(TimeSpan.FromMinutes(1), provider.GetRequiredService<IOptions<HeartbeatOptions>>().Value.Interval);
 
         var fileLogging = provider.GetRequiredService<IOptions<FileLoggingOptions>>().Value;
         Assert.Equal(FileLoggingMode.Auto, fileLogging.Mode);
         Assert.Equal("logs/rtsp-ingest-service-.log", fileLogging.Path);
         Assert.Equal(31, fileLogging.RetainedFileCountLimit);
         Assert.Equal(100, fileLogging.FileSizeLimitMegabytes);
+        Assert.True(provider.GetRequiredService<IOptions<ManagementOptions>>().Value.Enabled);
     }
 
     /// <summary>Verifies that a fully specified valid configuration binds every value.</summary>
@@ -75,7 +74,6 @@ public sealed class OptionsTests
             ["Application:Name"] = "edge-01.ingest",
             ["Lifetime:StartupTimeout"] = "00:02:00",
             ["Lifetime:ShutdownTimeout"] = "00:00:45",
-            ["Heartbeat:Interval"] = "00:00:15",
             ["FileLogging:Mode"] = "enabled",
             ["FileLogging:Path"] = "/var/log/streaming/service-.log",
             ["FileLogging:RetainedFileCountLimit"] = "7",
@@ -85,7 +83,6 @@ public sealed class OptionsTests
         Assert.Equal("edge-01.ingest", provider.GetRequiredService<IOptions<ApplicationOptions>>().Value.Name);
         Assert.Equal(TimeSpan.FromMinutes(2), provider.GetRequiredService<IOptions<LifetimeOptions>>().Value.StartupTimeout);
         Assert.Equal(TimeSpan.FromSeconds(45), provider.GetRequiredService<IOptions<LifetimeOptions>>().Value.ShutdownTimeout);
-        Assert.Equal(TimeSpan.FromSeconds(15), provider.GetRequiredService<IOptions<HeartbeatOptions>>().Value.Interval);
         var fileLogging = provider.GetRequiredService<IOptions<FileLoggingOptions>>().Value;
         Assert.Equal(FileLoggingMode.Enabled, fileLogging.Mode);
         Assert.Equal("/var/log/streaming/service-.log", fileLogging.Path);
@@ -129,8 +126,6 @@ public sealed class OptionsTests
     [InlineData("Lifetime:StartupTimeout", "01:00:01")]
     [InlineData("Lifetime:ShutdownTimeout", "00:00:00.999")]
     [InlineData("Lifetime:ShutdownTimeout", "00:10:01")]
-    [InlineData("Heartbeat:Interval", "-00:00:01")]
-    [InlineData("Heartbeat:Interval", "01:00:01")]
     [InlineData("FileLogging:RetainedFileCountLimit", "0")]
     [InlineData("FileLogging:RetainedFileCountLimit", "366")]
     [InlineData("FileLogging:FileSizeLimitMegabytes", "0")]
@@ -150,7 +145,7 @@ public sealed class OptionsTests
     [InlineData("Lifetime:ShutdownTimeout", "00:00:01")]
     [InlineData("Lifetime:ShutdownTimeout", "00:10:00")]
     [InlineData("Lifetime:StartupTimeout", "01:00:00")]
-    [InlineData("Heartbeat:Interval", "00:00:01")]
+    [InlineData("Lifetime:StartupTimeout", "00:00:01")]
     [InlineData("FileLogging:RetainedFileCountLimit", "365")]
     public void BoundaryValue_IsAccepted(string key, string value)
     {
@@ -178,7 +173,7 @@ public sealed class OptionsTests
     /// <param name="value">An unconvertible value.</param>
     [Theory]
     [InlineData("FileLogging:Mode", "Sometimes")]
-    [InlineData("Heartbeat:Interval", "soon")]
+    [InlineData("Lifetime:StartupTimeout", "soon")]
     [InlineData("FileLogging:RetainedFileCountLimit", "many")]
     public void UnconvertibleValue_FailsAsValidationError(string key, string value)
     {
@@ -196,7 +191,7 @@ public sealed class OptionsTests
     public async Task StartupValidation_FailsBeforeHostedServicesStart()
     {
         var journal = new LifecycleJournal();
-        var builder = TestHosts.CreateBuilder(new FakeLogCollector(), overrides: new Dictionary<string, string?> { ["Heartbeat:Interval"] = "00:00:00" });
+        var builder = TestHosts.CreateBuilder(new FakeLogCollector(), overrides: new Dictionary<string, string?> { ["Rtmp:Port"] = "70000" });
         builder.Services.AddSingleton(journal);
         builder.Services.AddHostedService<RecordingServiceA>();
         using var host = builder.Build();
@@ -259,7 +254,6 @@ public sealed class OptionsTests
     {
         ApplicationOptions.SectionName => provider.GetRequiredService<IOptions<ApplicationOptions>>().Value,
         LifetimeOptions.SectionName => provider.GetRequiredService<IOptions<LifetimeOptions>>().Value,
-        HeartbeatOptions.SectionName => provider.GetRequiredService<IOptions<HeartbeatOptions>>().Value,
         FileLoggingOptions.SectionName => provider.GetRequiredService<IOptions<FileLoggingOptions>>().Value,
         _ => throw new ArgumentOutOfRangeException(nameof(key), key, "Unknown section."),
     };

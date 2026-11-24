@@ -4,9 +4,9 @@ applyTo: "**/*.{cs,csproj,json,md}"
 
 # Performance engineering
 
-NMS hosts multiple independent applications and tools. Treat hot paths as performance-sensitive when the project's workload warrants it — for example high-throughput networking, packet or datagram processing, parsing/normalization, buffering and pooling, queueing, connection or socket management, durable write paths, and high-frequency logging — while preserving correctness, resource ownership, cancellation, work settlement, lifecycle, and shutdown semantics.
+RTSP.IngestService is a live media ingest and HLS delivery service. Treat hot paths as performance-sensitive when the workload warrants it — for example RTMP socket I/O and chunk parsing, media parsing and fMP4 packaging, parsing/normalization, buffering and pooling, queueing, connection or socket management, durable write paths, and high-frequency logging — while preserving correctness, resource ownership, cancellation, work settlement, lifecycle, and shutdown semantics.
 
-Not every NMS project is a high-throughput packet path. Apply these standards proportionally: establish relevance to the actual workload before optimizing. Where a project ships or uses benchmarks (for example `tools/NetFlowCapture.ReceiveBench`), prefer those verified harnesses over invented methodology.
+Not every code path is hot. Apply these standards proportionally: establish relevance to the actual workload before optimizing, and prefer verified measurements over invented methodology.
 
 - Avoid unnecessary allocations, copies, boxing, closures, LINQ, temporary collections, task creation, synchronization, lock contention, and retained large objects or buffers on hot paths.
 - Pay particular attention to Gen 0/1/2 pressure, LOH allocations, pinned memory, buffer retention, pooled-resource lifetime, and unbounded growth.
@@ -25,7 +25,7 @@ Not every NMS project is a high-throughput packet path. Apply these standards pr
 - Preserve work-settlement and acknowledgement semantics, retry behavior, cancellation, disposal, readiness, graceful shutdown, durability contracts, and other production invariants when changing performance-sensitive code. Do not weaken Native AOT / trimming compatibility, configuration validation, or security-relevant diagnostics for speed.
 - Keep production implementation, benchmark harness, fake/test peer, synthetic workload generator, and real external endpoint behavior clearly separated when evaluating measurements.
 - Do not optimize production code to satisfy an unrealistic benchmark harness. If benchmark behavior is not representative of the production path, identify the benchmark limitation separately.
-- Preserve established benchmark contracts, runtime identity, architecture, configuration, and CI expectations. Standalone tools under `tools/` are not solution members unless the repository explicitly includes them — do not invent solution coupling to make a bench "easier."
+- Preserve established benchmark contracts, runtime identity, architecture, configuration, and CI expectations.
 - Follow the repository's clean/build/run policy for benchmarks and performance tests. Do not use `--no-build` when the harness or project requires a clean build and runtime-identity verification.
 - Prefer isolated, deterministic execution for potentially blocking lifecycle, concurrency, or benchmark tests. Report exact pass/fail/skip counts and environmental limitations (for example host OS when cross-compiled binaries cannot be executed locally).
 - Do not invent baseline numbers. Prefer newer verified source, test, tool output, or `.artifacts/` evidence over memory. There is no repository-wide `.copilot/PERFORMANCE-CONTEXT.md` checkpoint.

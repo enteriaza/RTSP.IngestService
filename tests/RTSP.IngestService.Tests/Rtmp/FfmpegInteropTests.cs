@@ -168,9 +168,22 @@ public sealed class FfmpegInteropTests
         }
 
         var name = OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg";
-        return (Environment.GetEnvironmentVariable("PATH") ?? string.Empty)
+        var found = (Environment.GetEnvironmentVariable("PATH") ?? string.Empty)
             .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
             .Select(directory => Path.Combine(directory, name))
             .FirstOrDefault(File.Exists);
+        if (found is null && FfmpegRequired)
+        {
+            Assert.Fail("FFmpeg was not found but RTSP_FFMPEG_REQUIRED is set; interoperability tests must not be skipped.");
+        }
+
+        return found;
     }
+
+    /// <summary>
+    /// Gets a value indicating whether FFmpeg is required (<c>RTSP_FFMPEG_REQUIRED=true</c>, as in CI), in which case a
+    /// missing FFmpeg or ffprobe fails the test instead of skipping it.
+    /// </summary>
+    internal static bool FfmpegRequired =>
+        string.Equals(Environment.GetEnvironmentVariable("RTSP_FFMPEG_REQUIRED"), "true", StringComparison.OrdinalIgnoreCase);
 }

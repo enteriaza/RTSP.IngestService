@@ -4,6 +4,7 @@
 using System.Buffers;
 using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Rtmp.Publishing;
+using RTSP.IngestService.Streams;
 
 namespace RTSP.IngestService.Rtmp;
 
@@ -18,6 +19,7 @@ namespace RTSP.IngestService.Rtmp;
 /// <param name="timeProvider">Clock for timeouts and timestamps.</param>
 /// <param name="loggerFactory">Creates connection and session loggers.</param>
 /// <param name="bufferPool">Pool for message payloads.</param>
+/// <param name="events">Receives stream lifecycle events, or <see langword="null"/> for none.</param>
 internal sealed class RtmpServerContext(
     RtmpOptions options,
     IPublisherAuthenticator authenticator,
@@ -26,8 +28,12 @@ internal sealed class RtmpServerContext(
     RtmpMetrics metrics,
     TimeProvider timeProvider,
     ILoggerFactory loggerFactory,
-    ArrayPool<byte> bufferPool)
+    ArrayPool<byte> bufferPool,
+    IStreamEventPublisher? events = null)
 {
+    /// <summary>Gets the stream lifecycle event publisher, if any.</summary>
+    public IStreamEventPublisher? Events { get; } = events;
+
     /// <summary>Gets the RTMP options.</summary>
     public RtmpOptions Options { get; } = options;
 

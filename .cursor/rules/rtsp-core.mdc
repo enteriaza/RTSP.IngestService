@@ -1,0 +1,32 @@
+---
+description: Core RTSP.IngestService engineering discipline for every Cursor task in this repository
+alwaysApply: true
+---
+
+# RTSP.IngestService core instructions
+
+## Before changing anything
+
+1. Inspect existing implementation, callers, ownership, lifecycle, and tests before editing.
+2. Prefer the **smallest correct change**. Avoid speculative abstractions and unnecessary dependencies.
+3. Preserve unrelated user changes and out-of-scope files.
+
+## Repository facts (inspect rather than invent)
+
+- Solution: `RTSP.slnx` (`src/RTSP.IngestService` and `tests/RTSP.IngestService.Tests`)
+- Layout: `src/` service, `tests/` test project, `deploy/` deployment assets, `docs/` documentation, `.artifacts/` generated evidence (gitignored)
+- Target framework: `net10.0`; nullable + implicit usings enabled in `Directory.Build.props`; Native AOT publish
+- The service ingests RTMP (H.264/AAC), packages fMP4 HLS in memory and serves it from a built-in HTTP origin
+- Placement policy: sibling rule `repository-layout.mdc`
+
+## Evidence and honesty
+
+- Never claim builds, tests, format checks, benchmarks, or runtime verification succeeded unless they ran and succeeded here.
+- Report limitations and unverified assumptions explicitly.
+- Do not invent project conventions; inspect the repository.
+
+## Skill selection
+
+1. Read `AGENTS.md` and `.cursor/skills/README.md` before substantive work when present.
+2. Explicitly read relevant `.cursor/skills/<skill-name>/SKILL.md` file(s); combine skills when appropriate.
+3. Never claim a rule or skill was automatically loaded unless verified in this session.

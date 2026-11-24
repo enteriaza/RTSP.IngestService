@@ -123,6 +123,7 @@ public sealed class HlsFfmpegInteropTests
         var probe = ffmpeg is null ? null : Path.Combine(Path.GetDirectoryName(ffmpeg)!, OperatingSystem.IsWindows() ? "ffprobe.exe" : "ffprobe");
         if (ffmpeg is null || !File.Exists(probe))
         {
+            Assert.False(FfmpegInteropTests.FfmpegRequired, "ffprobe was not found next to ffmpeg but RTSP_FFMPEG_REQUIRED is set; interoperability tests must not be skipped.");
             Assert.Skip("FFmpeg and ffprobe were not found; set RTSP_FFMPEG_PATH or add ffmpeg to PATH to run this test.");
         }
 

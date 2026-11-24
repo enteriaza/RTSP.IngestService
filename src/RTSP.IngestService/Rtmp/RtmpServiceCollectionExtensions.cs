@@ -6,6 +6,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Rtmp.Publishing;
+using RTSP.IngestService.Streams;
 
 namespace RTSP.IngestService.Rtmp;
 
@@ -44,7 +45,8 @@ public static class RtmpServiceCollectionExtensions
             sp.GetRequiredService<PublishedStreamRegistry>(),
             sp.GetRequiredService<RtmpMetrics>(),
             sp.GetRequiredService<TimeProvider>(),
-            sp.GetRequiredService<ILoggerFactory>()));
+            sp.GetRequiredService<ILoggerFactory>(),
+            sp.GetService<IStreamEventPublisher>()));
         services.AddHostedService(static sp => sp.GetRequiredService<RtmpListener>());
 
         return services;

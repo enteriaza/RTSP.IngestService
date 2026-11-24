@@ -1,6 +1,6 @@
 ---
 name: implementation-and-verification
-description: End-to-end NMS feature or bug-fix workflow from inspect through verify.
+description: End-to-end RTSP.IngestService feature or bug-fix workflow from inspect through verify.
 ---
 
 # Implementation and verification

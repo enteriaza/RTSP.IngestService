@@ -1,11 +1,11 @@
 ---
 mode: agent
-description: Audit and complete XML documentation across an entire NMS production project under src/.
+description: Audit and complete XML documentation across the RTSP.IngestService production project under src/.
 ---
 
-# NMS Project Documentation Audit
+# RTSP.IngestService Project Documentation Audit
 
-Perform a complete, project-wide XML documentation audit and remediation pass across one NMS production project under `src/`.
+Perform a complete, project-wide XML documentation audit and remediation pass across one production project under `src/`.
 
 This prompt is the PROJECT-LEVEL ORCHESTRATOR.
 
@@ -39,10 +39,9 @@ Resolve `<ProjectName>` from:
 
 Examples of valid scopes (illustrative, not exhaustive):
 
-- `src/NetFlowCapture/`
-- `src/NetFlowGenerator/`
+- `src/RTSP.IngestService/`
 
-Do not treat `tests/`, `tools/`, or `deploy/` as the production documentation target unless the user explicitly selects a `tools/` project as the sole scope.
+Do not treat `tests/` or `deploy/` as the production documentation target.
 
 You must enumerate, audit, and remediate the entire selected production project tree.
 
@@ -63,18 +62,16 @@ The ONLY files that may be modified are C# source files under:
 Do NOT modify:
 
 - `tests/`
-- `tools/` (unless `<ProjectName>` itself is the explicitly selected tools project)
 - `deploy/`
 - `.github/`
 - `.cursor/`
 - `.artifacts/`
 - `release/`
-- solution files (`NMS.slnx`)
+- solution files (`RTSP.slnx`)
 - project files (`.csproj`, `Directory.Build.*`)
 - configuration files (including `appsettings*.json`)
 - analyzer configuration
 - test files
-- benchmark / ReceiveBench sources
 - generated artifacts
 - unrelated applications under `src/`
 
@@ -750,4 +747,4 @@ Do not stop after the highest-value files.
 
 Do not declare success merely because the build succeeds.
 
-The objective is a genuinely well-documented ENTIRE selected NMS production codebase.
+The objective is a genuinely well-documented ENTIRE selected production codebase.

@@ -57,7 +57,7 @@ HLS playback is served over plain HTTP on `127.0.0.1:8080` by default (`Http:Lis
 local clients or a reverse proxy can reach it. To serve viewers directly set `Http:ListenAddress` to `0.0.0.0` and
 allow the port (`New-NetFirewallRule -DisplayName 'RTSP.IngestService HLS' -Direction Inbound -Protocol TCP
 -LocalPort 8080 -Action Allow`); put a TLS-terminating proxy in front for HTTPS. If the HTTP port is in use the
-service fails to start with exit code 1 (see [HTTP HLS origin](../architecture.md#http-hls-origin)).
+service fails to start with exit code 1 (see [HTTP HLS origin](../architecture.md#http-hls-origin)). The loopback-only `/health/live` and `/health/ready` endpoints are served on the same port (see [Management endpoints](../architecture.md#management-endpoints)); a reverse proxy must forward only `/hls/`, never `/health/`.
 If the port is in use the service fails to start with exit code 1 and logs event 5001.
 
 ## Operate

@@ -1,6 +1,6 @@
 ---
 name: configuration-and-security
-description: NMS configuration convention, credentials, and publish exclusion.
+description: RTSP.IngestService configuration convention, credentials, and publish exclusion.
 ---
 
 # Configuration and security

@@ -8,9 +8,10 @@ using RTSP.IngestService.Hls;
 using RTSP.IngestService.Http;
 using RTSP.IngestService.Lifecycle;
 using RTSP.IngestService.Logging;
+using RTSP.IngestService.Management;
 using RTSP.IngestService.Media;
 using RTSP.IngestService.Rtmp;
-using RTSP.IngestService.Services;
+using RTSP.IngestService.Streams;
 
 namespace RTSP.IngestService.Hosting;
 
@@ -47,9 +48,10 @@ public static class IngestServiceHost
         builder.Services.AddApplicationLifecycle();
         builder.Services.AddPlatformHosting(mode);
         builder.Logging.AddIngestServiceLogging(mode);
-        builder.Services.AddHostedService<HeartbeatService>();
+        builder.Services.AddStreamEvents();
         builder.Services.AddHlsPackaging();
         builder.Services.AddMediaProcessing();
+        builder.Services.AddManagementEndpoints();
         builder.Services.AddHlsHttpOrigin();
         builder.Services.AddRtmpIngest();
 

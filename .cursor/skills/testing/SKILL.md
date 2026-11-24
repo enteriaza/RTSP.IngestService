@@ -1,6 +1,6 @@
 ---
 name: testing
-description: Design and fix deterministic NMS regression tests.
+description: Design and fix deterministic RTSP.IngestService regression tests.
 ---
 
 # Testing

@@ -2,7 +2,7 @@
 
 RTSP.IngestService is a .NET 10 Generic Host worker that runs unchanged as a console application, a Windows service and a
 systemd service. This document describes the hosting foundation (lifecycle, failure handling, configuration and
-logging) and the RTMP ingest server. Deployment is covered in [deployment/windows.md](deployment/windows.md) and
+logging), the RTMP ingest server, media processing, HLS packaging and the HTTP HLS origin. Deployment is covered in [deployment/windows.md](deployment/windows.md) and
 [deployment/linux.md](deployment/linux.md).
 
 ## Components
@@ -17,14 +17,18 @@ logging) and the RTMP ingest server. Deployment is covered in [deployment/window
 | Lifecycle | `Lifecycle/ApplicationLifecycle`, `ApplicationLifecycleCoordinator` | Application state machine and readiness, driven by host events. |
 | Configuration | `Configuration/*Options`, `IngestServiceOptionsExtensions` | Strict binding, source-generated validation, fail fast at startup. |
 | Logging | `Logging/SerilogPipeline`, `SystemdConsoleFormatter` | Serilog sinks per hosting mode; bootstrap logger for pre-host failures. |
-| Sample workload | `Services/HeartbeatService` | Periodic heartbeat; demonstrates options reload and `TimeProvider`. |
 | RTMP ingest | `Rtmp/*` | RTMP publishing server: listener, connections, chunk protocol, AMF0, sessions (see [RTMP ingest](#rtmp-ingest)). |
+| Media processing | `Media/*` | H.264/AAC parsing into typed samples and stream descriptions (see [Media processing](#media-processing)). |
+| HLS packaging | `Hls/*` | fMP4 segments and live playlists in a bounded in-memory store (see [HLS packaging](#hls-packaging)). |
+| HTTP HLS origin | `Http/*` | Kestrel-based HTTP/1.1 server for playlists and segments (see [HTTP HLS origin](#http-hls-origin)). |
+| Management | `Management/*` | Loopback-only liveness and readiness routes on the same HTTP listener (see [Management endpoints](#management-endpoints)). |
+| Stream events | `Streams/*` | Versioned, best-effort stream lifecycle notifications over one bounded in-process channel (see [Stream lifecycle events](#stream-lifecycle-events)). |
 
 ## Application lifecycle
 
 `IApplicationLifecycle` exposes `State`, `IsReady` (true only in `Running`), `StateChangedAt` and `Failure`. It is the
 readiness mechanism: in-process components query it, and the platform reports it to the service manager (systemd
-`READY=1`, SCM `RUNNING`). There is no HTTP endpoint.
+`READY=1`, SCM `RUNNING`). Loopback clients can also query it over HTTP (see [Management endpoints](#management-endpoints)).
 
 ```
 NotStarted ──► Starting ──► Running ──► Stopping ──► Stopped
@@ -89,16 +93,16 @@ RTMP settings are listed under [RTMP ingest](#configuration-1).
 | `Application` | `Name` | Required (`RTSP.IngestService` in `appsettings.json`) | Letter followed by up to 63 of `A-Z a-z 0-9 . _ -` |
 | `Lifetime` | `StartupTimeout` | `00:01:00` | 1 s – 1 h |
 | `Lifetime` | `ShutdownTimeout` | `00:00:30` | 1 s – 10 min |
-| `Heartbeat` | `Interval` | `00:01:00` | 1 s – 1 h (reloadable) |
 | `FileLogging` | `Mode` | `Auto` | `Auto` (Windows service only), `Enabled`, `Disabled` |
 | `FileLogging` | `Path` | `logs/rtsp-ingest-service-.log` | Relative to the executable directory, or absolute |
 | `FileLogging` | `RetainedFileCountLimit` | `31` | 1 – 365 |
 | `FileLogging` | `FileSizeLimitMegabytes` | `100` | 1 – 10240 |
+| `Management` | `Enabled` | `true` | `true` or `false` |
+| `StreamEvents` | `QueueCapacity` | `1024` | 16 – 65536 |
 
 Sources, in increasing precedence: `appsettings.json`, `appsettings.{Environment}.json`, environment variables,
 command-line arguments. Binding is strict: unknown keys and unconvertible values are configuration errors. Validators are
-source-generated (`[OptionsValidator]`), which keeps the Native AOT build free of trimming warnings. An invalid reload of
-the heartbeat interval is logged and the previous interval is kept.
+source-generated (`[OptionsValidator]`), which keeps the Native AOT build free of trimming warnings.
 
 ## Logging
 
@@ -116,13 +120,15 @@ hosting environment are logged at startup.
 |-----------|--------|
 | 1000–1002, 1100 | Application lifecycle |
 | 2000–2003 | systemd watchdog |
-| 3000–3003 | Heartbeat |
 | 4000–4007 | Service runner |
 | 5000–5006 | RTMP listener |
 | 5100–5108 | RTMP connection |
 | 5200–5212 | RTMP session and publishing |
 | 6000–6010 | Media processing |
 | 7000–7013 | HLS packaging |
+| 8000–8002 | HTTP HLS origin |
+| 9000 | Management endpoints |
+| 9100–9102 | Stream event dispatcher |
 
 ## RTMP ingest
 
@@ -239,8 +245,8 @@ connection IDs are never tags.
 | `rtmp.bytes_received` | Counter (bytes) | — |
 | `rtmp.messages_received` | Counter | `type`: `audio`, `video`, `data`, `command`, `control`, `other` |
 
-No exporter or HTTP endpoint is configured; use `dotnet-counters monitor --counters RTSP.IngestService.Rtmp -n
-RTSP.IngestService` or add an exporter in a later phase.
+No metrics exporter is configured; use `dotnet-counters monitor --counters RTSP.IngestService.Rtmp -n
+RTSP.IngestService`.
 
 ### Supported and unsupported
 
@@ -250,8 +256,8 @@ Peer Bandwidth, User Control (ping requests answered); `@setDataFrame`/`onMetaDa
 per connection.
 
 Not supported: RTMPE, RTMPS (TLS), RTMPT (HTTP tunnelling), the digest (FP9) handshake, AMF3-encoded values, playback
-(`play`), shared objects and aggregate messages (ignored), and anything after ingest (decoding, packaging, HTTP
-delivery, recording).
+(`play`), shared objects and aggregate messages (ignored), and recording. Packaging and HTTP delivery are separate layers
+([HLS packaging](#hls-packaging), [HTTP HLS origin](#http-hls-origin)); nothing is decoded or transcoded.
 
 ### Publishing from OBS and FFmpeg
 
@@ -407,7 +413,7 @@ ffmpeg -f lavfi -i testsrc=size=160x120:rate=10 -f lavfi -i sine=frequency=440:s
 
 `Hls/` packages the typed H.264/AAC samples of media processing into fragmented MP4 (ISO BMFF, CMAF-style) and live
 HLS media playlists (RFC 8216, version 7) held in a bounded in-memory store. Nothing is decoded or re-encoded; sample
-bytes are copied verbatim into `mdat`. There is no HTTP delivery yet: the store is the boundary a later phase serves.
+bytes are copied verbatim into `mdat`. The store is served by the [HTTP HLS origin](#http-hls-origin).
 
 ### Components
 
@@ -710,3 +716,189 @@ audio only.
 - After a restart, pre-restart segment URLs are 404 (their media is gone); players must reload the playlist, which
   then lists the new generation. Cached pre-restart segments are only ever served for their own URLs.
 - No byte ranges, no master playlist, HTTP/1.1 only.
+
+## Management endpoints
+
+`Management/ManagementEndpoints` adds liveness and readiness routes to the HTTP origin's request pipeline. There is
+one `KestrelServer` and one listener in the application: management shares the `Http` listen address, port,
+connection limit and timeouts, and has no address, port or limit of its own. `HlsHttpApplication` hands every path
+under `/health/` to the management endpoints before HLS routing; HLS requests and the `http.origin.*` metrics are
+unaffected. `Management:Enabled=false` stops serving these routes (they become unknown HLS paths, 404) without
+affecting HLS, the lifecycle or the service-manager integration.
+
+| Endpoint | 200 when | Otherwise |
+|----------|----------|-----------|
+| `GET`/`HEAD /health/live` | The lifecycle is not `Failed` or `Stopped` | 503 |
+| `GET`/`HEAD /health/ready` | The lifecycle is `Running`, the RTMP listener is bound and the HTTP listener is bound | 503 |
+
+Bodies are small source-generated JSON documents, for example
+`{"status":"not_ready","state":"Starting","rtmpListener":false,"httpListener":true}` or
+`{"status":"live","state":"Running"}`. Every management response has `Cache-Control: no-store` and
+`X-Content-Type-Options: nosniff`; `HEAD` returns the `GET` status and headers without a body; other methods are 405
+(`Allow: GET, HEAD`); unknown management paths are 404.
+
+Listener state is explicit: `RtmpListener.IsListening` is set after a successful bind and cleared when shutdown
+starts closing the socket; `HlsHttpOrigin.IsListening` is set after Kestrel has bound and cleared when `StopAsync`
+begins. The lifecycle enters `Stopping` on `ApplicationStopping`, before any hosted service stops, so readiness is
+503 while both listeners are still bound; the origin starts before and stops after RTMP ingest, so the endpoints stay
+reachable until the HTTP listener itself stops. A failure while answering a management request is logged (event
+9000) and answered 500; it never stops the listener or touches the media pipeline.
+
+### Access control
+
+The endpoints are unauthenticated and restricted to loopback clients by the connection's transport-level remote
+address: IPv4 `127.0.0.0/8`, IPv6 `::1` and IPv4-mapped loopback are accepted; any other address, or a connection
+without a remote address, gets an empty 403 for every `/health/` path and method, so a rejected client cannot tell
+which endpoints exist. `X-Forwarded-For`, `Forwarded` and similar headers are never read and there is no
+forwarded-headers processing, so a client cannot claim to be local. The `Http` listener binds to `127.0.0.1` by
+default. When viewers are served through a reverse proxy on the same host, the proxy's connections are loopback
+connections: **the proxy must not forward `/health/` paths** (expose only `/hls/`), or remote clients would reach the
+endpoints through it.
+
+### Tests
+
+`ManagementEndpointsTests` run the endpoints in a real Kestrel origin with a controllable lifecycle: liveness for
+every state, readiness for every state and listener combination, the origin's real bound state, headers and bodies,
+HEAD, 405 and 404, HLS and management answering on one connection, management disabled, IPv4, IPv6 and IPv4-mapped
+loopback clients, a client on a non-loopback address of the machine (403 on every path with and without spoofed
+forwarding headers), unknown and non-loopback remote addresses on every path and method, and a failing probe.
+`ManagementHostTests` run the real host: a single origin and listening event, readiness held at 503 by startup gates
+before and after the RTMP listener binds and by a shutdown gate before the listeners close, management configuration
+errors (exit 78), and FFmpeg HLS playback with management disabled.
+
+## Stream lifecycle events
+
+**Events are notifications, not authoritative state.** They report that an authoritative transition happened in the
+RTMP, media or HLS layer. Delivery is best-effort and in-process: an event can be overwritten when the channel is
+full, discarded at shutdown, or skipped by a failing consumer, and nothing is persisted, retried or replayed. A
+consumer that needs current state must reconcile against the authoritative source; it must never derive state from
+events alone.
+
+### Architecture and ownership
+
+```
+RtmpSession ──────────────┐  Published, Ended
+MediaPublishSessionHandler ┼─► IStreamEventPublisher ─► StreamEventChannel ─► StreamEventDispatcher ─► IStreamEventConsumer
+InMemoryHlsSegmentStore ───┘  MediaDescribed,           (bounded, drop-oldest,   (hosted service,        (optional, at most one)
+                              PlaylistWithdrawn, Drained  single owner)            own task)
+```
+
+Producers depend only on `IStreamEventPublisher.Publish`, which calls `TryWrite` and returns; it never waits for
+capacity or for the consumer, takes no lock of its own (the channel's internal lock is held only for the enqueue),
+and never throws for a full or closed channel. Events are small immutable records; they never hold media payloads or
+pooled buffers. `StreamEventChannel` is the single owner of the `Channel<StreamEvent>`: it creates it, counts drops,
+and completes it (`Complete`, also on disposal). `StreamEventDispatcher` is the only reader and runs the consumer on
+its own task, so consumer code never runs on a producer's path and cannot slow RTMP, media, HLS or viewers. There is
+one channel for all streams (no per-stream queue), no bus and no multi-subscriber fan-out. The RTMP-to-media-to-HLS
+pipeline is unchanged and remains synchronous; publishing an event is an additional non-blocking call at a
+transition, and a publishing failure cannot affect the lifecycle.
+
+### Envelope (schema version 1)
+
+```json
+{
+  "schemaVersion": 1,
+  "type": "MediaDescribed",
+  "timestamp": "2026-11-24T10:30:00.1234567+00:00",
+  "application": "live",
+  "stream": "camera1",
+  "incarnationId": "3f2a9c1e0b7d4e8f9a6b5c4d3e2f1a0b",
+  "reason": "client_disconnected",
+  "media": {
+    "video": { "codec": "avc1.64001F", "configurationVersion": 1, "width": 1280, "height": 720, "frameRate": 30 },
+    "audio": { "codec": "mp4a.40.2", "configurationVersion": 1, "sampleRate": 48000, "channelConfiguration": 2, "channels": 2 }
+  }
+}
+```
+
+| Field | Presence | Meaning |
+|-------|----------|---------|
+| `schemaVersion` | Always | `1`. |
+| `type` | Always | `Published`, `MediaDescribed`, `Ended`, `PlaylistWithdrawn` or `Drained`. |
+| `timestamp` | Always | When the transition happened, UTC (`+00:00`). |
+| `application` | Always | RTMP application. |
+| `stream` | Always | Non-secret stream identity from authentication; never the stream key. |
+| `incarnationId` | Always | Public identifier of the publication (below). |
+| `reason` | `Ended`, `PlaylistWithdrawn` | Snake-case reason; absent where the transition has none. |
+| `media` | `MediaDescribed` | Configured tracks; codec strings, sample rate and channel configuration come from the decoder configuration, width, height and frame rate from publisher metadata (unverified). |
+
+Absent optional fields are omitted. Serialization uses the source-generated `StreamEventJsonContext` (Native AOT
+safe); the contract has no broker-specific dependency. Events never contain credentials, stream keys, authentication
+data, the internal session GUID, connection IDs or client addresses.
+
+Versioning: within schema version 1, changes are additive only. Fields, enumeration values and reason values may be
+added; no field is renamed, removed, retyped or given a new meaning, and a removed field's name is never reused.
+Consumers must ignore unknown fields, types and reasons. Any other change requires a new schema version.
+
+### Event types
+
+| Type | Emitted | Reason |
+|------|---------|--------|
+| `Published` | By `RtmpSession` after the publish is authenticated, registered as the key's only publisher and accepted by the media and HLS stages (`OnSessionStartedAsync` succeeded), with `NetStream.Publish.Start`. Rejected publishes (unauthorised, duplicate, stage failure) emit nothing. | None |
+| `MediaDescribed` | By the media stage after the HLS stage accepted a description whose track configuration changed and that has at least one track: first when the first track is configured, again when a track is added, replaced by a different sequence header or cleared by an invalid one. Repeated identical headers and metadata-only changes emit nothing. | None |
+| `Ended` | By `RtmpSession` when the session-end transition (`TryEnd`) succeeds, before the stages are notified; exactly once per publication on every path (closeStream, deleteStream, disconnect, timeout, protocol or connection error, stage failure, shutdown). | `unpublished`, `stream_deleted`, `client_disconnected`, `connection_timeout`, `protocol_error`, `connection_error`, `server_shutdown`, `handler_failed` |
+| `PlaylistWithdrawn` | By the HLS store when the publication's playlist stops being served. | `aborted` (abnormal end), `retention_disabled`, `empty` (no segment), `retention_expired`, `replaced` (a new publication of the stream), `storage_pressure` |
+| `Drained` | By the HLS store when the last segment of a withdrawn publication is released; nothing of it remains. Immediately after `PlaylistWithdrawn` if it had no segments. | None |
+
+For one publication the order is `Published`, any `MediaDescribed`, `Ended`, `PlaylistWithdrawn`, `Drained`.
+Events of one publication are published from the threads that perform its transitions in that order, so the channel
+preserves it; events of different publications may interleave. The store raises its events under its lock and
+publishes them after releasing it, in the same call. Like the rest of the store, retention expiry and segment
+release are evaluated lazily on store calls (writes and viewer requests), so `PlaylistWithdrawn` (`retention_expired`)
+and `Drained` are observed at the next store call after the deadline, and their timestamps are that evaluation time.
+A publication whose process exits before draining never emits `Drained`. Compositions without the HLS stage emit only
+`Published`, `MediaDescribed` and `Ended`.
+
+### Incarnation identity
+
+`PublisherSession.IncarnationId` is 128 random bits from `RandomNumberGenerator`, as 32 lowercase hexadecimal digits,
+generated when the session is created. It is the same on every event of the publication, new for every publication
+(including republishing the same application and stream on the same connection), and independent of the internal
+session GUID, the application and the stream name. The HLS store keeps it with the stream instance so withdrawal and
+drain events carry the publication's identifier even after a new publication of the same stream has started.
+
+### Channel, drops and metrics
+
+`StreamEventChannel` is a `Channel.CreateBounded` of `StreamEvents:QueueCapacity` events (default 1024) with
+`FullMode = DropOldest`, a single reader and many writers. When it is full, a write succeeds and the oldest
+undelivered event is discarded. Because `TryWrite` still returns true, drops cannot be detected from its result; they
+are counted in the channel's item-dropped callback, which runs once for each overwritten event.
+
+| Instrument (meter `RTSP.IngestService.Streams`) | Meaning |
+|------------------------------------------------|---------|
+| `stream_events.published` | Events accepted into the channel, including any later overwritten. |
+| `stream_events.dropped` | Accepted events overwritten undelivered because the channel was full. |
+| `stream_events.rejected` | Events offered after the channel closed at shutdown. |
+| `stream_events.consumer_failures` | Events whose consumer threw. |
+
+The only tag is `type` (`published`, `media_described`, `ended`, `playlist_withdrawn`, `drained`); streams,
+applications and identifiers are never tags. `DroppedCount`, `RejectedCount` and `PublishedCount` on the channel are
+monotonic interlocked counters with the same meaning. The drop count does not include events discarded undelivered
+at shutdown, nor events a consumer received but failed to handle. Without a consumer nothing reads the channel, so
+after `QueueCapacity` events every further event overwrites one and is counted as dropped; at any time
+`published = delivered + buffered + dropped + discarded at shutdown`.
+
+### Consumer lifecycle and shutdown
+
+`IStreamEventConsumer.ConsumeAsync(event, token)` is called for one event at a time, in channel order. An exception is
+logged (event 9100), counted, and the next event is delivered; it never stops the dispatcher, ingest or the host.
+`StreamEventDispatcher` is registered before the HTTP origin and the RTMP listener, so the channel exists and delivery
+has started before any publish is accepted, and it stops after both, still accepting the `Ended` and withdrawal events
+their shutdown produces. Its `StopAsync` completes the channel (later events are rejected), cancels the consumer's
+token and waits at most five seconds (`StreamEventDispatcher.StopTimeout`) or until the host's shutdown token fires;
+a consumer that ignores cancellation is abandoned (event 9102). Undelivered events are discarded (event 9101 reports
+how many). Readiness does not depend on the dispatcher or consumer. Only one consumer is supported; registering none
+is valid.
+
+### Tests
+
+`StreamEventContractTests` cover the exact version 1 JSON, field set, optional fields, round-trip through the
+source-generated context, the absence of session, connection, address and key data, incarnation format and
+uniqueness, and the end-reason mapping. `StreamEventChannelTests` cover buffering without a consumer, capacity,
+drop-oldest order, exact drop accounting with concurrent producers, rejection after completion, in-order delivery
+off the producer thread, a stalled consumer not blocking producers, consumer failure isolation, cancellation, the stop
+budget on a fake clock, the host shutdown token and the capacity option range. `StreamLifecycleEventTests` cover
+every RTMP termination path, rejected publishes, republishing, `MediaDescribed` deduplication, every withdrawal reason,
+lazy expiry and drain, and publication outside the store lock. `StreamEventHostTests` run the real host with TCP
+publishes: composition order, the full lifecycle delivered to a failing consumer, and a stalled consumer leaving
+readiness, publishing and shutdown unaffected.

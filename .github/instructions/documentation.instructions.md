@@ -6,7 +6,7 @@ applyTo: "**/*.{cs,md}"
 
 ## Required standard for C# source
 
-The standard below applies to every hand-maintained `.cs` file in every project in `NMS.slnx` — production applications, tests, and tools. It excludes compiler/source-generated output and `bin/`/`obj/`.
+The standard below applies to every hand-maintained `.cs` file in every project in `RTSP.slnx` — the production service and its tests. It excludes compiler/source-generated output and `bin/`/`obj/`.
 
 ### File headers
 
@@ -68,23 +68,17 @@ The standard below applies to every hand-maintained `.cs` file in every project 
 Documentation changes must be validated with the repository's existing mechanisms:
 
 - **Compiler validation.** The repository-root `Directory.Build.props` enables `GenerateDocumentationFile` for all projects, and every project sets `TreatWarningsAsErrors`. Malformed XML, unresolved or ambiguous `cref`s, and `param`/`typeparam` mismatches therefore fail the build, and `CS1591` fails the build for undocumented externally visible members. `CS1591` does not cover private or internal members, so a successful build alone does not prove complete coverage.
-- **Source-level audit.** The documentation audit tool in `tools/Nms.DocAudit/` is the authoritative mechanical check of this standard. It audits every project in the complete solution, in both Debug and Release, for file headers, missing or incomplete XML documentation at every accessibility level, placeholder text, invalid elements and unresolved references (see `tools/Nms.DocAudit/README.md` for the rules and exit codes). CI runs it on every push and pull request. Run it locally from the repository root before submitting documentation changes, and do not claim audit results unless the audit was actually run:
-
-  ```bash
-  dotnet run --project tools/Nms.DocAudit -- --solution NMS.slnx
-  ```
-
-  A successful build alone does not prove compliance, and a clean audit only proves structure and references: the semantic accuracy, completeness and relevance of the documentation still require human review.
+- **Review.** There is no mechanical source-level documentation audit in this repository. File headers, documentation of private and internal members, placeholder text and semantic accuracy must be checked by review.
 
 Expected results before a documentation change is considered complete:
 
 - Every C# file has a meaningful header.
 - Every documentable declaration has relevant XML documentation.
 - XML documentation is syntactically valid, and `cref`, `param` and `typeparam` references are valid.
-- `dotnet build NMS.slnx --configuration Release` succeeds without documentation-related warnings or errors.
-- The documentation audit reports zero outstanding issues.
+- `dotnet build RTSP.slnx --configuration Release` succeeds without documentation-related warnings or errors.
+- Review confirms the file-header and member-documentation requirements above for private and internal members.
 
-Do not weaken build settings, analyzers or audit requirements to make documentation checks pass. Never hide documentation diagnostics with suppressions, `NoWarn`, exclusions, or analyzer configuration changes. Resolve the underlying documentation issue instead.
+Do not weaken build settings or analyzers to make documentation checks pass. Never hide documentation diagnostics with suppressions, `NoWarn`, exclusions, or analyzer configuration changes. Resolve the underlying documentation issue instead.
 
 ## Scope and change discipline
 
@@ -95,9 +89,9 @@ Do not weaken build settings, analyzers or audit requirements to make documentat
 
 ## Terminology and repository context
 
-- Follow established terminology and formatting in `.github/copilot-instructions.md`, `AGENTS.md`, `.github/instructions/csharp.instructions.md`, and the conventions of the project under documentation. Prefer project-local vocabulary (options section names, RID/release layout, WAL/NFRB/RIR terms, tool names) when documenting that project; do not force one application's terminology onto another.
-- NMS is a multi-application repository (`src/` applications, `tests/` tests, `tools/` engineering tools, `deploy/` operational tooling). Documentation for one application or tool must not invent coupling to unrelated projects. Markdown under `docs/`, `deploy/`, and repository-level READMEs must stay aligned with implemented layout and verified commands — do not invent paths, package names, or operational procedures.
-- Never document, echo, or embed credentials, connection strings, broker passwords, or other secrets from local Development/Production configuration files.
+- Follow established terminology and formatting in `.github/copilot-instructions.md`, `AGENTS.md`, `.github/instructions/csharp.instructions.md`, and the conventions of the project under documentation. Prefer project-local vocabulary (options section names, RID/release layout, RTMP/HLS/fMP4 terms) when documenting that project; do not force one application's terminology onto another.
+- The repository contains one service (`src/RTSP.IngestService`), its tests (`tests/`), deployment assets (`deploy/`) and documentation (`docs/`). Markdown under `docs/`, `deploy/`, and repository-level READMEs must stay aligned with implemented layout and verified commands — do not invent paths, package names, or operational procedures.
+- Never document, echo, or embed credentials, stream keys, or other secrets from local Development/Production configuration files.
 
 ## Related workflows
 

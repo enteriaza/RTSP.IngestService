@@ -7,6 +7,7 @@ using System.Net;
 using RTSP.IngestService.Rtmp.Amf;
 using RTSP.IngestService.Rtmp.Protocol;
 using RTSP.IngestService.Rtmp.Publishing;
+using RTSP.IngestService.Streams;
 
 namespace RTSP.IngestService.Rtmp;
 
@@ -446,6 +447,7 @@ internal sealed partial class RtmpSession
         _writer.WriteUserControl(UserControlEventType.StreamBegin, messageStreamId);
         WriteStatus(messageStreamId, "status", "NetStream.Publish.Start", "Publishing started.");
         LogPublishStarted(session.SessionId, ConnectionId, session.Application, session.StreamIdentity, publishType);
+        _context.Events?.Publish(StreamEventFactory.Create(StreamEventType.Published, session, time.GetUtcNow()));
     }
 
     /// <summary>Handles <c>closeStream</c>: ends publishing on the stream and keeps the stream.</summary>
@@ -566,7 +568,11 @@ internal sealed partial class RtmpSession
         stream.Session = null;
         PublishingCount--;
         _context.Registry.Remove(session);
-        session.TryEnd(reason, _context.TimeProvider.GetUtcNow());
+        if (session.TryEnd(reason, _context.TimeProvider.GetUtcNow()))
+        {
+            _context.Events?.Publish(StreamEventFactory.Create(StreamEventType.Ended, session, session.EndedAt!.Value, StreamEventFactory.EndReason(reason)));
+        }
+
         _context.Metrics.SessionEnded(reason);
         LogPublishEnded(
             session.SessionId,

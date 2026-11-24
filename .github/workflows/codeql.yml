@@ -1,15 +1,21 @@
 name: CodeQL
 
-# DISABLED: GitHub code scanning is not available for this repository, so SARIF uploads are rejected.
-# Only workflow_call is declared (GitHub requires a trigger) and no workflow calls this file, so it never
-# runs. To reactivate, restore the push, pull_request, schedule and workflow_dispatch triggers.
+# Results are kept as a SARIF workflow artifact (upload: never) because code scanning uploads are not enabled for
+# this repository. To publish alerts instead, enable code scanning and set upload to "always".
 on:
-  workflow_call:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
 
 permissions:
   actions: read
   contents: read
-  security-events: write
 
 concurrency:
   group: codeql-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
@@ -17,9 +23,17 @@ concurrency:
 
 jobs:
   analyze:
-    name: Analyze (CodeQL)
+    name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: csharp
+            build-mode: manual
+          - language: actions
+            build-mode: none
 
     steps:
       - name: Checkout
@@ -27,44 +41,44 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
-        with:
-          config-file: ./.github/codeql/codeql-config.yml
-          languages: csharp
-
       - name: Setup .NET SDK (repo pin)
+        if: matrix.language == 'csharp'
         uses: actions/setup-dotnet@v6
         with:
           global-json-file: global.json
 
-      - name: Restore solution
-        run: dotnet restore NMS.slnx
+      - name: Initialize CodeQL (C#)
+        if: matrix.language == 'csharp'
+        uses: github/codeql-action/init@v4
+        with:
+          config-file: ./.github/codeql/codeql-config.yml
+          languages: csharp
+          build-mode: manual
+
+      - name: Initialize CodeQL (GitHub Actions workflows)
+        if: matrix.language == 'actions'
+        uses: github/codeql-action/init@v4
+        with:
+          languages: actions
+          build-mode: none
+          queries: security-extended
 
       - name: Build solution
-        run: dotnet build NMS.slnx --configuration Release --no-restore --no-incremental
+        if: matrix.language == 'csharp'
+        run: |
+          dotnet restore RTSP.slnx
+          dotnet build RTSP.slnx --configuration Release --no-restore --no-incremental
 
-      - name: Perform CodeQL Analysis
+      - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v4
         with:
+          category: "/language:${{ matrix.language }}"
           upload: never
           output: codeql-sarif
 
-      - name: Filter generated bin/obj findings from SARIF
-        shell: pwsh
-        run: |
-          $inputs = Get-ChildItem -Path codeql-sarif -Filter *.sarif -File -ErrorAction Stop
-          if ($inputs.Count -lt 1) {
-            throw "No SARIF files found under codeql-sarif/"
-          }
-          New-Item -ItemType Directory -Force -Path codeql-sarif-filtered | Out-Null
-          foreach ($sarif in $inputs) {
-            $out = Join-Path codeql-sarif-filtered $sarif.Name
-            & ./deploy/CodeQL/Filter-CodeQlSarif.ps1 -InputPath $sarif.FullName -OutputPath $out -StripAcceptedSuppressions
-          }
-
-      - name: Upload filtered CodeQL SARIF
-        uses: github/codeql-action/upload-sarif@v4
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@v4
         with:
-          sarif_file: codeql-sarif-filtered
-          category: ".github/workflows/codeql.yml:analyze"
+          name: codeql-sarif-${{ matrix.language }}
+          path: codeql-sarif
+          if-no-files-found: error

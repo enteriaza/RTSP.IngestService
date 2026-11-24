@@ -1,6 +1,6 @@
 ---
 name: Feature request
-about: Propose a capability for an NMS application or tool
+about: Propose a capability for RTSP.IngestService
 labels: [enhancement]
 ---
 
@@ -11,9 +11,11 @@ What problem does this solve?
 Describe the desired behavior.
 
 ## Component
-- [ ] NetFlowCapture
-- [ ] Tooling / repository
-- [ ] Other
+- [ ] RTMP ingest
+- [ ] Media processing / HLS packaging
+- [ ] HTTP HLS origin
+- [ ] Hosting, lifecycle, configuration or logging
+- [ ] Repository tooling
 
 ## Alternatives considered
 List alternatives already considered.

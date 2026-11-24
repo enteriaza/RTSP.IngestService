@@ -1,5 +1,5 @@
 ---
-description: Testing conventions for NMS test projects
+description: Testing conventions for RTSP.IngestService test projects
 globs: "tests/**/*.{cs,csproj}"
 alwaysApply: false
 ---
@@ -11,11 +11,6 @@ alwaysApply: false
 - Do not weaken assertions or raise arbitrary timeouts to hide races—fix the race or wait for the real invariant.
 - Do not disable parallelization globally without evidence of shared mutable state.
 - Report exact pass/fail/skip counts; distinguish a failed full run from a passing isolated rerun.
-- Integration tests must clean up every external resource they create, including RabbitMQ **exchanges and queues** (plus bindings, consumers, channels, and connections). Cleanup must run on success, failure, exception, cancellation, timeout, and partial initialization (`try/finally`, fixture teardown, or `await using`).
-- Every test-created broker resource must have an unambiguous owner (typically `RabbitMqBrokerLab` / `BrokerLabContext` with unique `nms.m8.*` names). One test must never delete another test's or production resources; never purge a vhost or use blanket topology deletion.
-- Broker-backed tests run only against the disposable test broker from `deploy/test-broker/Start-TestBroker.ps1` (container on `127.0.0.1`, dedicated vhost, random per-run credentials). `RabbitMqBrokerLab` reads its connection settings only from the gitignored `.artifacts/test-broker/broker.json` that script writes — never from application `appsettings*.json`, production/lab brokers, or hardcoded values. Never print or log those credentials.
-- Broker-backed tests use `[SkippableFact]` / `[SkippableTheory]` and call `RabbitMqBrokerLab.RequireBroker()` (or `CreateIsolatedContext`): a missing broker fails them; they skip only when `NMS_TEST_BROKER_REQUIRED=false` is set explicitly (Windows CI, which cannot run Linux containers). Never turn broker connection failures into skips or passes. A plain `[Fact]` reports a skip as a failure, so the skippable attributes are needed for that explicit opt-out.
-- Historical test leaks (`nms.m4.q|ex.<12-hex>` from the old integration tests) are remediated automatically by `RabbitMqLabFixture` / `RemediateHistoricalIntegrationTestLeaksAsync` before lab topology is created. That pass is idempotent, ownership-scoped only, and uses the same test-broker settings as AMQP tests — management HTTP Basic auth reuses those credentials; do not add a second credential source. A remediation failure is recorded on the fixture (asserted by `HistoricalLeakRemediationTests`), not thrown, so broker-independent tests in the collection are unaffected.
-- Process-wide measurements (`GC.GetTotalMemory`, working set) are only meaningful with no concurrent tests: place them in a `DisableParallelization` collection (see `ProcessHeapMeasurementCollection`).
-- Pipeline replay tests must not treat `DatagramBufferPool.RentedCount == 0` as "all records delivered": aggregation shards hand off asynchronously and `StopAsync` abandons queued Applies. Also wait for consumer emissions to reach `PipelineTestFactory.TotalRoutedApplies`.
-- After a broker-backed test run, the broker must not retain resources created by that run. Verify against the real broker when changing cleanup.
+- Integration tests bind loopback listeners on port 0 and must dispose every host, server, socket and client they create, including on failure, cancellation and timeout (`try/finally` or `await using`).
+- FFmpeg interoperability tests skip only when FFmpeg/ffprobe are absent and `RTSP_FFMPEG_REQUIRED` is not `true`; CI sets it so a missing tool fails the run. Locally, `RTSP_FFMPEG_PATH` selects the FFmpeg binary.
+- Process-wide measurements (`GC.GetTotalMemory`, working set) are only meaningful with no concurrent tests: place them in a `DisableParallelization` collection.

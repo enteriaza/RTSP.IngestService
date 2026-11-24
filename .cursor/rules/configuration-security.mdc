@@ -1,5 +1,5 @@
 ---
-description: Configuration, credentials, and security conventions for NMS
+description: Configuration, credentials, and security conventions for RTSP.IngestService
 alwaysApply: true
 ---
 

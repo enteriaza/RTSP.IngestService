@@ -6,6 +6,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Media;
+using RTSP.IngestService.Streams;
 
 namespace RTSP.IngestService.Hls;
 
@@ -33,7 +34,8 @@ public static class HlsServiceCollectionExtensions
         services.TryAddSingleton<IHlsSegmentStore>(static sp => new InMemoryHlsSegmentStore(
             sp.GetRequiredService<IOptions<HlsOptions>>(),
             sp.GetRequiredService<TimeProvider>(),
-            sp.GetRequiredService<HlsMetrics>()));
+            sp.GetRequiredService<HlsMetrics>(),
+            sp.GetService<IStreamEventPublisher>()));
         services.TryAddSingleton<IMediaSessionHandler>(static sp => new HlsPackagingHandler(
             sp.GetRequiredService<IOptions<HlsOptions>>(),
             sp.GetRequiredService<IHlsSegmentStore>(),

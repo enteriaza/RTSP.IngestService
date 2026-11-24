@@ -9,6 +9,7 @@ using Microsoft.Extensions.Options;
 using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Rtmp.Amf;
 using RTSP.IngestService.Rtmp.Publishing;
+using RTSP.IngestService.Streams;
 
 namespace RTSP.IngestService.Media;
 
@@ -45,6 +46,12 @@ public sealed partial class MediaPublishSessionHandler : IPublishSessionHandler
     /// <summary>Logger.</summary>
     private readonly ILogger<MediaPublishSessionHandler> _logger;
 
+    /// <summary>Stream lifecycle event publisher, if any.</summary>
+    private readonly IStreamEventPublisher? _events;
+
+    /// <summary>Clock for event timestamps.</summary>
+    private readonly TimeProvider _time;
+
     /// <summary>State of the active sessions by session ID.</summary>
     private readonly ConcurrentDictionary<Guid, SessionState> _sessions = new();
 
@@ -53,13 +60,23 @@ public sealed partial class MediaPublishSessionHandler : IPublishSessionHandler
     /// <param name="downstream">The consumer of typed media.</param>
     /// <param name="metrics">Metrics.</param>
     /// <param name="logger">Logger.</param>
-    internal MediaPublishSessionHandler(IOptions<MediaOptions> options, IMediaSessionHandler downstream, MediaMetrics metrics, ILogger<MediaPublishSessionHandler> logger)
+    /// <param name="events">Receives <see cref="StreamEventType.MediaDescribed"/> events, or <see langword="null"/> for none.</param>
+    /// <param name="time">Clock for event timestamps; the system clock when <see langword="null"/>.</param>
+    internal MediaPublishSessionHandler(
+        IOptions<MediaOptions> options,
+        IMediaSessionHandler downstream,
+        MediaMetrics metrics,
+        ILogger<MediaPublishSessionHandler> logger,
+        IStreamEventPublisher? events = null,
+        TimeProvider? time = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         _options = options.Value;
         _downstream = downstream;
         _metrics = metrics;
         _logger = logger;
+        _events = events;
+        _time = time ?? TimeProvider.System;
     }
 
     /// <summary>Gets the number of sessions with media state; for diagnostics and tests.</summary>
@@ -384,16 +401,27 @@ public sealed partial class MediaPublishSessionHandler : IPublishSessionHandler
         await PublishAsync(state, info with { Metadata = metadata, Video = video }, cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>Replaces the stream description and notifies downstream.</summary>
+    /// <summary>
+    /// Replaces the stream description and notifies downstream. Once downstream has accepted a description whose
+    /// track configurations differ from the previous one and that has at least one track, a
+    /// <see cref="StreamEventType.MediaDescribed"/> event is published; metadata-only changes publish nothing.
+    /// </summary>
     /// <param name="state">The session state.</param>
     /// <param name="info">The new description; its version is assigned here.</param>
     /// <param name="cancellationToken">Cancellation.</param>
     /// <returns>A task that completes when downstream has been notified.</returns>
-    private ValueTask PublishAsync(SessionState state, MediaStreamInfo info, CancellationToken cancellationToken)
+    private async ValueTask PublishAsync(SessionState state, MediaStreamInfo info, CancellationToken cancellationToken)
     {
+        var previous = state.Media.StreamInfo;
         var next = info with { Version = info.Version + 1 };
         state.Media.SetStreamInfo(next);
-        return _downstream.OnStreamInfoChangedAsync(state.Media, next, cancellationToken);
+        await _downstream.OnStreamInfoChangedAsync(state.Media, next, cancellationToken).ConfigureAwait(false);
+        if (_events is not null
+            && (next.Video is not null || next.Audio is not null)
+            && (next.Video?.ConfigurationVersion != previous.Video?.ConfigurationVersion || next.Audio?.ConfigurationVersion != previous.Audio?.ConfigurationVersion))
+        {
+            _events.Publish(StreamEventFactory.Create(StreamEventType.MediaDescribed, state.Media.Publisher, _time.GetUtcNow(), media: StreamEventFactory.Describe(next)));
+        }
     }
 
     /// <summary>Classifies a delivered sample's timestamp step and records any discontinuity.</summary>

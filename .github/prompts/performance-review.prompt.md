@@ -1,1 +1,1 @@
-Review NMS performance-sensitive changes. Require measurement evidence. Consider ReceiveBench under `tools/` when appropriate. Do not sacrifice correctness for speed.
+Review RTSP.IngestService performance-sensitive changes. Require measurement evidence. Do not sacrifice correctness for speed.

@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Report a defect in an NMS application or tool
+about: Report a defect in RTSP.IngestService
 labels: [bug]
 ---
 
@@ -8,9 +8,11 @@ labels: [bug]
 Describe the issue clearly.
 
 ## Component
-- [ ] NetFlowCapture
-- [ ] NetFlowCapture.ReceiveBench
-- [ ] Other / repository tooling
+- [ ] RTMP ingest
+- [ ] Media processing / HLS packaging
+- [ ] HTTP HLS origin
+- [ ] Hosting, lifecycle, configuration or logging
+- [ ] Repository tooling
 
 ## Expected behavior
 What should have happened?

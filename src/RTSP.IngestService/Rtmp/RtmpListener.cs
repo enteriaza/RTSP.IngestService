@@ -10,6 +10,7 @@ using System.Net.Sockets;
 using Microsoft.Extensions.Options;
 using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Rtmp.Publishing;
+using RTSP.IngestService.Streams;
 
 namespace RTSP.IngestService.Rtmp;
 
@@ -67,6 +68,9 @@ public sealed partial class RtmpListener : BackgroundService
     /// <summary>Logger factory for connections.</summary>
     private readonly ILoggerFactory _loggerFactory;
 
+    /// <summary>Stream lifecycle event publisher, if any.</summary>
+    private readonly IStreamEventPublisher? _events;
+
     /// <summary>Listener logger.</summary>
     private readonly ILogger<RtmpListener> _logger;
 
@@ -82,6 +86,9 @@ public sealed partial class RtmpListener : BackgroundService
     /// <summary>Admitted connections that have not finished.</summary>
     private int _activeConnections;
 
+    /// <summary>Whether the socket is bound and accepting; see <see cref="IsListening"/>.</summary>
+    private volatile bool _listening;
+
     /// <summary>Initializes a new instance of the <see cref="RtmpListener"/> class.</summary>
     /// <param name="options">The RTMP options.</param>
     /// <param name="authenticator">Publisher authenticator.</param>
@@ -90,6 +97,7 @@ public sealed partial class RtmpListener : BackgroundService
     /// <param name="metrics">Metrics.</param>
     /// <param name="timeProvider">Clock for timeouts.</param>
     /// <param name="loggerFactory">Logger factory.</param>
+    /// <param name="events">Receives stream lifecycle events, or <see langword="null"/> for none.</param>
     internal RtmpListener(
         IOptions<RtmpOptions> options,
         IPublisherAuthenticator authenticator,
@@ -97,7 +105,8 @@ public sealed partial class RtmpListener : BackgroundService
         PublishedStreamRegistry registry,
         RtmpMetrics metrics,
         TimeProvider timeProvider,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        IStreamEventPublisher? events = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(authenticator);
@@ -114,11 +123,18 @@ public sealed partial class RtmpListener : BackgroundService
         _metrics = metrics;
         _timeProvider = timeProvider;
         _loggerFactory = loggerFactory;
+        _events = events;
         _logger = loggerFactory.CreateLogger<RtmpListener>();
     }
 
     /// <summary>Gets the bound local endpoint (with the actual port when <see cref="RtmpOptions.Port"/> is 0), or <see langword="null"/> before start.</summary>
     public EndPoint? LocalEndPoint { get; private set; }
+
+    /// <summary>
+    /// Gets a value indicating whether the listening socket is bound and accepting connections: <see langword="true"/>
+    /// from a successful bind in <see cref="StartAsync"/> until shutdown begins closing the socket.
+    /// </summary>
+    public bool IsListening => _listening;
 
     /// <summary>Gets the number of admitted connections that have not finished.</summary>
     public int ActiveConnectionCount => Volatile.Read(ref _activeConnections);
@@ -157,8 +173,9 @@ public sealed partial class RtmpListener : BackgroundService
 
         _socket = socket;
         LocalEndPoint = socket.LocalEndPoint;
-        _context = new RtmpServerContext(options, _authenticator, _handler, _registry, _metrics, _timeProvider, _loggerFactory, ArrayPool<byte>.Shared);
+        _context = new RtmpServerContext(options, _authenticator, _handler, _registry, _metrics, _timeProvider, _loggerFactory, ArrayPool<byte>.Shared, _events);
         LogListening(LocalEndPoint, options.MaxConnections);
+        _listening = true;
 
         await base.StartAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -166,6 +183,7 @@ public sealed partial class RtmpListener : BackgroundService
     /// <summary>Closes the listening socket if the accept loop never ran, then disposes the base service.</summary>
     public override void Dispose()
     {
+        _listening = false;
         _socket?.Dispose();
         base.Dispose();
     }
@@ -218,6 +236,7 @@ public sealed partial class RtmpListener : BackgroundService
         }
         finally
         {
+            _listening = false;
             socket.Dispose();
             var active = _connections.Values.Select(static e => e.Task).ToArray();
             LogStopping(active.Length);

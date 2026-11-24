@@ -13,10 +13,6 @@ public sealed partial class ApplicationOptionsValidator : IValidateOptions<Appli
 [OptionsValidator]
 public sealed partial class LifetimeOptionsValidator : IValidateOptions<LifetimeOptions>;
 
-/// <summary>Validates <see cref="HeartbeatOptions"/> against its data annotations.</summary>
-[OptionsValidator]
-public sealed partial class HeartbeatOptionsValidator : IValidateOptions<HeartbeatOptions>;
-
 /// <summary>Validates <see cref="FileLoggingOptions"/> against its data annotations.</summary>
 [OptionsValidator]
 public sealed partial class FileLoggingOptionsValidator : IValidateOptions<FileLoggingOptions>;
@@ -39,3 +35,22 @@ public sealed partial class HlsOptionsValidator : IValidateOptions<HlsOptions>;
 /// <summary>Validates <see cref="HttpOriginOptions"/> against its data annotations.</summary>
 [OptionsValidator]
 public sealed partial class HttpOriginOptionsValidator : IValidateOptions<HttpOriginOptions>;
+
+/// <summary>Validates <see cref="StreamEventOptions"/> against its data annotations.</summary>
+[OptionsValidator]
+public sealed partial class StreamEventOptionsValidator : IValidateOptions<StreamEventOptions>;
+
+/// <summary>
+/// Validates <see cref="ManagementOptions"/>. Every value of its only setting is valid, so this validator always
+/// succeeds; unknown keys and unconvertible values are still rejected by strict binding. Written by hand because the
+/// options source generator rejects a type with no annotated members.
+/// </summary>
+public sealed class ManagementOptionsValidator : IValidateOptions<ManagementOptions>
+{
+    /// <inheritdoc />
+    public ValidateOptionsResult Validate(string? name, ManagementOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return ValidateOptionsResult.Success;
+    }
+}

@@ -16,6 +16,12 @@ concurrency:
   group: build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  # FFmpeg interoperability tests fail instead of skipping when FFmpeg or ffprobe is missing.
+  RTSP_FFMPEG_REQUIRED: "true"
+
 jobs:
   build-test:
     name: Build and Test (${{ matrix.os }})
@@ -24,9 +30,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+            executable: RTSP.IngestService
+          - os: windows-latest
+            rid: win-x64
+            executable: RTSP.IngestService.exe
 
     steps:
       - name: Checkout
@@ -47,7 +57,6 @@ jobs:
           actual="$(dotnet --version | tr -d '\r')"
           echo "global.json sdk.version=$expected"
           echo "dotnet --version=$actual"
-          dotnet --list-sdks || true
           if [ "$actual" != "$expected" ]; then
             echo "SDK mismatch: expected exactly '$expected' from global.json, got '$actual'."
             exit 1
@@ -59,19 +68,13 @@ jobs:
           set -euo pipefail
           disk_list="$(mktemp)"
           sln_list="$(mktemp)"
-          # src/WebSite and tests/WebSite.Tests are abandoned historical source kept outside the
-          # solution since the TechConnect extraction (commit 1365179); they no longer compile.
-          find src tests -name '*.csproj' \
-            ! -path 'src/WebSite/*' ! -path 'tests/WebSite.Tests/*' \
-            | sed 's|\\|/|g' | sed 's|^\./||' | sort -u > "$disk_list"
-          # tools/ membership is selective (ReceiveBench and Nms.DocAudit); this check covers src/ and tests/.
-          dotnet sln NMS.slnx list | tr -d '\r' | sed 's|\\|/|g' | sed 's|^\./||' | grep '\.csproj$' \
-            | grep -E '^(src|tests)/' | sort -u > "$sln_list"
+          find src tests -name '*.csproj' | sed 's|\\|/|g' | sed 's|^\./||' | sort -u > "$disk_list"
+          dotnet sln RTSP.slnx list | tr -d '\r' | sed 's|\\|/|g' | sed 's|^\./||' | grep '\.csproj$' | sort -u > "$sln_list"
           if ! cmp -s "$disk_list" "$sln_list"; then
             echo "Solution membership does not match every project under src/ and tests/."
-            echo "On disk but not in NMS.slnx:"
+            echo "On disk but not in RTSP.slnx:"
             comm -23 "$disk_list" "$sln_list"
-            echo "In NMS.slnx but missing on disk:"
+            echo "In RTSP.slnx but missing on disk:"
             comm -13 "$disk_list" "$sln_list"
             exit 1
           fi
@@ -82,153 +85,103 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Nested Directory.Build.props/.targets/.rsp use MSBuild nearest-wins and shadow the
-          # repository-root policy. Supported layout: only the repo-root Directory.Build.props
-          # and Directory.Build.targets. This is a CI/repository guard, not an absolute local
-          # MSBuild guarantee against deliberate circumvention.
-          #
-          # Exclusions (generated / VCS / build output): .git, .artifacts, bin, obj
-          fail=0
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            case "$f" in
-              Directory.Build.props|Directory.Build.targets) continue ;;
-            esac
-            echo "Nested Directory.Build file is forbidden (shadows repo .NET 10 policy): $f"
-            fail=1
-          done < <(find . \( -name 'Directory.Build.props' -o -name 'Directory.Build.targets' -o -name 'Directory.Build.rsp' \) \
-            ! -path './.git/*' ! -path './.artifacts/*' ! -path '*/bin/*' ! -path '*/obj/*' \
-            | sed 's|^\./||' | sort -u)
-          if [ "$fail" -ne 0 ]; then
+          # Nested Directory.Build.props/.targets/.rsp use MSBuild nearest-wins and would shadow the repository-root
+          # policy (net10.0, nullable, warnings as errors).
+          nested="$(find . \( -name 'Directory.Build.props' -o -name 'Directory.Build.targets' -o -name 'Directory.Build.rsp' \) \
+            ! -path './.git/*' ! -path '*/bin/*' ! -path '*/obj/*' | sed 's|^\./||' \
+            | grep -v -x -e 'Directory.Build.props' -e 'Directory.Build.targets' || true)"
+          if [ -n "$nested" ]; then
+            echo "Nested Directory.Build files are forbidden:"
+            echo "$nested"
             exit 1
           fi
-          echo "No nested Directory.Build.props/targets/rsp files."
 
-      - name: Audit MSBuild project inventory
+      - name: Verify every project targets net10.0
         shell: bash
         run: |
           set -euo pipefail
-          # Fail closed on unexpected project extensions so maintained projects cannot
-          # silently escape the .NET TFM inventory (cs/fs/vb).
-          # Exclusions: .git, .artifacts, bin, obj
-          unexpected="$(mktemp)"
-          find . \( \
-              -name '*.vcxproj' -o -name '*.sqlproj' -o -name '*.wixproj' -o \
-              -name '*.msbuildproj' -o -name '*.shproj' -o -name '*.proj' \
-            \) \
-            ! -path './.git/*' ! -path './.artifacts/*' ! -path '*/bin/*' ! -path '*/obj/*' \
-            | sed 's|^\./||' | sort -u > "$unexpected"
-          if [ -s "$unexpected" ]; then
-            echo "Unexpected MSBuild project extension(s) outside the .NET inventory."
-            echo "Classify each project (add to TFM gate or document a deliberate exclusion):"
-            cat "$unexpected"
-            exit 1
-          fi
-          echo "No unexpected non-cs/fs/vb project extensions outside exclusions."
-
-      - name: Verify every in-scope project targets net10.0
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Repository-wide discovery of SDK-style .NET projects (cs/fs/vb).
-          # Not limited to NMS.slnx or src/tests/tools.
-          # Exclusions (generated / VCS / build output): .git, .artifacts, bin, obj
           fail=0
-          py=python3
-          command -v python3 >/dev/null 2>&1 || py=python
           while IFS= read -r proj; do
-            [ -z "$proj" ] && continue
-            if ! json="$(dotnet msbuild "$proj" -nologo -getProperty:TargetFramework -getProperty:TargetFrameworks 2>/dev/null | tr -d '\r')"; then
-              echo "Failed to evaluate project: $proj"
-              fail=1
-              continue
-            fi
-            if ! tf="$(printf '%s' "$json" | "$py" -c 'import json,sys; p=json.load(sys.stdin); print(p.get("Properties",p).get("TargetFramework",""))')"; then
-              echo "Failed to parse TargetFramework for: $proj"
-              echo "$json"
-              fail=1
-              continue
-            fi
-            if ! tfs="$(printf '%s' "$json" | "$py" -c 'import json,sys; p=json.load(sys.stdin); print(p.get("Properties",p).get("TargetFrameworks",""))')"; then
-              echo "Failed to parse TargetFrameworks for: $proj"
-              echo "$json"
-              fail=1
-              continue
-            fi
-            if [ -n "$tfs" ]; then
-              echo "Project uses TargetFrameworks (forbidden): $proj => '$tfs'"
-              fail=1
-            fi
-            if [ "$tf" != "net10.0" ]; then
-              echo "Project TargetFramework must be net10.0: $proj => '$tf'"
+            tf="$(dotnet msbuild "$proj" -nologo -getProperty:TargetFramework | tr -d '\r')"
+            tfs="$(dotnet msbuild "$proj" -nologo -getProperty:TargetFrameworks | tr -d '\r')"
+            if [ -n "$tfs" ] || [ "$tf" != "net10.0" ]; then
+              echo "Project must target exactly net10.0: $proj => TargetFramework='$tf' TargetFrameworks='$tfs'"
               fail=1
             else
               echo "OK $proj => net10.0"
             fi
-          done < <(find . \( -name '*.csproj' -o -name '*.fsproj' -o -name '*.vbproj' \) \
-            ! -path './.git/*' ! -path './.artifacts/*' ! -path '*/bin/*' ! -path '*/obj/*' \
-            | sed 's|^\./||' | sort -u)
-          if [ "$fail" -ne 0 ]; then
-            exit 1
+          done < <(find . -name '*.csproj' ! -path './.git/*' ! -path '*/bin/*' ! -path '*/obj/*' | sed 's|^\./||' | sort -u)
+          exit "$fail"
+
+      # Distribution FFmpeg packages are too old: FFmpeg 7.0 and earlier omit packet durations when demuxing fMP4 HLS,
+      # which the interoperability tests assert. Install the current BtbN 9.0 release-branch build on both runners.
+      - name: Install FFmpeg 9.0
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FFMPEG_PLATFORM: ${{ runner.os == 'Windows' && 'win64' || 'linux64' }}
+        run: |
+          set -euo pipefail
+          ext=$([ "$FFMPEG_PLATFORM" = win64 ] && echo zip || echo tar.xz)
+          asset="$(gh release view latest --repo BtbN/FFmpeg-Builds --json assets --jq '.assets[].name' \
+            | grep -E "^ffmpeg-n9\.0.*-${FFMPEG_PLATFORM}-gpl-9\.0\.(zip|tar\.xz)$" | grep -F ".${ext}" | head -n1 || true)"
+          test -n "$asset"
+          echo "FFmpeg asset: $asset"
+          dir="$RUNNER_TEMP/ffmpeg"
+          gh release download latest --repo BtbN/FFmpeg-Builds --pattern "$asset" --dir "$RUNNER_TEMP"
+          mkdir -p "$dir"
+          if [ "$ext" = zip ]; then
+            unzip -q "$RUNNER_TEMP/$asset" -d "$dir"
+          else
+            tar -xJf "$RUNNER_TEMP/$asset" -C "$dir"
           fi
+          bin="$(dirname "$(find "$dir" -type f \( -name ffmpeg -o -name ffmpeg.exe \) | head -n1)")"
+          if [ "$FFMPEG_PLATFORM" = win64 ]; then bin="$(cygpath -w "$bin")"; fi
+          echo "$bin" >> "$GITHUB_PATH"
 
-      - name: Restore solution
-        run: dotnet restore NMS.slnx
+      - name: Show FFmpeg version
+        shell: bash
+        run: |
+          ffmpeg -hide_banner -version | head -n1
+          ffprobe -hide_banner -version | head -n1
+          ffmpeg -hide_banner -encoders | grep -E 'libx264|aac'
 
-      - name: Build solution
-        run: dotnet build NMS.slnx --configuration Release --no-restore
+      - name: Restore
+        run: dotnet restore RTSP.slnx
 
-      - name: Build benchmark tools
+      - name: Verify formatting
+        run: dotnet format RTSP.slnx --verify-no-changes --no-restore
+
+      - name: Build (Release)
+        run: dotnet build RTSP.slnx --configuration Release --no-restore
+
+      - name: Test (Release)
+        timeout-minutes: 20
+        run: dotnet test RTSP.slnx --configuration Release --no-build
+
+      - name: Install Native AOT prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends clang zlib1g-dev
+
+      - name: Publish Native AOT (${{ matrix.rid }})
+        run: dotnet publish src/RTSP.IngestService/RTSP.IngestService.csproj --configuration Release --runtime ${{ matrix.rid }} --output artifacts/publish/${{ matrix.rid }}
+
+      - name: Verify published output
         shell: bash
         run: |
           set -euo pipefail
-          for proj in $(find tools -name '*.csproj' | sort); do
-            dotnet build "$proj" --configuration Release
-          done
-
-      - name: Test NetFlowGenerator
-        timeout-minutes: 10
-        run: dotnet test tests/NetFlowGenerator.Tests/NetFlowGenerator.Tests.csproj --configuration Release --no-build --verbosity normal
-
-      # Disposable broker with per-run random credentials (deploy/test-broker). Linux only:
-      # Windows runners cannot run Linux containers, so broker-backed tests are explicitly
-      # skipped there (NMS_TEST_BROKER_REQUIRED=false); a missing broker fails everywhere else.
-      - name: Start isolated RabbitMQ test broker
-        if: runner.os == 'Linux'
-        timeout-minutes: 5
-        shell: pwsh
-        run: ./deploy/test-broker/Start-TestBroker.ps1
-
-      - name: Test NetFlowCapture
-        timeout-minutes: 25
-        env:
-          NMS_TEST_BROKER_REQUIRED: ${{ runner.os == 'Linux' && 'true' || 'false' }}
-        run: dotnet test tests/NetFlowCapture.Tests/NetFlowCapture.Tests.csproj --configuration Release --no-build --verbosity normal
-
-      - name: Golden PCAP corpus filter (parity signal)
-        timeout-minutes: 10
-        run: dotnet test tests/NetFlowCapture.Tests/NetFlowCapture.Tests.csproj --configuration Release --no-build --filter FullyQualifiedName~GoldenPcapCorpusTests --verbosity normal
-
-      # End-to-end cases restore throwaway solutions under the runner's temp directory, never the checkout.
-      - name: Test documentation audit tool
-        timeout-minutes: 10
-        run: dotnet test tests/Nms.DocAudit.Tests/Nms.DocAudit.Tests.csproj --configuration Release --no-build --verbosity normal
-
-      # Enforces .github/instructions/documentation.instructions.md for every project in NMS.slnx
-      # (Debug and Release). Read-only; exit 1 = violations, 2 = tool/configuration error. Reuses the
-      # Release build above and evaluates projects without compiling them again.
-      - name: Documentation audit
-        timeout-minutes: 15
-        run: dotnet run --project tools/Nms.DocAudit/Nms.DocAudit.csproj --configuration Release --no-build -- --solution NMS.slnx
-
-      - name: RabbitMQ test broker diagnostics
-        if: failure() && runner.os == 'Linux'
-        shell: bash
-        run: |
-          docker ps -a --filter name=nms-test-rabbitmq --format '{{.Names}} {{.Image}} {{.Status}}' || true
-          docker logs --tail 300 nms-test-rabbitmq || true
-
-      - name: Stop isolated RabbitMQ test broker
-        if: always() && runner.os == 'Linux'
-        shell: pwsh
-        run: ./deploy/test-broker/Stop-TestBroker.ps1
+          out="artifacts/publish/${{ matrix.rid }}"
+          exe="$out/${{ matrix.executable }}"
+          test -f "$exe"
+          test -f "$out/appsettings.json"
+          if ls "$out"/appsettings.Development*.json "$out"/appsettings.Production*.json >/dev/null 2>&1; then
+            echo "Environment-specific settings must not be published."
+            exit 1
+          fi
+          # Invalid configuration must exit with EX_CONFIG (78) from the native executable.
+          set +e
+          Http__Port=70000 "$exe" --environment Testing > /dev/null 2>&1
+          code=$?
+          set -e
+          echo "Exit code for invalid configuration: $code"
+          test "$code" -eq 78

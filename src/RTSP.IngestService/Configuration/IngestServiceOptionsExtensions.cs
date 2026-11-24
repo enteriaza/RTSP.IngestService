@@ -20,8 +20,8 @@ public static class IngestServiceOptionsExtensions
     private static readonly Action<BinderOptions> StrictBinding = static binder => binder.ErrorOnUnknownConfiguration = true;
 
     /// <summary>
-    /// Registers <see cref="ApplicationOptions"/>, <see cref="LifetimeOptions"/>, <see cref="HeartbeatOptions"/>,
-    /// <see cref="FileLoggingOptions"/>, <see cref="RtmpOptions"/>, <see cref="MediaOptions"/>, <see cref="HlsOptions"/> and <see cref="HttpOriginOptions"/>, each bound from its configuration section,
+    /// Registers <see cref="ApplicationOptions"/>, <see cref="LifetimeOptions"/>,
+    /// <see cref="FileLoggingOptions"/>, <see cref="RtmpOptions"/>, <see cref="MediaOptions"/>, <see cref="HlsOptions"/>, <see cref="HttpOriginOptions"/>, <see cref="ManagementOptions"/> and <see cref="StreamEventOptions"/>, each bound from its configuration section,
     /// validated when first resolved and validated eagerly when the host starts.
     /// </summary>
     /// <param name="services">The service collection to add registrations to.</param>
@@ -43,8 +43,6 @@ public static class IngestServiceOptionsExtensions
             services, configuration, ApplicationOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
         AddValidatedOptions<LifetimeOptions, LifetimeOptionsValidator>(
             services, configuration, LifetimeOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
-        AddValidatedOptions<HeartbeatOptions, HeartbeatOptionsValidator>(
-            services, configuration, HeartbeatOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
         AddValidatedOptions<FileLoggingOptions, FileLoggingOptionsValidator>(
             services, configuration, FileLoggingOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
         AddValidatedOptions<RtmpOptions, RtmpOptionsValidator>(
@@ -55,6 +53,10 @@ public static class IngestServiceOptionsExtensions
             services, configuration, HlsOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
         AddValidatedOptions<HttpOriginOptions, HttpOriginOptionsValidator>(
             services, configuration, HttpOriginOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
+        AddValidatedOptions<ManagementOptions, ManagementOptionsValidator>(
+            services, configuration, ManagementOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
+        AddValidatedOptions<StreamEventOptions, StreamEventOptionsValidator>(
+            services, configuration, StreamEventOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
 
         return services;
     }

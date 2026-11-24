@@ -1,5 +1,6 @@
 // Kestrel request pipeline of the HTTP HLS origin: routes /hls/{application}/{stream}/{file} to the segment store
-// and writes playlists, initialization segments and media segments. There is no middleware and no routing
+// and writes playlists, initialization segments and media segments, and hands /health/* to the management endpoints
+// when they are enabled, so both share the one listener. There is no middleware and no routing
 // framework; the store is only read, never locked across a network write, and segment bytes are written straight
 // from the store's immutable buffers.
 
@@ -13,6 +14,7 @@ using Microsoft.Extensions.Options;
 using Microsoft.Net.Http.Headers;
 using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Hls;
+using RTSP.IngestService.Management;
 
 namespace RTSP.IngestService.Http;
 
@@ -81,13 +83,20 @@ internal sealed partial class HlsHttpApplication : IHttpApplication<HttpContext>
     /// <summary>Random per-process prefix of entity tags, so tags never match across restarts.</summary>
     private readonly string _epoch;
 
+    /// <summary>Management routes served on the same listener, or <see langword="null"/> when management is disabled.</summary>
+    private readonly ManagementEndpoints? _management;
+
     /// <summary>Initializes a new instance of the <see cref="HlsHttpApplication"/> class.</summary>
     /// <param name="store">The segment store.</param>
     /// <param name="hlsOptions">The HLS options, which bound segment cache lifetimes.</param>
     /// <param name="metrics">Metrics.</param>
     /// <param name="timeProvider">Clock.</param>
     /// <param name="logger">Logger.</param>
-    public HlsHttpApplication(IHlsSegmentStore store, IOptions<HlsOptions> hlsOptions, HttpOriginMetrics metrics, TimeProvider timeProvider, ILogger<HlsHttpApplication> logger)
+    /// <param name="management">
+    /// Management routes to serve for paths under <see cref="ManagementEndpoints.PathPrefix"/>, or
+    /// <see langword="null"/> to treat those paths as unknown HLS paths.
+    /// </param>
+    public HlsHttpApplication(IHlsSegmentStore store, IOptions<HlsOptions> hlsOptions, HttpOriginMetrics metrics, TimeProvider timeProvider, ILogger<HlsHttpApplication> logger, ManagementEndpoints? management = null)
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(hlsOptions);
@@ -101,6 +110,7 @@ internal sealed partial class HlsHttpApplication : IHttpApplication<HttpContext>
         _logger = logger;
         _segmentCacheControl = $"public, max-age={(long)SegmentCacheLifetime(hlsOptions.Value).TotalSeconds}";
         _epoch = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(4));
+        _management = management;
     }
 
     /// <summary>
@@ -130,6 +140,12 @@ internal sealed partial class HlsHttpApplication : IHttpApplication<HttpContext>
     public async Task ProcessRequestAsync(HttpContext context)
     {
         ArgumentNullException.ThrowIfNull(context);
+        if (_management is not null && ManagementEndpoints.IsManagementPath(context.Request.Path.Value))
+        {
+            await _management.ServeAsync(context).ConfigureAwait(false);
+            return;
+        }
+
         var start = _timeProvider.GetTimestamp();
         _metrics.RequestStarted();
         var route = Route.Parse(context.Request.Path.Value);

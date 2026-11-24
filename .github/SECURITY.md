@@ -8,4 +8,4 @@ Use GitHub Security Advisories (private) for this repository when available, or 
 
 ## Configuration and credentials
 
-NMS stores local Development and Production credentials in gitignored `appsettings.*.json` files. Example templates with placeholders are tracked. Do not commit real credentials.
+RTSP.IngestService stores local Development and Production credentials (such as RTMP stream keys) in gitignored `appsettings.*.json` files. Example templates with placeholders are tracked. Do not commit real credentials.

@@ -1,5 +1,5 @@
 ---
-description: C# / .NET conventions for NMS source and tests
+description: C# / .NET conventions for RTSP.IngestService source and tests
 globs: "**/*.{cs,csproj}"
 alwaysApply: false
 ---

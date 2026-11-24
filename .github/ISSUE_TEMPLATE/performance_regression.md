@@ -8,8 +8,11 @@ labels: [performance]
 Describe the regression.
 
 ## Component
-- [ ] NetFlowCapture
-- [ ] ReceiveBench / tooling
+- [ ] RTMP ingest
+- [ ] Media processing / HLS packaging
+- [ ] HTTP HLS origin
+- [ ] Hosting, lifecycle, configuration or logging
+- [ ] Repository tooling
 
 ## Baseline
 - Prior commit/version:
@@ -22,7 +25,7 @@ Describe the regression.
 - Environment differences:
 
 ## Reproduction
-Commands or ReceiveBench modes used (no secrets).
+Commands, encoder settings and configuration used (no secrets).
 
 ## Impact
 Operational impact and urgency.

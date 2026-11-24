@@ -1,11 +1,9 @@
-name: NMS CodeQL configuration
+name: RTSP.IngestService CodeQL configuration
 
 queries:
   - uses: ./.github/codeql/csharp-with-alert-suppression.qls
 
-# paths-ignore documents intent for non-traced languages / documentation.
-# For traced C# builds, compiled obj/bin still appear in SARIF;
-# deploy/CodeQL/Filter-CodeQlSarif.ps1 strips those results before upload.
+# Build output and generated sources are not analysed.
 paths-ignore:
   - '**/bin/**'
   - '**/obj/**'

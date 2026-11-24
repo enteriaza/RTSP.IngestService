@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Review NMS diffs for defects, risks, and evidence-backed findings without auto-editing.
+description: Review RTSP.IngestService diffs for defects, risks, and evidence-backed findings without auto-editing.
 ---
 
 # Code review

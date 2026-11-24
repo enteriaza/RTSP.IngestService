@@ -63,7 +63,7 @@ public sealed partial class HlsPackagingHandler : IMediaSessionHandler
     {
         ArgumentNullException.ThrowIfNull(session);
         var publisher = session.Publisher;
-        if (!_store.TryOpenStream(session.SessionId, publisher.Application, publisher.StreamIdentity, HlsPackager.TargetDurationSeconds(_options), out var numbering))
+        if (!_store.TryOpenStream(session.SessionId, publisher.Application, publisher.StreamIdentity, HlsPackager.TargetDurationSeconds(_options), out var numbering, publisher.IncarnationId))
         {
             LogRejected(session.SessionId);
             throw new InvalidOperationException("The HLS segment store refused the stream: the stream limit is reached or the stream is already being packaged.");

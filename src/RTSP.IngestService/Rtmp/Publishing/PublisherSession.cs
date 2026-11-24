@@ -105,6 +105,7 @@ public sealed class PublisherSession
         DateTimeOffset startedAt)
     {
         SessionId = Guid.CreateVersion7(startedAt);
+        IncarnationId = Convert.ToHexStringLower(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
         ConnectionId = connectionId;
         RemoteEndPoint = remoteEndPoint;
         Application = application;
@@ -117,6 +118,13 @@ public sealed class PublisherSession
 
     /// <summary>Gets the unique, time-ordered session identifier.</summary>
     public Guid SessionId { get; }
+
+    /// <summary>
+    /// Gets the public identifier of this publication, used by stream lifecycle events: 32 lowercase hexadecimal
+    /// digits (128 random bits), new for every session and independent of <see cref="SessionId"/>, the application and
+    /// the stream identity.
+    /// </summary>
+    public string IncarnationId { get; }
 
     /// <summary>Gets the identifier of the TCP connection carrying the session.</summary>
     public long ConnectionId { get; }

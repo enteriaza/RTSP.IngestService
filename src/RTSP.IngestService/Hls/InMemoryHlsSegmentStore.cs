@@ -5,6 +5,7 @@
 
 using Microsoft.Extensions.Options;
 using RTSP.IngestService.Configuration;
+using RTSP.IngestService.Streams;
 
 namespace RTSP.IngestService.Hls;
 
@@ -36,6 +37,12 @@ namespace RTSP.IngestService.Hls;
 /// Generation: published playlists reference segments as <c>{<see cref="Generation"/>}/{name}</c>. The generation is
 /// random per store instance (one per process in the service), so URIs from an earlier process never name this
 /// process's media, although numbering restarts with the process.
+/// </para>
+/// <para>
+/// Lifecycle events: withdrawing a playlist raises <see cref="StreamEventType.PlaylistWithdrawn"/>, and releasing the
+/// last segment of a withdrawn stream raises <see cref="StreamEventType.Drained"/>, each once per stream instance.
+/// They are raised under the lock and published by the same call after the lock is released; like every other
+/// transition here, retention expiry and drain are evaluated lazily, so they are observed on the next store call.
 /// </para>
 /// <para>Thread-safe; all state is guarded by one lock and every operation is short and bounded.</para>
 /// </remarks>
@@ -75,16 +82,27 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
     /// <summary>The <see cref="Generation"/> path segment that prefixes every URI in published playlists.</summary>
     private readonly string _uriPrefix;
 
+    /// <summary>Stream lifecycle event publisher, if any.</summary>
+    private readonly IStreamEventPublisher? _events;
+
+    /// <summary>Lifecycle events raised under <see cref="_gate"/>, published by the same call after it is released.</summary>
+    private readonly List<StreamEvent> _pendingEvents = [];
+
     /// <summary>Initializes a new instance of the <see cref="InMemoryHlsSegmentStore"/> class.</summary>
     /// <param name="options">The limits.</param>
     /// <param name="time">The clock.</param>
     /// <param name="metrics">Metrics.</param>
-    internal InMemoryHlsSegmentStore(IOptions<HlsOptions> options, TimeProvider time, HlsMetrics metrics)
+    /// <param name="events">
+    /// Receives <see cref="StreamEventType.PlaylistWithdrawn"/> and <see cref="StreamEventType.Drained"/> events for
+    /// streams opened with an incarnation identifier, or <see langword="null"/> for none.
+    /// </param>
+    internal InMemoryHlsSegmentStore(IOptions<HlsOptions> options, TimeProvider time, HlsMetrics metrics, IStreamEventPublisher? events = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         _options = options.Value;
         _time = time;
         _metrics = metrics;
+        _events = events;
         Generation = Convert.ToHexStringLower(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
         _uriPrefix = Generation + "/";
     }
@@ -98,7 +116,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
     {
         get
         {
-            lock (_gate)
+            using (EnterGate())
             {
                 PurgeExpired();
                 return _totalBytes;
@@ -111,7 +129,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
     {
         get
         {
-            lock (_gate)
+            using (EnterGate())
             {
                 PurgeExpired();
                 return _keys.Values.Count(static k => k.Current is not null);
@@ -124,7 +142,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
     {
         get
         {
-            lock (_gate)
+            using (EnterGate())
             {
                 PurgeExpired();
                 return _keys.Values.Sum(static k => k.Withdrawn.Count);
@@ -133,9 +151,9 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
     }
 
     /// <inheritdoc />
-    public bool TryOpenStream(Guid sessionId, string application, string streamIdentity, int targetDurationSeconds, out HlsStreamNumbering numbering)
+    public bool TryOpenStream(Guid sessionId, string application, string streamIdentity, int targetDurationSeconds, out HlsStreamNumbering numbering, string? incarnationId = null)
     {
-        lock (_gate)
+        using (EnterGate())
         {
             PurgeExpired();
             numbering = default;
@@ -158,10 +176,10 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
             }
             else if (keyState.Current is { } ended)
             {
-                Withdraw(keyState, ended);
+                Withdraw(keyState, ended, StreamEventReasons.Replaced);
             }
 
-            var state = new StreamState(key, sessionId, new HlsPlaylist(targetDurationSeconds, _options.PlaylistWindowSize));
+            var state = new StreamState(key, sessionId, new HlsPlaylist(targetDurationSeconds, _options.PlaylistWindowSize), incarnationId);
             keyState.Current = state;
             _bySession[sessionId] = state;
             numbering = new HlsStreamNumbering(keyState.NextSequence, keyState.NextInitialization);
@@ -173,7 +191,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
     public HlsAppendResult AddInitialization(Guid sessionId, HlsSegment segment)
     {
         ArgumentNullException.ThrowIfNull(segment);
-        lock (_gate)
+        using (EnterGate())
         {
             PurgeExpired();
             var state = Writer(sessionId);
@@ -202,7 +220,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
     {
         ArgumentNullException.ThrowIfNull(segment);
         ArgumentNullException.ThrowIfNull(entry);
-        lock (_gate)
+        using (EnterGate())
         {
             PurgeExpired();
             var state = Writer(sessionId);
@@ -246,7 +264,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
     /// <inheritdoc />
     public void CloseStream(Guid sessionId, bool completed)
     {
-        lock (_gate)
+        using (EnterGate())
         {
             PurgeExpired();
             if (!_bySession.Remove(sessionId, out var state))
@@ -255,9 +273,13 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
             }
 
             var keyState = _keys[state.Key];
-            if (!completed || _options.EndedStreamRetention == TimeSpan.Zero || state.Playlist.Entries.Count == 0)
+            var withdrawal = !completed ? StreamEventReasons.Aborted
+                : _options.EndedStreamRetention == TimeSpan.Zero ? StreamEventReasons.RetentionDisabled
+                : state.Playlist.Entries.Count == 0 ? StreamEventReasons.Empty
+                : null;
+            if (withdrawal is not null)
             {
-                Withdraw(keyState, state);
+                Withdraw(keyState, state, withdrawal);
                 return;
             }
 
@@ -271,7 +293,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
     /// <inheritdoc />
     public HlsPlaylistSnapshot? GetPlaylist(string application, string streamIdentity)
     {
-        lock (_gate)
+        using (EnterGate())
         {
             PurgeExpired();
             return _keys.TryGetValue((application, streamIdentity), out var keyState) ? keyState.Current?.Snapshot : null;
@@ -281,7 +303,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
     /// <inheritdoc />
     public HlsSegment? GetSegment(string application, string streamIdentity, string name)
     {
-        lock (_gate)
+        using (EnterGate())
         {
             PurgeExpired();
             if (!_keys.TryGetValue((application, streamIdentity), out var keyState))
@@ -304,7 +326,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
     /// <inheritdoc />
     public bool ContainsStream(string application, string streamIdentity)
     {
-        lock (_gate)
+        using (EnterGate())
         {
             PurgeExpired();
             return _keys.ContainsKey((application, streamIdentity));
@@ -388,7 +410,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
         {
             if (keyState.Current is { Ended: true } ended)
             {
-                Withdraw(keyState, ended);
+                Withdraw(keyState, ended, StreamEventReasons.StoragePressure);
             }
         }
 
@@ -414,7 +436,8 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
     /// </summary>
     /// <param name="keyState">The key.</param>
     /// <param name="state">The stream.</param>
-    private void Withdraw(KeyState keyState, StreamState state)
+    /// <param name="reason">The <see cref="StreamEvent.Reason"/> of the withdrawal.</param>
+    private void Withdraw(KeyState keyState, StreamState state, string reason)
     {
         _bySession.Remove(state.SessionId);
         if (ReferenceEquals(keyState.Current, state))
@@ -432,9 +455,14 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
         state.Snapshot = null;
         state.CurrentInitialization = null;
         ReleaseUnreferencedInitializations(state);
+        Raise(StreamEventType.PlaylistWithdrawn, state, now, reason);
         if (state.Segments.Count > 0)
         {
             keyState.Withdrawn.Add(state);
+        }
+        else
+        {
+            Raise(StreamEventType.Drained, state, now);
         }
     }
 
@@ -446,7 +474,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
         {
             if (keyState.Current is { Ended: true } ended && ended.ExpiresAt <= now)
             {
-                Withdraw(keyState, ended);
+                Withdraw(keyState, ended, StreamEventReasons.RetentionExpired);
             }
 
             foreach (var state in keyState.Instances())
@@ -465,10 +493,53 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
                 ReleaseUnreferencedInitializations(state);
             }
 
-            keyState.Withdrawn.RemoveAll(static s => s.Segments.Count == 0);
+            RemoveDrained(keyState);
         }
 
         RemoveEmptyKeys();
+    }
+
+    /// <summary>Forgets withdrawn streams with no remaining segments, raising <see cref="StreamEventType.Drained"/> for each.</summary>
+    /// <param name="keyState">The key.</param>
+    private void RemoveDrained(KeyState keyState)
+    {
+        var withdrawn = keyState.Withdrawn;
+        var kept = 0;
+        for (var i = 0; i < withdrawn.Count; i++)
+        {
+            var state = withdrawn[i];
+            if (state.Segments.Count == 0)
+            {
+                Raise(StreamEventType.Drained, state, _time.GetUtcNow());
+            }
+            else
+            {
+                withdrawn[kept++] = state;
+            }
+        }
+
+        withdrawn.RemoveRange(kept, withdrawn.Count - kept);
+    }
+
+    /// <summary>Records a lifecycle event of a stream instance, to be published once the lock is released.</summary>
+    /// <param name="type">The transition.</param>
+    /// <param name="state">The stream.</param>
+    /// <param name="now">When it happened.</param>
+    /// <param name="reason">The reason, if any.</param>
+    private void Raise(StreamEventType type, StreamState state, DateTimeOffset now, string? reason = null)
+    {
+        if (_events is not null && state.IncarnationId is { } incarnationId)
+        {
+            _pendingEvents.Add(StreamEventFactory.Create(type, state.Key.Application, state.Key.Identity, incarnationId, now, reason));
+        }
+    }
+
+    /// <summary>Acquires <see cref="_gate"/>; disposing the scope releases it and then publishes the events raised meanwhile.</summary>
+    /// <returns>The scope.</returns>
+    private GateScope EnterGate()
+    {
+        _gate.Enter();
+        return new GateScope(this);
     }
 
     /// <summary>Forgets keys with no stream and no remaining segments.</summary>
@@ -477,7 +548,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
         List<(string, string)>? empty = null;
         foreach (var (key, keyState) in _keys)
         {
-            keyState.Withdrawn.RemoveAll(static s => s.Segments.Count == 0);
+            RemoveDrained(keyState);
             if (keyState.Current is null && keyState.Withdrawn.Count == 0)
             {
                 (empty ??= []).Add(key);
@@ -567,17 +638,46 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
         }
     }
 
+    /// <summary>
+    /// Holds <see cref="_gate"/>. Disposing takes the pending lifecycle events, releases the lock and only then
+    /// publishes them, so publication never runs under the store lock.
+    /// </summary>
+    /// <param name="store">The store.</param>
+    private readonly ref struct GateScope(InMemoryHlsSegmentStore store)
+    {
+        /// <summary>Releases the lock and publishes the events raised while it was held.</summary>
+        public void Dispose()
+        {
+            StreamEvent[]? events = null;
+            if (store._pendingEvents.Count > 0)
+            {
+                events = [.. store._pendingEvents];
+                store._pendingEvents.Clear();
+            }
+
+            store._gate.Exit();
+            foreach (var streamEvent in events ?? [])
+            {
+                store._events!.Publish(streamEvent);
+            }
+        }
+    }
+
     /// <summary>State of one stream instance.</summary>
     /// <param name="key">The stream key.</param>
     /// <param name="sessionId">The writer session.</param>
     /// <param name="playlist">The playlist.</param>
-    private sealed class StreamState((string Application, string Identity) key, Guid sessionId, HlsPlaylist playlist)
+    /// <param name="incarnationId">The publication's incarnation identifier, if lifecycle events are reported for it.</param>
+    private sealed class StreamState((string Application, string Identity) key, Guid sessionId, HlsPlaylist playlist, string? incarnationId)
     {
         /// <summary>Gets the stream key.</summary>
         public (string Application, string Identity) Key { get; } = key;
 
         /// <summary>Gets the writer session.</summary>
         public Guid SessionId { get; } = sessionId;
+
+        /// <summary>Gets the publication's incarnation identifier, or <see langword="null"/> to report no lifecycle events.</summary>
+        public string? IncarnationId { get; } = incarnationId;
 
         /// <summary>Gets the playlist.</summary>
         public HlsPlaylist Playlist { get; } = playlist;

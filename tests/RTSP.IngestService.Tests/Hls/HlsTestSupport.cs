@@ -312,14 +312,19 @@ internal sealed class HlsHarness : IDisposable
         MeterFactory = _services.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>();
         _loggerFactory = new LoggerFactory([new FakeLoggerProvider(Logs)]);
         var metrics = new HlsMetrics(MeterFactory);
-        Store = new InMemoryHlsSegmentStore(Microsoft.Extensions.Options.Options.Create(Options), Time, metrics);
+        Store = new InMemoryHlsSegmentStore(Microsoft.Extensions.Options.Options.Create(Options), Time, metrics, StreamEvents);
         Packaging = new HlsPackagingHandler(Microsoft.Extensions.Options.Options.Create(Options), Store, metrics, _loggerFactory.CreateLogger<HlsPackagingHandler>());
         Processor = new MediaPublishSessionHandler(
             Microsoft.Extensions.Options.Options.Create(new MediaOptions()),
             Packaging,
             new MediaMetrics(MeterFactory),
-            _loggerFactory.CreateLogger<MediaPublishSessionHandler>());
+            _loggerFactory.CreateLogger<MediaPublishSessionHandler>(),
+            StreamEvents,
+            Time);
     }
+
+    /// <summary>Gets the recorder of stream lifecycle events published by the store and the media stage.</summary>
+    public RecordingStreamEventPublisher StreamEvents { get; } = new();
 
     /// <summary>Gets the options.</summary>
     public HlsOptions Options { get; }

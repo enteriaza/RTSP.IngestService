@@ -6,7 +6,6 @@
 
     <!-- Production -->
     <ItemGroup>
-        <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.15" />
         <PackageVersion Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.15" />
         <PackageVersion Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.15" />
         <PackageVersion Include="Serilog" Version="4.4.0" />

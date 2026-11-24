@@ -73,9 +73,9 @@ public sealed class ServiceRunnerTests
     /// <param name="value">An invalid value for <paramref name="key"/>.</param>
     [Theory]
     [InlineData("Application:Name", "")]
-    [InlineData("Heartbeat:Interval", "00:00:00")]
+    [InlineData("Lifetime:StartupTimeout", "00:00:00")]
     [InlineData("FileLogging:Mode", "Sometimes")]
-    [InlineData("Heartbeat:Unexpected", "1")]
+    [InlineData("Lifetime:Unexpected", "1")]
     public async Task InvalidConfiguration_ReturnsConfigurationError(string key, string value)
     {
         var exitCode = await RunAsync(
