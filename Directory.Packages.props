@@ -6,7 +6,7 @@
 
     <!-- Production -->
     <ItemGroup>
-        <PackageVersion Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.15" />
+        <PackageVersion Include="Microsoft.Extensions.Hosting.Systemd" Version="11.0.0" />
         <PackageVersion Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.15" />
         <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.21.0" />
         <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.21.0" />
