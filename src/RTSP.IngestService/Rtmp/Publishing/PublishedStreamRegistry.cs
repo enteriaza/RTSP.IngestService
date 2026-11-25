@@ -15,6 +15,9 @@ public sealed class PublishedStreamRegistry
     /// <summary>Active sessions by key.</summary>
     private readonly ConcurrentDictionary<string, PublisherSession> _sessions = new(StringComparer.Ordinal);
 
+    /// <summary>The last generation assigned.</summary>
+    private long _lastGeneration;
+
     /// <summary>Gets the number of active sessions.</summary>
     public int Count => _sessions.Count;
 
@@ -28,10 +31,18 @@ public sealed class PublishedStreamRegistry
     public PublisherSession? Find(string application, string streamIdentity) =>
         _sessions.TryGetValue(Key(application, streamIdentity), out var session) ? session : null;
 
-    /// <summary>Adds <paramref name="session"/> unless its identity is already being published.</summary>
+    /// <summary>
+    /// Adds <paramref name="session"/> unless its identity is already being published. The session first gets the
+    /// next <see cref="PublisherSession.Generation"/>; a later registration of the same identity can only succeed
+    /// after this one is removed, so it always gets a larger generation.
+    /// </summary>
     /// <param name="session">The new session.</param>
     /// <returns><see langword="true"/> if added.</returns>
-    internal bool TryAdd(PublisherSession session) => _sessions.TryAdd(Key(session.Application, session.StreamIdentity), session);
+    internal bool TryAdd(PublisherSession session)
+    {
+        session.SetGeneration(Interlocked.Increment(ref _lastGeneration));
+        return _sessions.TryAdd(Key(session.Application, session.StreamIdentity), session);
+    }
 
     /// <summary>Removes <paramref name="session"/> if it is the registered session for its identity.</summary>
     /// <param name="session">The ending session.</param>

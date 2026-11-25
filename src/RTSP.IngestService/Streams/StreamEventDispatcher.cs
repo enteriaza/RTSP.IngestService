@@ -37,6 +37,9 @@ public sealed partial class StreamEventDispatcher : BackgroundService
     /// <summary>Logger.</summary>
     private readonly ILogger<StreamEventDispatcher> _logger;
 
+    /// <summary>1 while the loop is about to call or is inside the consumer; set before the loop's final cancellation check.</summary>
+    private int _inConsumer;
+
     /// <summary>Initializes a new instance of the <see cref="StreamEventDispatcher"/> class.</summary>
     /// <param name="channel">The channel.</param>
     /// <param name="consumer">The consumer, or <see langword="null"/> for none.</param>
@@ -65,6 +68,13 @@ public sealed partial class StreamEventDispatcher : BackgroundService
         using var budget = new CancellationTokenSource(StopTimeout, _time);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, budget.Token);
         await base.StopAsync(linked.Token).ConfigureAwait(false);
+        if (ExecuteTask is { IsCompleted: false } loop && Volatile.Read(ref _inConsumer) == 0)
+        {
+            // Outside the consumer the cancelled loop runs no consumer code and exits promptly, even if the host's
+            // shutdown budget is already spent.
+            await loop.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        }
+
         if (ExecuteTask is { IsCompleted: false })
         {
             LogConsumerAbandoned(StopTimeout);
@@ -81,14 +91,22 @@ public sealed partial class StreamEventDispatcher : BackgroundService
 
         await Task.CompletedTask.ConfigureAwait(ConfigureAwaitOptions.ForceYielding);
         var reader = _channel.Reader;
+        var discarded = 0;
         try
         {
             while (await reader.WaitToReadAsync(stoppingToken).ConfigureAwait(false))
             {
                 while (!stoppingToken.IsCancellationRequested && reader.TryRead(out var streamEvent))
                 {
+                    Interlocked.Exchange(ref _inConsumer, 1);
                     try
                     {
+                        if (stoppingToken.IsCancellationRequested)
+                        {
+                            discarded = 1;
+                            break;
+                        }
+
                         await _consumer.ConsumeAsync(streamEvent, stoppingToken).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -100,6 +118,15 @@ public sealed partial class StreamEventDispatcher : BackgroundService
                         _metrics.ConsumerFailed(streamEvent.Type);
                         LogConsumerFailed(ex, streamEvent.Type);
                     }
+                    finally
+                    {
+                        Interlocked.Exchange(ref _inConsumer, 0);
+                    }
+                }
+
+                if (discarded > 0)
+                {
+                    break;
                 }
             }
         }
@@ -107,7 +134,7 @@ public sealed partial class StreamEventDispatcher : BackgroundService
         {
         }
 
-        LogStopped(reader.Count);
+        LogStopped(reader.Count + discarded);
     }
 
     /// <summary>Logs a consumer failure.</summary>

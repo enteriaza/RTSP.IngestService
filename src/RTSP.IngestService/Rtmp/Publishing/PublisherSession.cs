@@ -85,6 +85,12 @@ public sealed class PublisherSession
     /// <summary>When the session ended, once it has.</summary>
     private DateTimeOffset? _endedAt;
 
+    /// <summary>The registration generation; see <see cref="Generation"/>.</summary>
+    private long _generation;
+
+    /// <summary>1 once an HLS stream was opened for this publication; see <see cref="HlsStreamOpened"/>.</summary>
+    private int _hlsStreamOpened;
+
     /// <summary>Initializes a new instance of the <see cref="PublisherSession"/> class in the <see cref="PublisherSessionState.Publishing"/> state.</summary>
     /// <param name="connectionId">The owning connection's identifier.</param>
     /// <param name="remoteEndPoint">The publisher's address.</param>
@@ -125,6 +131,12 @@ public sealed class PublisherSession
     /// the stream identity.
     /// </summary>
     public string IncarnationId { get; }
+
+    /// <summary>
+    /// Gets the registration generation assigned by <see cref="PublishedStreamRegistry"/>: strictly increasing across
+    /// registrations, so a later publication of the same stream always has a larger value; 0 until registered.
+    /// </summary>
+    public long Generation => Interlocked.Read(ref _generation);
 
     /// <summary>Gets the identifier of the TCP connection carrying the session.</summary>
     public long ConnectionId { get; }
@@ -222,6 +234,20 @@ public sealed class PublisherSession
     /// <summary>Replaces the stored metadata.</summary>
     /// <param name="metadata">The metadata properties.</param>
     internal void SetMetadata(IReadOnlyList<KeyValuePair<string, AmfValue>> metadata) => Volatile.Write(ref _metadata, metadata);
+
+    /// <summary>Sets <see cref="Generation"/>; called by the registry before the session becomes visible.</summary>
+    /// <param name="generation">The generation.</param>
+    internal void SetGeneration(long generation) => Interlocked.Exchange(ref _generation, generation);
+
+    /// <summary>
+    /// Gets a value indicating whether the HLS stage opened a stream in the segment store for this publication. It
+    /// never reverts, so it still holds after the store has withdrawn and forgotten the stream, which lets the stream
+    /// catalog tell a drained HLS stream from one that never opened. It lives and dies with this session.
+    /// </summary>
+    internal bool HlsStreamOpened => Volatile.Read(ref _hlsStreamOpened) != 0;
+
+    /// <summary>Records that the HLS stage opened this publication's stream; called after the store accepted it.</summary>
+    internal void MarkHlsStreamOpened() => Volatile.Write(ref _hlsStreamOpened, 1);
 
     /// <summary>Ends the session if it has not already ended.</summary>
     /// <param name="reason">Why it ended.</param>

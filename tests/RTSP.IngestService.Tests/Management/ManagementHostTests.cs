@@ -16,6 +16,7 @@ using RTSP.IngestService.Http;
 using RTSP.IngestService.Lifecycle;
 using RTSP.IngestService.Management;
 using RTSP.IngestService.Rtmp;
+using RTSP.IngestService.Rtmp.Publishing;
 using RTSP.IngestService.Tests.Hls;
 using RTSP.IngestService.Tests.Infrastructure;
 
@@ -241,7 +242,8 @@ public sealed class ManagementHostTests : IDisposable
     private static Dictionary<string, string?> Settings() => new()
     {
         ["Rtmp:Authentication:Publishers:0:Name"] = "camera",
-        ["Rtmp:Authentication:Publishers:0:StreamKey"] = StreamKey,
+        ["Rtmp:Authentication:Publishers:0:Application"] = "live",
+        ["Rtmp:Authentication:Publishers:0:KeyHash"] = PublisherKeyHash.Create(StreamKey),
         ["Hls:TargetSegmentDuration"] = "00:00:01",
         ["Hls:MaxSegmentDuration"] = "00:00:04",
     };

@@ -18,6 +18,9 @@ public static class ExitCodes
     /// <summary>Startup failed, startup timed out, or a hosted service faulted.</summary>
     public const int Failure = 1;
 
+    /// <summary>A command-line tool was used incorrectly (<c>EX_USAGE</c> from sysexits.h).</summary>
+    public const int UsageError = 64;
+
     /// <summary>
     /// Configuration was missing or invalid (<c>EX_CONFIG</c> from sysexits.h). The systemd unit uses
     /// <c>RestartPreventExitStatus=78</c> so that a misconfigured service is not restarted in a loop.

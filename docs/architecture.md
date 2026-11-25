@@ -23,6 +23,8 @@ logging), the RTMP ingest server, media processing, HLS packaging and the HTTP H
 | HTTP HLS origin | `Http/*` | Kestrel-based HTTP/1.1 server for playlists and segments (see [HTTP HLS origin](#http-hls-origin)). |
 | Management | `Management/*` | Loopback-only liveness and readiness routes on the same HTTP listener (see [Management endpoints](#management-endpoints)). |
 | Stream events | `Streams/*` | Versioned, best-effort stream lifecycle notifications over one bounded in-process channel (see [Stream lifecycle events](#stream-lifecycle-events)). |
+| Stream catalog | `Streams/StreamCatalog*` | Reconciled, read-only in-memory inventory of stream incarnations, served at `/health/streams` (see [Stream catalog](#stream-catalog)). |
+| Telemetry export | `Telemetry/*` | Optional OpenTelemetry OTLP export of the existing metrics, disabled by default (see [Telemetry export](#telemetry-export)). |
 
 ## Application lifecycle
 
@@ -99,6 +101,11 @@ RTMP settings are listed under [RTMP ingest](#configuration-1).
 | `FileLogging` | `FileSizeLimitMegabytes` | `100` | 1 – 10240 |
 | `Management` | `Enabled` | `true` | `true` or `false` |
 | `StreamEvents` | `QueueCapacity` | `1024` | 16 – 65536 |
+| `StreamCatalog` | `ReconciliationInterval` | `00:00:30` | 1 s – 1 h |
+| `Telemetry:Otlp` | `Enabled` | `false` | `true` or `false` |
+| `Telemetry:Otlp` | `Endpoint` | Unset | Required when enabled; absolute `http`/`https` URI without user information, query or fragment |
+| `Telemetry:Otlp` | `Protocol` | `grpc` | `grpc` or `http/protobuf` |
+| `Telemetry:Otlp` | `ExportInterval` | `00:00:15` | 1 s – 5 min |
 
 Sources, in increasing precedence: `appsettings.json`, `appsettings.{Environment}.json`, environment variables,
 command-line arguments. Binding is strict: unknown keys and unconvertible values are configuration errors. Validators are
@@ -129,6 +136,8 @@ hosting environment are logged at startup.
 | 8000–8002 | HTTP HLS origin |
 | 9000 | Management endpoints |
 | 9100–9102 | Stream event dispatcher |
+| 9200–9202 | Stream catalog |
+| 9300–9302 | Telemetry export |
 
 ## RTMP ingest
 
@@ -176,13 +185,126 @@ registry → `OnSessionStartedAsync` → StreamBegin and `onStatus NetStream.Pub
 
 ### Authentication
 
-`ConfiguredPublisherAuthenticator` accepts a publish when the application equals `Rtmp:Authentication:Application`
-(ordinal) and the stream name (the part before any `?`) equals a configured `StreamKey`. Keys are compared as SHA-256
-digests with `CryptographicOperations.FixedTimeEquals` across every entry. The session's stream identity is the
-publisher's `Name`, so the key itself is never used as an identifier, logged or exported. With no publishers configured
-every publish is rejected. Stream names, query strings and `tcUrl` are never logged; `PublishAuthenticationRequest`
-redacts them in `ToString`. Real keys belong in the git-ignored `appsettings.{Environment}.json`, environment variables
-(`Rtmp__Authentication__Publishers__0__StreamKey`) or a secret store, never in `appsettings.json`.
+`ConfiguredPublisherAuthenticator` verifies the stream name (the part before any `?`; the OBS "Stream Key") against
+one-way hashes of configured credentials. The service never stores, compares or logs a plaintext key, and there is no
+plaintext fallback.
+
+**Credentials.** Each entry of `Rtmp:Authentication:Publishers` has:
+
+| Setting | Meaning |
+|---------|---------|
+| `Name` | Unique, non-secret identifier; also the stream identity used by sessions, the registry, HLS URLs, events and the catalog |
+| `Application` | The only application the credential may publish to (ordinal). Required; there is no default application |
+| `KeyHash` | `hmac-sha256$<salt>$<digest>`: unpadded base64url of a 16-byte random salt and the HMAC-SHA256 of the ASCII key keyed by that salt |
+| `Enabled` | `true` (default) or `false` to revoke while keeping the entry |
+
+HMAC-SHA256 is a fast one-way function. That is appropriate because supported keys are generated with 256 bits of
+entropy, which makes offline guessing infeasible even if a hash leaks. The per-credential salt makes equal keys hash
+differently. A slow password hash would add CPU cost to every attempt for every credential without strengthening
+such keys. Keys chosen by people do not have that entropy and should be replaced with generated ones. Hashes are still
+sensitive: keep them in the git-ignored `appsettings.{Environment}.json` files or environment variables, never in
+`appsettings.json` or source control.
+
+**Provisioning.** The service binary provisions credentials without starting the host:
+
+```
+RTSP.IngestService publisher-key generate        # prints "StreamKey: <key>" once and "KeyHash: <hash>"
+RTSP.IngestService publisher-key hash < key.txt  # reads one existing key from stdin; prints only "KeyHash: <hash>"
+```
+
+Give the stream key to the encoder operator and store only the `KeyHash`. The service keeps no copy of the key, so a
+lost key is replaced, not recovered. Keys must be 16 to 256 printable ASCII characters without spaces or `?`; generated
+keys are 43 characters. Exit code 64 reports a usage error. Example configuration (placeholders only):
+
+```json
+"Rtmp": {
+  "Authentication": {
+    "Publishers": [
+      { "Name": "camera1", "Application": "live", "KeyHash": "<KeyHash from publisher-key>", "Enabled": true },
+      { "Name": "studio", "Application": "studio", "KeyHash": "<KeyHash from publisher-key>" }
+    ]
+  }
+}
+```
+
+**Verification.** Steps for one `publish` command:
+
+1. The rate limiter reserves a failure token for the TCP peer address. If none is left, the attempt is rejected
+   before any hashing (`rate_limited`).
+2. A key that is not 16 to 256 printable ASCII characters is rejected without hashing (`malformed_key`).
+3. The key is checked against every credential in one immutable snapshot, enabled or not, with
+   `CryptographicOperations.FixedTimeEquals`, so timing does not reveal which credential matched. The attempt is
+   rejected if it matches no credential (`invalid_credential`), more than one (`ambiguous`), a disabled one
+   (`disabled`), or one whose `Application` differs from the application the publisher connected to
+   (`application_mismatch`).
+4. On success the token is returned. The session is created with the credential's `Name` and `Application`, so the
+   registry, HLS store, events and catalog use the authenticated application. A publisher cannot choose a different
+   one.
+
+Every rejection keeps the existing behaviour:
+- `NetStream.Publish.Unauthorized`, then the connection closes;
+- log 5205 with a fixed reason that names no key, hash or credential;
+- `rtmp.authentication.failures` is incremented.
+
+No session, registry entry, HLS stream or event is created. An authenticator exception still answers
+`NetStream.Publish.Failed`.
+
+**Rotation and revocation.** Credentials are reloaded when the configuration changes. `appsettings*.json` files are
+watched by default; environment variables and command-line values are not, so they change only on restart.
+
+| Action | How |
+|--------|-----|
+| Add | Append an entry |
+| Remove | Delete the entry |
+| Revoke | Set `Enabled` to `false` (or remove the entry) |
+| Rotate | Run `publisher-key generate`, replace the entry's `KeyHash`, then reconfigure the encoder |
+| Reassign | Change `Application` |
+
+Every reload re-runs the startup binding and validation for the whole `Rtmp` section:
+- A valid reload atomically replaces the snapshot. It logs 5301 and counts `rtmp.authentication.reloads{result=success}`.
+- An invalid reload keeps the last known-good credentials. Examples are a malformed or duplicate hash, a duplicate
+  name, a missing application, a former `StreamKey` setting, or any other invalid `Rtmp` value. It logs 5302 with the
+  validation messages, which name settings but never contain values, and counts `result=failure`.
+
+Readiness and existing sessions are unaffected by any reload. Each attempt reads the snapshot once, so it sees one
+consistent set of credentials.
+
+**Revocation and rotation affect only new publish attempts.** A session that is already publishing continues until
+the publisher disconnects or the service stops; there is no session termination.
+
+Only `Publishers` is reloaded; the other `Rtmp` settings, including `RateLimit`, are read at startup. Invalid
+credentials at startup stop the service with exit code 78.
+
+**Rate limiting.** Failed attempts are limited per TCP peer IP address, taken from the accepted socket and never from
+publisher-supplied fields such as `tcUrl`, the application or the query. The limiter is a token bucket:
+- Each address may fail `RateLimit:FailureLimit` times in a burst (default 10, range 1 – 1000).
+- The allowance refills evenly over `RateLimit:Window` (default 1 minute, range 1 s – 1 h).
+- A token is reserved before verification and returned on success, so concurrent attempts cannot exceed the
+  allowance and successful publishers are never charged.
+- Once an address is limited, even a correct key from it is rejected until tokens refill. This prevents guessing
+  through the limit.
+
+Memory and scope:
+- At most 10,000 addresses are tracked. A full bucket is equivalent to an untracked address and is removed on
+  release, by a sweep at most once per window, and when the table is full.
+- If the table is full of addresses that have not refilled, a new address is rejected (fail closed) until space is
+  reclaimed.
+- IPv4-mapped IPv6 addresses count as IPv4. Each IPv6 address is limited separately.
+- The limiter runs once per `publish` command under a short lock, never on the media path, and does not affect
+  established sessions.
+
+**Migration from plaintext keys.** The `StreamKey` property and the global `Authentication:Application` setting no
+longer exist, so strict binding rejects them and the service exits with code 78 instead of accepting plaintext. To
+migrate:
+
+1. For each publisher, pipe the existing key into `publisher-key hash`.
+2. Replace `StreamKey` with `KeyHash` and add `Application` (formerly the global value, usually `live`).
+3. Delete the plaintext from configuration.
+
+Encoders keep their keys. Plan to rotate migrated keys to generated keys.
+
+Stream names, query strings and `tcUrl` are never logged; `PublishAuthenticationRequest` redacts them in `ToString`,
+and `PublisherKeyHash.ToString` never formats a salt or digest.
 
 ### Memory and backpressure
 
@@ -219,12 +341,16 @@ connection waits for data or for its own output to flush; time spent in the hand
 | `InboundChunkSize` | `128` | 128 – 65536 (the size assumed before the client's Set Chunk Size) |
 | `OutboundChunkSize` | `4096` | 128 – 65536 |
 | `MaxBufferedBytes` | `16777216` | 65536 – 268435456, and at least `MaxMessageSize` |
-| `Authentication:Application` | `live` | Letter or digit followed by up to 63 of `A-Z a-z 0-9 . _ -` |
-| `Authentication:Publishers:N:Name` | — | Same pattern as `Application`; unique |
-| `Authentication:Publishers:N:StreamKey` | — | 16 – 256 characters; unique |
+| `Authentication:Publishers:N:Name` | — | Letter or digit followed by up to 63 of `A-Z a-z 0-9 . _ -`; unique |
+| `Authentication:Publishers:N:Application` | — (required) | Same pattern as `Name` |
+| `Authentication:Publishers:N:KeyHash` | — (required) | `hmac-sha256$<22 chars>$<43 chars>`; unique |
+| `Authentication:Publishers:N:Enabled` | `true` | `true` or `false` |
+| `Authentication:RateLimit:FailureLimit` | `10` | 1 – 1000 |
+| `Authentication:RateLimit:Window` | `00:01:00` | 1 s – 1 h |
 
-Values are validated at startup and never clamped; an invalid value stops the service with exit code 78. RTMP options
-are read once at startup.
+At most 1000 publishers. Values are validated at startup and never clamped; an invalid value stops the service with
+exit code 78. RTMP options are read once at startup, except `Authentication:Publishers`, which is reloaded (see
+[Authentication](#authentication)).
 
 ### Metrics
 
@@ -239,14 +365,16 @@ connection IDs are never tags.
 | `rtmp.connection.duration` | Histogram (s) | `close_reason`: `client_disconnected`, `rejected`, `server_shutdown`, `handshake_timeout`, `handshake_failed`, `idle_timeout`, `protocol_error`, `transport_error`, `handler_failed`, `internal_error` |
 | `rtmp.handshakes` | Counter | `result`: `success`, `failure` |
 | `rtmp.authentication.failures` | Counter | — |
+| `rtmp.authentication.attempts` | Counter | `result`: `success`, `invalid_credential`, `disabled`, `ambiguous`, `application_mismatch`, `malformed_key`, `rate_limited` |
+| `rtmp.authentication.reloads` | Counter | `result`: `success`, `failure` |
 | `rtmp.protocol_errors` | Counter | — |
 | `rtmp.sessions.active` | UpDownCounter | — |
 | `rtmp.publisher.disconnects` | Counter | `reason`: `unpublished`, `stream_deleted`, `client_disconnected`, `connection_timeout`, `protocol_error`, `connection_error`, `server_shutdown`, `handler_failed` |
 | `rtmp.bytes_received` | Counter (bytes) | — |
 | `rtmp.messages_received` | Counter | `type`: `audio`, `video`, `data`, `command`, `control`, `other` |
 
-No metrics exporter is configured; use `dotnet-counters monitor --counters RTSP.IngestService.Rtmp -n
-RTSP.IngestService`.
+All application meters can be exported over OTLP (see [Telemetry export](#telemetry-export), disabled by default),
+or observed locally with `dotnet-counters monitor --counters RTSP.IngestService.Rtmp -n RTSP.IngestService`.
 
 ### Supported and unsupported
 
@@ -267,13 +395,13 @@ Configure a publisher in `appsettings.Development.json` (git-ignored; start from
 ```json
 "Rtmp": {
   "Authentication": {
-    "Application": "live",
-    "Publishers": [ { "Name": "studio", "StreamKey": "<at least 16 random characters>" } ]
+    "Publishers": [ { "Name": "studio", "Application": "live", "KeyHash": "<KeyHash from publisher-key generate>" } ]
   }
 }
 ```
 
-OBS: Settings → Stream → Service *Custom…*, Server `rtmp://<host>:1935/live`, Stream Key `<StreamKey>`.
+OBS: Settings → Stream → Service *Custom…*, Server `rtmp://<host>:1935/live`, Stream Key `<StreamKey>` (the key
+printed once by `publisher-key generate`).
 
 FFmpeg (synthetic test stream; no media files needed):
 
@@ -730,6 +858,8 @@ affecting HLS, the lifecycle or the service-manager integration.
 |----------|----------|-----------|
 | `GET`/`HEAD /health/live` | The lifecycle is not `Failed` or `Stopped` | 503 |
 | `GET`/`HEAD /health/ready` | The lifecycle is `Running`, the RTMP listener is bound and the HTTP listener is bound | 503 |
+| `GET`/`HEAD /health/streams` | The stream catalog has completed its first reconciliation | 503 `{"status":"initializing"}` |
+| `GET`/`HEAD /health/streams/{application}/{stream}` | As above, and the stream is in the catalog (its current incarnation is returned) | 503 as above; 404 (empty) if unknown |
 
 Bodies are small source-generated JSON documents, for example
 `{"status":"not_ready","state":"Starting","rtmpListener":false,"httpListener":true}` or
@@ -886,9 +1016,12 @@ logged (event 9100), counted, and the next event is delivered; it never stops th
 has started before any publish is accepted, and it stops after both, still accepting the `Ended` and withdrawal events
 their shutdown produces. Its `StopAsync` completes the channel (later events are rejected), cancels the consumer's
 token and waits at most five seconds (`StreamEventDispatcher.StopTimeout`) or until the host's shutdown token fires;
-a consumer that ignores cancellation is abandoned (event 9102). Undelivered events are discarded (event 9101 reports
+a consumer that ignores cancellation is abandoned (event 9102). When the loop is not inside the consumer at that
+point, it runs no consumer code once cancelled, so `StopAsync` waits for it to exit even if the host's token has
+already fired. Undelivered events are discarded (event 9101 reports
 how many). Readiness does not depend on the dispatcher or consumer. Only one consumer is supported; registering none
-is valid.
+is valid. The service host registers the [stream catalog](#stream-catalog) as the consumer unless the composition
+registers another one.
 
 ### Tests
 
@@ -902,3 +1035,237 @@ every RTMP termination path, rejected publishes, republishing, `MediaDescribed` 
 lazy expiry and drain, and publication outside the store lock. `StreamEventHostTests` run the real host with TCP
 publishes: composition order, the full lifecycle delivered to a failing consumer, and a stalled consumer leaving
 readiness, publishing and shutdown unaffected.
+
+## Stream catalog
+
+`Streams/StreamCatalog` is an in-memory, read-only operational view of the stream incarnations that are publishing or
+still hold HLS resources. **Its authority is the RTMP registry and the HLS store**, read by reconciliation; lifecycle
+events only accelerate updates of incarnations a reconciliation already established and request reconciliation for
+anything else. Nothing is persisted, there is no second registry, and the media pipeline is untouched: the catalog
+reads immutable copies and never holds media buffers.
+
+### Sources and consistency model
+
+`RuntimeStreamInventorySource` acquires, in this order and each as an immutable copy:
+
+1. The HLS store's instances via `IHlsStreamInventory.GetStreams` (application, stream, incarnation, generation,
+   `Live`/`Ended`/`Withdrawn`, and `PlaylistAvailable`), copied under the store lock after lazy expiry is evaluated.
+   `PlaylistAvailable` is true exactly when `GetPlaylist`, which the playlist route serves, returns that instance's
+   playlist: the instance is the key's current one and has published a playlist snapshot.
+2. The registry's sessions (`PublishedStreamRegistry.Sessions`, an array copy), and for each the media stage's
+   current immutable `MediaStreamInfo` (a volatile read), described exactly as `MediaDescribed` would describe it.
+
+There is no global atomic snapshot. The order makes the gap interpretable because the authoritative operations are
+ordered: a publication is registered before its HLS stream opens, and unregistered before it closes. So an HLS
+instance that is live while its session is not registered has ended (the RTMP side is reported `ended`; the HLS close
+that follows has no event, so the incarnation is *unsettled* and the service re-reconciles after
+`StreamCatalogService.SettleDelay`, one second, until it is not). A registered session that is absent from the HLS copy
+has either not opened yet (`pending`) or opened and been withdrawn and drained (`withdrawn`). The HLS packaging stage
+sets `PublisherSession.HlsStreamOpened` once the store accepts the stream; it never reverts and lives exactly as long
+as that incarnation's session, so it needs no cleanup, cannot leak to a later publication of the name, and is visible
+to a newly created catalog. The source reads the flags *before* the HLS copy, so a stream that opens during acquisition
+is reported `pending` (and `live` at the next reconciliation), never as drained; `withdrawn` therefore never depends on
+having received `Drained`. An opened HLS stream publishes its first playlist only when its first segment closes, and
+that has no event either, so a `live` incarnation without an available playlist is also *unsettled*: the settle timer
+re-reconciles every second until the store reports the playlist (or the stream ends). Any remaining staleness is
+bounded by the next event-triggered or periodic reconciliation.
+
+In the current composition the store withdraws a publication's stream only after its session has been unregistered
+(`CloseStream` runs from `OnSessionEndedAsync`, and a packaging failure ends the publish first), so "publishing with a
+drained HLS stream" is reached only transiently or if a stage closes its stream while the publish continues; the
+catalog reports it correctly either way.
+
+### Incarnation identity and ordering
+
+Entries are keyed by `(application, stream, incarnationId)` and looked up by incarnation identifier, so an event or
+snapshot about one incarnation cannot touch another. The registry assigns every registration a strictly increasing
+`PublisherSession.Generation` (an interlocked counter, set before the session becomes visible), which the HLS
+packaging stage passes to the store when it opens the stream. A later publication of a name is registered only after
+the previous one was removed, so it always has a larger generation. The **current** incarnation of a name is the one
+with the largest generation; incarnation identifiers and timestamps are never compared.
+
+Stale information cannot win:
+
+- Events never create entries; only snapshots do. An event for an unknown incarnation requests reconciliation.
+- Within an incarnation, states only move forward: publishing `publishing` → `ended`; HLS `pending` → `live` →
+  `ended` → `withdrawn`. Every merge takes the later state, so a duplicate or late event is a no-op and an older
+  snapshot cannot undo a newer event.
+- Reconciliations are serialized, so each snapshot is newer than the previous one.
+- Each event-driven change increments an epoch. When `Drained` removes an ended incarnation, it leaves a tombstone
+  with that epoch; a snapshot whose acquisition started before the tombstone's epoch cannot reintroduce it, and later
+  events for it are ignored. A reconciliation that started after the tombstone releases it, so tombstones stay
+  bounded. `Drained` while still publishing keeps the entry as `withdrawn`.
+- An event applied while a snapshot was being acquired keeps its media description over the snapshot's.
+
+### Reconciliation and coalescing
+
+`StreamCatalogService` reconciles once in `StartAsync`, before the HTTP origin and RTMP listener start; the catalog
+reports not initialized (503) until a reconciliation has succeeded, and a failed startup reconciliation is retried by
+the loop. Afterwards reconciliations are requested by the `StreamCatalog:ReconciliationInterval` timer (a
+`TimeProvider` timer), by events it cannot apply (a new `Published`, unknown incarnations, and `Ended`, because the HLS
+stream closes without an event of its own), by an increase in the event channel's dropped count, and by a one-shot
+settle timer armed after any reconciliation that left an incarnation unsettled (at most one request per second, only
+while that lasts). Requests set a single pending flag and release a one-slot semaphore: at most one request is
+pending and one reconciliation runs at a time. A request made while a reconciliation runs makes another pending, so
+it is never lost; extra requests are counted as coalesced. Stopping cancels the loop, waits for it (it only waits
+for a request or finishes an in-memory reconciliation) and disposes the timers.
+
+### Atomic publication
+
+Every change builds a complete new immutable `StreamCatalogSnapshot` (entries, lookups, version, reconciliation time)
+and publishes it with one volatile reference write. Readers (`StreamCatalog.Current`, the HTTP routes) never lock or
+wait; each response is serialized from the one snapshot it read. A short writer lock serializes publication between
+the event consumer and reconciliation; it is never held while acquiring a snapshot or serializing. A failed
+reconciliation (logged as event 9200, counted) keeps the previous snapshot.
+
+### HTTP
+
+`GET /health/streams` returns every entry, ordered by application, stream and newest generation first;
+`/health/streams/{application}/{stream}` returns that stream's current incarnation. Both are served by the management
+endpoints with the same loopback-only policy, headers, `HEAD`, 404 and 405 behaviour and `Management:Enabled` switch;
+there is no other server or listener.
+
+```json
+{
+  "version": 12,
+  "reconciledAt": "2026-11-25T08:00:00+00:00",
+  "streams": [
+    {
+      "application": "live",
+      "stream": "camera1",
+      "incarnationId": "3f2a9c1e0b7d4e8f9a6b5c4d3e2f1a0b",
+      "current": true,
+      "publishing": { "state": "ended", "startedAt": "…", "endedAt": "…", "endReason": "unpublished" },
+      "hls": { "state": "ended", "playlistAvailable": true },
+      "media": { "audio": { "codec": "mp4a.40.2", "configurationVersion": 1, "sampleRate": 48000, "channelConfiguration": 2, "channels": 2 } }
+    }
+  ]
+}
+```
+
+`publishing.state` is `publishing` or `ended`; `hls.state` is `pending` (registered, HLS stream not opened yet),
+`live` (HLS stream opened and being packaged), `ended` (ended playlist still served) or `withdrawn` (playlist gone,
+segments draining, or drained while still publishing). `playlistAvailable` is independent of the state and reports
+whether the playlist route served the playlist when the store was last read, taken from the store, never inferred
+from registration, the HLS open, the entry's existence or the media description. A newly opened stream is legitimately
+`live` with `playlistAvailable: false` (the playlist route returns 404) until its first segment is published, for at
+least `Hls:TargetSegmentDuration` and at most `Hls:MaxSegmentDuration`, plus up to one settle delay before the catalog
+observes it. It is never true for `pending` or `withdrawn`. Clients must use `playlistAvailable`, not `hls.state`,
+when deciding whether to request the playlist. `media` is the latest complete description (the `MediaDescribed` shape) and is absent until one is
+established; it is never inferred. `endedAt` and `endReason` are absent if the catalog has not observed them (the
+session left the registry before a snapshot and its `Ended` event was not delivered). The body contains no stream
+keys, credentials, addresses, connection or session identifiers, or generations. `version` increases with every
+published snapshot.
+
+### Metrics
+
+On meter `RTSP.IngestService.Streams`: `stream_catalog.streams` (gauge), `stream_catalog.reconciliations` (tag
+`result`: `success`, `failure`), `stream_catalog.reconciliation.duration` (s), `stream_catalog.reconciliation.requests`
+(tag `reason`: `startup`, `periodic`, `event`, `loss`, `inconsistency`), `stream_catalog.reconciliation.coalesced` and
+`stream_catalog.reconciliation.age` (s since the last success). Logs: 9200 reconciliation failed (warning), 9201
+initialized (information, with the entry count), 9202 event loss detected (information).
+
+### Tests
+
+`StreamCatalogTests` cover initialization, startup with active streams, every RTMP/HLS state combination, unsettled
+detection, failure keeping the previous catalog, replacement ordered by generation, stale, unknown, duplicate and
+out-of-order events, stale snapshots after drain, events during acquisition, complete media replacement, loss
+detection, coalescing and concurrent readers. `StreamCatalogServiceTests` cover startup, retry, the periodic and
+settle timers on fake time, requests during a reconciliation and shutdown. `StreamCatalogSourceTests` cover registry generations, the
+store inventory and a lifecycle and replacement over the real registry, media stage and store.
+`StreamCatalogPlaylistAvailabilityTests` compare `playlistAvailable` with the real playlist route at every lifecycle
+phase, across a replacement and under concurrent readers.
+`ManagementEndpointsTests` cover the routes' schema, detail and 404s, 503, HEAD, 405, loopback policy (IPv4, IPv6,
+IPv4-mapped, non-loopback, missing address, forwarding headers), management disabled and one-snapshot responses.
+`StreamCatalogHostTests` run the real host with TCP and FFmpeg publishes and the interval validation (exit 78).
+## Telemetry export
+
+The service's metrics can be exported with OpenTelemetry over OTLP. Export is **disabled by default**; only metrics
+are exported. There is no distributed tracing, no log export and no Prometheus endpoint.
+
+### Architecture
+
+`TelemetryServiceCollectionExtensions.AddTelemetryExport` (registered after logging and before every ingest component)
+calls `AddOpenTelemetry().WithMetrics()` from `OpenTelemetry.Extensions.Hosting` and configures the meter provider
+from the validated `Telemetry:Otlp` options when the provider is built. When enabled, it subscribes to every
+application meter by name and adds the SDK's `PeriodicExportingMetricReader` around the `OtlpMetricExporter` from
+`OpenTelemetry.Exporter.OpenTelemetryProtocol` (cumulative temporality, resource `service.name` = `Application:Name`).
+When disabled, the provider has no meter and no reader: no exporter exists and nothing connects.
+
+The instruments themselves are unchanged. The existing metrics classes own their instruments, created from the host's
+`IMeterFactory`. The SDK observes them through its own `MeterListener` and exports their names, units, descriptions,
+types, values and fixed tag vocabularies as they are. No instrument, meter or tag is added. Exported meters:
+
+| Meter | Instruments |
+|-------|-------------|
+| `RTSP.IngestService.Rtmp` | 11 ([RTMP metrics](#metrics)) |
+| `RTSP.IngestService.Media` | 7 ([media metrics](#metrics-1)) |
+| `RTSP.IngestService.Hls` | 11 ([HLS metrics](#metrics-2)) |
+| `RTSP.IngestService.Http` | 7 ([HTTP origin metrics](#metrics-3)) |
+| `RTSP.IngestService.Streams` | 10: four `stream_events.*` and six `stream_catalog.*` ([stream events](#channel-drops-and-metrics), [catalog](#metrics-4)) |
+
+### Configuration
+
+`Telemetry:Otlp` (strict binding, so unknown keys in `Telemetry` or `Telemetry:Otlp` are errors; validated at start;
+invalid values exit with code 78):
+
+| Setting | Default | Valid values |
+|---------|---------|--------------|
+| `Enabled` | `false` | `true` or `false` |
+| `Endpoint` | Unset | Required when enabled. An absolute `http` or `https` URI without user information, query or fragment |
+| `Protocol` | `grpc` | `grpc` (OTLP/gRPC) or `http/protobuf` (OTLP/HTTP, binary protobuf) |
+| `ExportInterval` | `00:00:15` | 1 s – 5 min |
+
+`Endpoint` is the collector's base address. With `grpc` it is used as is; with `http/protobuf`, `/v1/metrics` is
+appended to its path unless the path already ends with it. Each export request times out after 10 seconds. Example
+for a collector on its default ports:
+
+```json
+"Telemetry": {
+  "Otlp": {
+    "Enabled": true,
+    "Endpoint": "http://otel-collector:4317",
+    "Protocol": "grpc",
+    "ExportInterval": "00:00:15"
+  }
+}
+```
+
+(`"Endpoint": "http://otel-collector:4318", "Protocol": "http/protobuf"` for OTLP/HTTP.) The SDK still honours the
+standard `OTEL_*` environment variables for settings this section does not cover, such as `OTEL_EXPORTER_OTLP_HEADERS`
+and `OTEL_RESOURCE_ATTRIBUTES`; the four settings above always take precedence over their environment equivalents.
+
+### Failure isolation and shutdown
+
+- Export runs on the SDK's reader thread. Instruments record into the SDK's in-memory aggregation with no I/O, no
+  queue and no per-measurement allocation on the RTMP, media or HLS path. Memory is bounded by the fixed
+  instrument and tag cardinality.
+- Building the provider does not connect, so an unavailable collector never delays or fails startup. A failed export
+  drops that export's data (the next export is cumulative) and changes neither readiness nor the lifecycle state.
+- The SDK reports failures only through its EventSources. While export is enabled, `OpenTelemetryDiagnosticsListener`
+  logs their warnings and errors as event 9301 with only the source, event name and event id. Payloads can contain
+  the endpoint and exception text and are never logged. Expected notices are skipped: no tracer or logger provider
+  registered, and runtime or framework instruments the provider does not subscribe to. Native AOT disables EventSource
+  by default, so the project sets `EventSourceSupport` to keep these diagnostics in the published binary.
+- `OtlpMetricsExportService`, registered right after the provider, stops after every ingest component. It calls the
+  SDK's `MeterProvider.Shutdown`, a final collect-and-export that includes the components' last measurements. The wait
+  is bounded by 5 seconds (`FlushTimeout`); the SDK also cancels the final export at that deadline. The wait ends at
+  once when the host's stop token, bounded by `Lifetime:ShutdownTimeout`, is cancelled. Event 9302 is logged when the
+  SDK reports the shutdown incomplete or the wait was abandoned. An export that failed or was cancelled within the
+  bound is reported by the SDK itself (9301). Disposal does not wait for an unanswered request, so an unresponsive
+  collector cannot hold the process.
+
+Event IDs: 9300 export enabled (information, with protocol, interval and meter count, never the endpoint), 9301 SDK
+diagnostic (warning), 9302 final export incomplete (warning).
+
+### Tests
+
+`TelemetryOptionsTests` cover the defaults, every endpoint, protocol and interval rule, unknown keys, exit 78 through
+the service runner and the metrics URI. `TelemetryExportTests` cover export disabled by default (no exporter, no
+connection over the whole host lifetime even with an endpoint configured, and in-process instruments still recording),
+OTLP/HTTP delivery of all five meters to a loopback collector, and every one of the 46 instruments exported through an
+in-memory exporter. That check covers meter, name, unit, description, type, values and tag vocabulary. A real FFmpeg
+publish and HTTP playback must export no identifying tag. `TelemetryHostTests` cover a refusing collector over both
+protocols (listeners bound, ready, lifecycle unaffected, failure logged without the endpoint) and an unresponsive
+collector (stop bounded by the flush timeout, and by a cancelled stop token; disposal not blocked). The telemetry tests
+run in a non-parallel collection because the SDK subscribes to meters by name across the process.

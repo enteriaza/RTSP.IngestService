@@ -51,7 +51,9 @@ firewall, ideally only from encoder networks:
 New-NetFirewallRule -DisplayName 'RTSP.IngestService RTMP' -Direction Inbound -Protocol TCP -LocalPort 1935 -Action Allow -RemoteAddress <encoder subnet>
 ```
 
-Configure publisher stream keys in `appsettings.Production.json` (see [RTMP ingest](../architecture.md#rtmp-ingest)).
+Configure publisher credentials in `appsettings.Production.json` as key hashes generated with
+`RTSP.IngestService.exe publisher-key generate`; plaintext keys are not accepted, and changes to the file are reloaded
+without a restart (see [Authentication](../architecture.md#authentication)).
 
 HLS playback is served over plain HTTP on `127.0.0.1:8080` by default (`Http:ListenAddress`, `Http:Port`), so only
 local clients or a reverse proxy can reach it. To serve viewers directly set `Http:ListenAddress` to `0.0.0.0` and

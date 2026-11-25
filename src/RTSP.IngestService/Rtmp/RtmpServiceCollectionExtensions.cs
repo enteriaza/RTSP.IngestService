@@ -17,7 +17,8 @@ public static class RtmpServiceCollectionExtensions
 {
     /// <summary>
     /// Registers <see cref="RtmpListener"/> as a singleton and hosted service, with its metrics, the
-    /// <see cref="PublishedStreamRegistry"/>, <see cref="ConfiguredPublisherAuthenticator"/> as the default
+    /// <see cref="PublishedStreamRegistry"/>, <see cref="ConfiguredPublisherAuthenticator"/> (with its reloadable
+    /// <see cref="PublisherCredentialStore"/> and <see cref="PublisherAuthenticationRateLimiter"/>) as the default
     /// <see cref="IPublisherAuthenticator"/> and <see cref="DiscardingPublishSessionHandler"/> as the default
     /// <see cref="IPublishSessionHandler"/>.
     /// </summary>
@@ -36,7 +37,21 @@ public static class RtmpServiceCollectionExtensions
         services.AddMetrics();
         services.TryAddSingleton<RtmpMetrics>();
         services.TryAddSingleton<PublishedStreamRegistry>();
-        services.TryAddSingleton<IPublisherAuthenticator, ConfiguredPublisherAuthenticator>();
+        services.TryAddSingleton(static sp => new PublisherCredentialStore(
+            sp.GetRequiredService<IOptions<RtmpOptions>>(),
+            sp.GetRequiredService<IOptionsFactory<RtmpOptions>>(),
+            sp.GetServices<IOptionsChangeTokenSource<RtmpOptions>>(),
+            sp.GetRequiredService<RtmpMetrics>(),
+            sp.GetRequiredService<ILogger<PublisherCredentialStore>>()));
+        services.TryAddSingleton(static sp =>
+        {
+            var rateLimit = sp.GetRequiredService<IOptions<RtmpOptions>>().Value.Authentication.RateLimit;
+            return new PublisherAuthenticationRateLimiter(rateLimit.FailureLimit, rateLimit.Window, sp.GetRequiredService<TimeProvider>());
+        });
+        services.TryAddSingleton<IPublisherAuthenticator>(static sp => new ConfiguredPublisherAuthenticator(
+            sp.GetRequiredService<PublisherCredentialStore>(),
+            sp.GetRequiredService<PublisherAuthenticationRateLimiter>(),
+            sp.GetRequiredService<RtmpMetrics>()));
         services.TryAddSingleton<IPublishSessionHandler, DiscardingPublishSessionHandler>();
         services.TryAddSingleton(static sp => new RtmpListener(
             sp.GetRequiredService<IOptions<RtmpOptions>>(),

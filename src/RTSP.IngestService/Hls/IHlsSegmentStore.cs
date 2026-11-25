@@ -123,8 +123,9 @@ public interface IHlsSegmentStore
     /// The publication's public incarnation identifier, reported on the stream's playlist-withdrawn and drained
     /// lifecycle events; <see langword="null"/> to report none.
     /// </param>
+    /// <param name="generation">The publication's registration generation, reported by stream inventories; 0 if unknown.</param>
     /// <returns><see langword="false"/> if the stream limit is reached or the key is being written by another session.</returns>
-    bool TryOpenStream(Guid sessionId, string application, string streamIdentity, int targetDurationSeconds, out HlsStreamNumbering numbering, string? incarnationId = null);
+    bool TryOpenStream(Guid sessionId, string application, string streamIdentity, int targetDurationSeconds, out HlsStreamNumbering numbering, string? incarnationId = null, long generation = 0);
 
     /// <summary>Stores an initialization segment, before any media segment that references it.</summary>
     /// <param name="sessionId">The writer's session ID.</param>

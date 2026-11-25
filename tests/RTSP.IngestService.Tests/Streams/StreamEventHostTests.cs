@@ -11,6 +11,7 @@ using RTSP.IngestService.Http;
 using RTSP.IngestService.Lifecycle;
 using RTSP.IngestService.Management;
 using RTSP.IngestService.Rtmp;
+using RTSP.IngestService.Rtmp.Publishing;
 using RTSP.IngestService.Streams;
 using RTSP.IngestService.Tests.Infrastructure;
 
@@ -130,7 +131,8 @@ public sealed class StreamEventHostTests
     private static Dictionary<string, string?> Settings() => new()
     {
         ["Rtmp:Authentication:Publishers:0:Name"] = "camera",
-        ["Rtmp:Authentication:Publishers:0:StreamKey"] = StreamKey,
+        ["Rtmp:Authentication:Publishers:0:Application"] = "live",
+        ["Rtmp:Authentication:Publishers:0:KeyHash"] = PublisherKeyHash.Create(StreamKey),
     };
 
     /// <summary>A consumer that records events and can fail on a type or stall cooperatively on its first event.</summary>

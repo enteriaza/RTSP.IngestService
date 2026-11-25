@@ -55,13 +55,16 @@ public static partial class ServiceRunner
     }
 
     /// <summary>
-    /// Detects the hosting mode and runs the service until it stops.
+    /// Runs the <see cref="PublisherKeyCommand"/> when it is requested; otherwise detects the hosting mode and runs the
+    /// service until it stops.
     /// </summary>
     /// <param name="args">Command-line arguments.</param>
     /// <param name="cancellationToken">Requests a graceful shutdown when cancelled.</param>
     /// <returns>The process exit code.</returns>
     public static Task<int> RunAsync(string[] args, CancellationToken cancellationToken = default) =>
-        RunAsync(args, HostingModeDetector.Detect(), configure: null, cancellationToken);
+        PublisherKeyCommand.TryRun(args, Console.In, Console.Out, Console.Error, out var exitCode)
+            ? Task.FromResult(exitCode)
+            : RunAsync(args, HostingModeDetector.Detect(), configure: null, cancellationToken);
 
     /// <summary>
     /// Runs the service in the specified hosting mode until it stops.

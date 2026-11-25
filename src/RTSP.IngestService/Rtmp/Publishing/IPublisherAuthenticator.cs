@@ -78,10 +78,12 @@ public sealed class PublishAuthenticationResult
 {
     /// <summary>Initializes a new instance of the <see cref="PublishAuthenticationResult"/> class.</summary>
     /// <param name="streamIdentity">The identity when authorized.</param>
+    /// <param name="application">The authenticated application, if the authenticator assigns one.</param>
     /// <param name="rejectionReason">The reason when rejected.</param>
-    private PublishAuthenticationResult(string? streamIdentity, string? rejectionReason)
+    private PublishAuthenticationResult(string? streamIdentity, string? application, string? rejectionReason)
     {
         StreamIdentity = streamIdentity;
+        Application = application;
         RejectionReason = rejectionReason;
     }
 
@@ -96,17 +98,34 @@ public sealed class PublishAuthenticationResult
     /// </summary>
     public string? StreamIdentity { get; }
 
+    /// <summary>
+    /// Gets the application assigned by the authenticator when authorized, or <see langword="null"/> to keep the
+    /// application the publisher connected to. When set, the session is published under this application.
+    /// </summary>
+    public string? Application { get; }
+
     /// <summary>Gets why the request was rejected. Logged, so it must not contain secrets.</summary>
     public string? RejectionReason { get; }
 
-    /// <summary>Creates a successful result.</summary>
+    /// <summary>Creates a successful result that keeps the application the publisher connected to.</summary>
     /// <param name="streamIdentity">The non-secret stream identity; 1 to 128 characters.</param>
     /// <returns>The result.</returns>
     public static PublishAuthenticationResult Authorize(string streamIdentity)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(streamIdentity);
-        ArgumentOutOfRangeException.ThrowIfGreaterThan(streamIdentity.Length, 128, nameof(streamIdentity));
-        return new PublishAuthenticationResult(streamIdentity, null);
+        ValidateIdentity(streamIdentity);
+        return new PublishAuthenticationResult(streamIdentity, null, null);
+    }
+
+    /// <summary>Creates a successful result with the application determined by the credential.</summary>
+    /// <param name="streamIdentity">The non-secret stream identity; 1 to 128 characters.</param>
+    /// <param name="application">The authenticated application; 1 to 128 characters.</param>
+    /// <returns>The result.</returns>
+    public static PublishAuthenticationResult Authorize(string streamIdentity, string application)
+    {
+        ValidateIdentity(streamIdentity);
+        ArgumentException.ThrowIfNullOrWhiteSpace(application);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(application.Length, 128, nameof(application));
+        return new PublishAuthenticationResult(streamIdentity, application, null);
     }
 
     /// <summary>Creates a rejection.</summary>
@@ -115,6 +134,14 @@ public sealed class PublishAuthenticationResult
     public static PublishAuthenticationResult Reject(string reason)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(reason);
-        return new PublishAuthenticationResult(null, reason);
+        return new PublishAuthenticationResult(null, null, reason);
+    }
+
+    /// <summary>Validates a stream identity.</summary>
+    /// <param name="streamIdentity">The identity.</param>
+    private static void ValidateIdentity(string streamIdentity)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(streamIdentity);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(streamIdentity.Length, 128, nameof(streamIdentity));
     }
 }

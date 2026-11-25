@@ -142,7 +142,8 @@ public sealed class StreamEventChannelTests : IDisposable
             channel.Publish(Event(i));
         }
 
-        await Eventually.WaitUntilAsync(() => consumer.Received.Count == 100, "all events are delivered");
+        // Wait on the producer thread itself: an await would return it to the pool, where the dispatcher could reuse it.
+        Assert.True(SpinWait.SpinUntil(() => consumer.Received.Count == 100, Eventually.SafetyTimeout), "all events are delivered");
         Assert.Equal(Enumerable.Range(0, 100).Select(static i => i.ToString(System.Globalization.CultureInfo.InvariantCulture)), consumer.Received.Select(static e => e.Stream));
         Assert.DoesNotContain(producer, consumer.Threads);
         await dispatcher.StopAsync(TestContext.Current.CancellationToken).WithinSafetyTimeout();
@@ -259,6 +260,27 @@ public sealed class StreamEventChannelTests : IDisposable
 
         consumer.Gate.SetResult();
         await dispatcher.ExecuteTask!.WithinSafetyTimeout();
+    }
+
+    /// <summary>
+    /// Verifies that with the host's shutdown budget already spent, an idle dispatcher (not inside its consumer)
+    /// still finishes its loop before StopAsync returns, so it is not reported as abandoned.
+    /// </summary>
+    [Fact]
+    public async Task Dispatcher_Stop_WithSpentHostBudget_FinishesIdleLoop()
+    {
+        using var channel = CreateChannel(16);
+        var consumer = new GatedConsumer();
+        using var dispatcher = CreateDispatcher(channel, consumer, new FakeTimeProvider());
+        await dispatcher.StartAsync(TestContext.Current.CancellationToken);
+        channel.Publish(Event(0));
+        await Eventually.WaitUntilAsync(() => consumer.Received.Count == 1, "the event is delivered");
+
+        await dispatcher.StopAsync(new CancellationToken(canceled: true)).WithinSafetyTimeout();
+
+        Assert.True(dispatcher.ExecuteTask!.IsCompleted);
+        Assert.DoesNotContain(_logs.GetSnapshot(), static r => r.Id.Id == 9102);
+        Assert.Contains(_logs.GetSnapshot(), static r => r.Id.Id == 9101);
     }
 
     /// <summary>Verifies that with no consumer the dispatcher reads nothing and stops at once.</summary>

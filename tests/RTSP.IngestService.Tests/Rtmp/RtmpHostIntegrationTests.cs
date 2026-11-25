@@ -121,7 +121,8 @@ public sealed class RtmpHostIntegrationTests
     private static Dictionary<string, string?> Credentials() => new()
     {
         ["Rtmp:Authentication:Publishers:0:Name"] = "camera",
-        ["Rtmp:Authentication:Publishers:0:StreamKey"] = StreamKey,
+        ["Rtmp:Authentication:Publishers:0:Application"] = "live",
+        ["Rtmp:Authentication:Publishers:0:KeyHash"] = PublisherKeyHash.Create(StreamKey),
     };
 
     /// <summary>Runs the service to completion with <paramref name="overrides"/>.</summary>
