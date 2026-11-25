@@ -46,7 +46,7 @@ namespace RTSP.IngestService.Hls;
 /// </para>
 /// <para>Thread-safe; all state is guarded by one lock and every operation is short and bounded.</para>
 /// </remarks>
-public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
+public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInventory
 {
     /// <summary>Guards all state.</summary>
     private readonly Lock _gate = new();
@@ -151,7 +151,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
     }
 
     /// <inheritdoc />
-    public bool TryOpenStream(Guid sessionId, string application, string streamIdentity, int targetDurationSeconds, out HlsStreamNumbering numbering, string? incarnationId = null)
+    public bool TryOpenStream(Guid sessionId, string application, string streamIdentity, int targetDurationSeconds, out HlsStreamNumbering numbering, string? incarnationId = null, long generation = 0)
     {
         using (EnterGate())
         {
@@ -179,7 +179,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
                 Withdraw(keyState, ended, StreamEventReasons.Replaced);
             }
 
-            var state = new StreamState(key, sessionId, new HlsPlaylist(targetDurationSeconds, _options.PlaylistWindowSize), incarnationId);
+            var state = new StreamState(key, sessionId, new HlsPlaylist(targetDurationSeconds, _options.PlaylistWindowSize), incarnationId, generation);
             keyState.Current = state;
             _bySession[sessionId] = state;
             numbering = new HlsStreamNumbering(keyState.NextSequence, keyState.NextInitialization);
@@ -330,6 +330,31 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
         {
             PurgeExpired();
             return _keys.ContainsKey((application, streamIdentity));
+        }
+    }
+
+    /// <inheritdoc />
+    /// <remarks>Expiry is evaluated first, as on every call, so the list reflects the current time.</remarks>
+    public IReadOnlyList<HlsStreamStatus> GetStreams()
+    {
+        using (EnterGate())
+        {
+            PurgeExpired();
+            var streams = new List<HlsStreamStatus>();
+            foreach (var keyState in _keys.Values)
+            {
+                foreach (var state in keyState.Instances())
+                {
+                    if (state.IncarnationId is { } incarnationId)
+                    {
+                        var status = state.Withdrawn ? HlsStreamState.Withdrawn : state.Ended ? HlsStreamState.Ended : HlsStreamState.Live;
+                        var served = ReferenceEquals(keyState.Current, state) && state.Snapshot is not null;
+                        streams.Add(new HlsStreamStatus(state.Key.Application, state.Key.Identity, incarnationId, state.Generation, status, served));
+                    }
+                }
+            }
+
+            return streams.AsReadOnly();
         }
     }
 
@@ -668,8 +693,12 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore
     /// <param name="sessionId">The writer session.</param>
     /// <param name="playlist">The playlist.</param>
     /// <param name="incarnationId">The publication's incarnation identifier, if lifecycle events are reported for it.</param>
-    private sealed class StreamState((string Application, string Identity) key, Guid sessionId, HlsPlaylist playlist, string? incarnationId)
+    /// <param name="generation">The publication's registration generation.</param>
+    private sealed class StreamState((string Application, string Identity) key, Guid sessionId, HlsPlaylist playlist, string? incarnationId, long generation)
     {
+        /// <summary>Gets the publication's registration generation.</summary>
+        public long Generation { get; } = generation;
+
         /// <summary>Gets the stream key.</summary>
         public (string Application, string Identity) Key { get; } = key;
 

@@ -414,10 +414,11 @@ internal sealed partial class RtmpSession
         }
 
         var time = _context.TimeProvider;
-        var session = new PublisherSession(ConnectionId, RemoteEndPoint, Application!, result.StreamIdentity, publishType, messageStreamId, ConnectedAt, time.GetUtcNow());
+        var application = result.Application ?? Application!;
+        var session = new PublisherSession(ConnectionId, RemoteEndPoint, application, result.StreamIdentity, publishType, messageStreamId, ConnectedAt, time.GetUtcNow());
         if (!_context.Registry.TryAdd(session))
         {
-            LogStreamAlreadyPublished(ConnectionId, Application!, result.StreamIdentity);
+            LogStreamAlreadyPublished(ConnectionId, application, result.StreamIdentity);
             WriteStatus(messageStreamId, "error", "NetStream.Publish.BadName", "The stream is already being published.");
             return;
         }

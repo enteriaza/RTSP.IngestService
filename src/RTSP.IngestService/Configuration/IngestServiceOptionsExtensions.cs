@@ -21,7 +21,7 @@ public static class IngestServiceOptionsExtensions
 
     /// <summary>
     /// Registers <see cref="ApplicationOptions"/>, <see cref="LifetimeOptions"/>,
-    /// <see cref="FileLoggingOptions"/>, <see cref="RtmpOptions"/>, <see cref="MediaOptions"/>, <see cref="HlsOptions"/>, <see cref="HttpOriginOptions"/>, <see cref="ManagementOptions"/> and <see cref="StreamEventOptions"/>, each bound from its configuration section,
+    /// <see cref="FileLoggingOptions"/>, <see cref="RtmpOptions"/>, <see cref="MediaOptions"/>, <see cref="HlsOptions"/>, <see cref="HttpOriginOptions"/>, <see cref="ManagementOptions"/>, <see cref="StreamEventOptions"/>, <see cref="StreamCatalogOptions"/> and <see cref="TelemetryOptions"/>, each bound from its configuration section,
     /// validated when first resolved and validated eagerly when the host starts.
     /// </summary>
     /// <param name="services">The service collection to add registrations to.</param>
@@ -57,6 +57,10 @@ public static class IngestServiceOptionsExtensions
             services, configuration, ManagementOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
         AddValidatedOptions<StreamEventOptions, StreamEventOptionsValidator>(
             services, configuration, StreamEventOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
+        AddValidatedOptions<StreamCatalogOptions, StreamCatalogOptionsValidator>(
+            services, configuration, StreamCatalogOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
+        AddValidatedOptions<TelemetryOptions, TelemetryOptionsValidator>(
+            services, configuration, TelemetryOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
 
         return services;
     }

@@ -6,6 +6,9 @@
         <InvariantGlobalization>true</InvariantGlobalization>
         <PublishAot>true</PublishAot>
         <EnableConfigurationBindingGenerator>true</EnableConfigurationBindingGenerator>
+        <!-- Native AOT disables EventSource by default. The OpenTelemetry SDK reports export failures only through its
+             EventSources, which OpenTelemetryDiagnosticsListener forwards to the log; without this they are silent. -->
+        <EventSourceSupport>true</EventSourceSupport>
     </PropertyGroup>
 
     <ItemGroup>
@@ -16,6 +19,8 @@
     <ItemGroup>
         <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" />
         <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" />
+        <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />
+        <PackageReference Include="OpenTelemetry.Extensions.Hosting" />
         <PackageReference Include="Serilog" />
         <PackageReference Include="Serilog.Extensions.Logging" />
         <PackageReference Include="Serilog.Sinks.Console" />

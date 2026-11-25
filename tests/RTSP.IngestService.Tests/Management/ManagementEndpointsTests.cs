@@ -18,7 +18,9 @@ using RTSP.IngestService.Hls;
 using RTSP.IngestService.Http;
 using RTSP.IngestService.Lifecycle;
 using RTSP.IngestService.Management;
+using RTSP.IngestService.Streams;
 using RTSP.IngestService.Tests.Infrastructure;
+using RTSP.IngestService.Tests.Streams;
 using MsOptions = Microsoft.Extensions.Options.Options;
 
 namespace RTSP.IngestService.Tests.Management;
@@ -38,6 +40,9 @@ public sealed class ManagementEndpointsTests : IAsyncDisposable
     /// <summary>The client.</summary>
     private readonly HttpClient _client = new();
 
+    /// <summary>The stream catalog served, over a scriptable source.</summary>
+    private readonly CatalogFixture _catalog = new();
+
     /// <summary>The reported RTMP listener state.</summary>
     private bool _rtmpListening = true;
 
@@ -45,7 +50,7 @@ public sealed class ManagementEndpointsTests : IAsyncDisposable
     private bool? _httpListening;
 
     /// <summary>Gets every management path, including unknown ones, for policy tests.</summary>
-    public static TheoryData<string> ManagementPaths => ["/health/live", "/health/ready", "/health/unknown", "/health/", "/health"];
+    public static TheoryData<string> ManagementPaths => ["/health/live", "/health/ready", "/health/streams", "/health/streams/live/cam", "/health/streams/live/missing", "/health/unknown", "/health/", "/health"];
 
     /// <summary>Gets the test cancellation token.</summary>
     private static CancellationToken Token => TestContext.Current.CancellationToken;
@@ -60,6 +65,7 @@ public sealed class ManagementEndpointsTests : IAsyncDisposable
         }
 
         _client.Dispose();
+        _catalog.Dispose();
         await _services.DisposeAsync();
     }
 
@@ -230,7 +236,7 @@ public sealed class ManagementEndpointsTests : IAsyncDisposable
         _origins.Add(origin);
         _lifecycle.State = ApplicationState.Running;
 
-        foreach (var path in new[] { "/health/live", "/health/ready" })
+        foreach (var path in new[] { "/health/live", "/health/ready", "/health/streams", "/health/streams/live/cam" })
         {
             using var response = await _client.GetAsync(Uri(origin, path), Token);
             Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
@@ -379,6 +385,236 @@ public sealed class ManagementEndpointsTests : IAsyncDisposable
         Assert.Equal(StatusCodes.Status200OK, context.Response.StatusCode);
     }
 
+    /// <summary>Verifies the stream inventory is 503 with a status body until the catalog's first reconciliation.</summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task Streams_BeforeInitialization_Is503()
+    {
+        var origin = await StartAsync();
+
+        foreach (var path in new[] { "/health/streams", "/health/streams/live/cam" })
+        {
+            using var response = await _client.GetAsync(Uri(origin, path), Token);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+            AssertHealthHeaders(response);
+            Assert.Equal("{\"status\":\"initializing\"}", await response.Content.ReadAsStringAsync(Token));
+        }
+    }
+
+    /// <summary>
+    /// Verifies the inventory's schema: version, reconciliation time and per-incarnation entries with distinct
+    /// publishing and HLS states and the media description; internal fields and connection details are absent.
+    /// </summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task Streams_Get_ReturnsInventorySchema()
+    {
+        const string Incarnation = "0123456789abcdef0123456789abcdef";
+        _catalog.Source.Publish(Incarnation, 41, media: new StreamMediaDescription { Video = TestMedia.Video() })
+            .Store(Incarnation, 41, HlsStreamState.Live)
+            .Store("fedcba9876543210fedcba9876543210", 40, HlsStreamState.Withdrawn)
+            .Publish("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 42, "pending");
+        _catalog.Catalog.Reconcile();
+        var origin = await StartAsync();
+
+        using var response = await _client.GetAsync(Uri(origin, "/health/streams"), Token);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        AssertHealthHeaders(response);
+        var text = await response.Content.ReadAsStringAsync(Token);
+        using var body = JsonDocument.Parse(text);
+        var root = body.RootElement;
+        Assert.Equal(["version", "reconciledAt", "streams"], root.EnumerateObject().Select(static p => p.Name));
+        Assert.Equal(_catalog.Catalog.Current.Version, root.GetProperty("version").GetInt64());
+        Assert.Equal(_catalog.Time.GetUtcNow(), root.GetProperty("reconciledAt").GetDateTimeOffset());
+        var streams = root.GetProperty("streams").EnumerateArray().ToList();
+        Assert.Equal(3, streams.Count);
+
+        var live = streams.Single(static s => s.GetProperty("incarnationId").GetString() == Incarnation);
+        Assert.Equal(["application", "stream", "incarnationId", "current", "publishing", "hls", "media"], live.EnumerateObject().Select(static p => p.Name));
+        Assert.Equal(("live", "cam", true), (live.GetProperty("application").GetString(), live.GetProperty("stream").GetString(), live.GetProperty("current").GetBoolean()));
+        Assert.Equal("publishing", live.GetProperty("publishing").GetProperty("state").GetString());
+        Assert.Equal(DateTimeOffset.UnixEpoch, live.GetProperty("publishing").GetProperty("startedAt").GetDateTimeOffset());
+        Assert.False(live.GetProperty("publishing").TryGetProperty("endReason", out _));
+        Assert.Equal("live", live.GetProperty("hls").GetProperty("state").GetString());
+        Assert.True(live.GetProperty("hls").GetProperty("playlistAvailable").GetBoolean());
+        Assert.Equal("avc1.64001F", live.GetProperty("media").GetProperty("video").GetProperty("codec").GetString());
+        Assert.False(live.GetProperty("media").TryGetProperty("audio", out _));
+
+        var draining = streams.Single(static s => s.GetProperty("incarnationId").GetString() == "fedcba9876543210fedcba9876543210");
+        Assert.False(draining.GetProperty("current").GetBoolean());
+        Assert.Equal(("ended", "withdrawn", false), (draining.GetProperty("publishing").GetProperty("state").GetString(), draining.GetProperty("hls").GetProperty("state").GetString(), draining.GetProperty("hls").GetProperty("playlistAvailable").GetBoolean()));
+
+        var pending = streams.Single(static s => s.GetProperty("stream").GetString() == "pending");
+        Assert.Equal("pending", pending.GetProperty("hls").GetProperty("state").GetString());
+        Assert.False(pending.TryGetProperty("media", out _));
+
+        foreach (var forbidden in new[] { "generation", "sessionId", "connection", "remote", "address", "key", "41", "42" })
+        {
+            Assert.DoesNotContain(forbidden, text, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    /// <summary>
+    /// Verifies a live stream whose playlist is not yet published is serialized as <c>live</c> with
+    /// <c>playlistAvailable: false</c>, in the list and the detail route, and becomes true once the store reports it.
+    /// </summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task Streams_LiveWithoutPlaylist_SerializesUnavailable()
+    {
+        const string Incarnation = "0123456789abcdef0123456789abcdef";
+        _catalog.Source.Publish(Incarnation, 1).Store(Incarnation, 1, HlsStreamState.Live, playlistAvailable: false);
+        _catalog.Catalog.Reconcile();
+        var origin = await StartAsync();
+
+        async Task<(string? State, bool Available)> ReadAsync(string path, Func<JsonElement, JsonElement> entry)
+        {
+            using var response = await _client.GetAsync(Uri(origin, path), Token);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync(Token));
+            var hls = entry(body.RootElement).GetProperty("hls");
+            Assert.Equal(["state", "playlistAvailable"], hls.EnumerateObject().Select(static p => p.Name));
+            return (hls.GetProperty("state").GetString(), hls.GetProperty("playlistAvailable").GetBoolean());
+        }
+
+        Assert.Equal(("live", false), await ReadAsync("/health/streams", static r => r.GetProperty("streams")[0]));
+        Assert.Equal(("live", false), await ReadAsync("/health/streams/live/cam", static r => r.GetProperty("stream")));
+
+        _catalog.Source.Hls.Clear();
+        _catalog.Source.Store(Incarnation, 1, HlsStreamState.Live, playlistAvailable: true);
+        _catalog.Catalog.Reconcile();
+        Assert.Equal(("live", true), await ReadAsync("/health/streams", static r => r.GetProperty("streams")[0]));
+        Assert.Equal(("live", true), await ReadAsync("/health/streams/live/cam", static r => r.GetProperty("stream")));
+    }
+
+    /// <summary>Verifies the detail route returns the current incarnation and 404s unknown streams and malformed paths.</summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task StreamDetail_ReturnsCurrentIncarnation_Or404()
+    {
+        _catalog.Source.Store("ffffffffffffffffffffffffffffffff", 1, HlsStreamState.Withdrawn)
+            .Publish("00000000000000000000000000000000", 2).Store("00000000000000000000000000000000", 2, HlsStreamState.Live);
+        _catalog.Catalog.Reconcile();
+        var origin = await StartAsync();
+
+        using (var response = await _client.GetAsync(Uri(origin, "/health/streams/live/cam"), Token))
+        {
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            AssertHealthHeaders(response);
+            using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync(Token));
+            Assert.Equal(["version", "reconciledAt", "stream"], body.RootElement.EnumerateObject().Select(static p => p.Name));
+            Assert.Equal("00000000000000000000000000000000", body.RootElement.GetProperty("stream").GetProperty("incarnationId").GetString());
+        }
+
+        foreach (var path in new[] { "/health/streams/live/missing", "/health/streams/other/cam", "/health/streams/live", "/health/streams/live/cam/extra", "/health/streams//cam", "/health/streams/live/", "/health/streams/" })
+        {
+            using var response = await _client.GetAsync(Uri(origin, path), Token);
+            Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+            Assert.True(response.Headers.CacheControl!.NoStore);
+            Assert.Empty(await response.Content.ReadAsByteArrayAsync(Token));
+        }
+    }
+
+    /// <summary>Verifies HEAD on the stream routes matches GET without a body, and other methods are 405.</summary>
+    /// <param name="path">The route.</param>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Theory]
+    [InlineData("/health/streams")]
+    [InlineData("/health/streams/live/cam")]
+    public async Task Streams_HeadMatchesGet_AndOtherMethodsAre405(string path)
+    {
+        _catalog.Source.Publish("0123456789abcdef0123456789abcdef", 1);
+        _catalog.Catalog.Reconcile();
+        var origin = await StartAsync();
+        using var get = await _client.GetAsync(Uri(origin, path), Token);
+        var getLength = (await get.Content.ReadAsByteArrayAsync(Token)).Length;
+
+        using var head = await _client.SendAsync(new HttpRequestMessage(HttpMethod.Head, Uri(origin, path)), Token);
+        Assert.Equal(HttpStatusCode.OK, head.StatusCode);
+        AssertHealthHeaders(head);
+        Assert.Equal(getLength, head.Content.Headers.ContentLength);
+        Assert.Empty(await head.Content.ReadAsByteArrayAsync(Token));
+
+        foreach (var method in new[] { HttpMethod.Post, HttpMethod.Put, HttpMethod.Delete })
+        {
+            using var rejected = await _client.SendAsync(new HttpRequestMessage(method, Uri(origin, path)), Token);
+            Assert.Equal(HttpStatusCode.MethodNotAllowed, rejected.StatusCode);
+            Assert.Equal(["GET", "HEAD"], rejected.Content.Headers.Allow.Order(StringComparer.Ordinal));
+            Assert.Empty(await rejected.Content.ReadAsByteArrayAsync(Token));
+        }
+    }
+
+    /// <summary>Verifies the stream routes accept IPv6 and IPv4-mapped loopback clients.</summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task Streams_AcceptIpv6AndMappedLoopback()
+    {
+        Assert.SkipUnless(Socket.OSSupportsIPv6, "IPv6 is not available on this machine.");
+        _catalog.Catalog.Reconcile();
+        var v6 = await StartAsync("::1");
+        var dual = await StartAsync("::");
+
+        using var ipv6 = await _client.GetAsync(new Uri($"http://[::1]:{v6.LocalEndPoint!.Port}/health/streams"), Token);
+        using var mapped = await _client.GetAsync(new Uri($"http://127.0.0.1:{dual.LocalEndPoint!.Port}/health/streams"), Token);
+
+        Assert.Equal(HttpStatusCode.OK, ipv6.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, mapped.StatusCode);
+    }
+
+    /// <summary>Verifies stream routes are ordinary unknown paths when the endpoints have no catalog.</summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task Streams_WithoutCatalog_Are404()
+    {
+        var endpoints = new ManagementEndpoints(_lifecycle, () => true, () => true, NullLogger<ManagementEndpoints>.Instance);
+        foreach (var path in new[] { "/health/streams", "/health/streams/live/cam" })
+        {
+            var context = Context(IPAddress.Loopback, "GET", path);
+            await endpoints.ServeAsync(context);
+            Assert.Equal(StatusCodes.Status404NotFound, context.Response.StatusCode);
+            Assert.Equal(0, context.Response.Body.Length);
+        }
+    }
+
+    /// <summary>
+    /// Verifies every response is serialized from one catalog snapshot: while reconciliations alternate between an
+    /// empty and a two-stream inventory, no response ever contains exactly one stream.
+    /// </summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task Streams_EachResponseIsOneConsistentSnapshot()
+    {
+        var endpoints = CreateEndpoints(origin: null);
+        _catalog.Catalog.Reconcile();
+        var writer = Task.Run(() =>
+        {
+            for (var round = 0; round < 200; round++)
+            {
+                _catalog.Source.Hls.Clear();
+                _catalog.Source.Publishing.Clear();
+                if (round % 2 == 0)
+                {
+                    _catalog.Source.Publish("0123456789abcdef0123456789abcdef", 1, "a").Publish("fedcba9876543210fedcba9876543210", 2, "b");
+                }
+
+                _catalog.Catalog.Reconcile();
+            }
+        }, Token);
+
+        var counts = new HashSet<int>();
+        while (!writer.IsCompleted)
+        {
+            var (status, bytes) = endpoints.Streams(null)!.Value;
+            Assert.Equal(StatusCodes.Status200OK, status);
+            using var body = JsonDocument.Parse(bytes);
+            counts.Add(body.RootElement.GetProperty("streams").GetArrayLength());
+        }
+
+        await writer.WithinSafetyTimeout();
+        Assert.DoesNotContain(1, counts);
+    }
+
     /// <summary>Verifies loopback classification of transport addresses.</summary>
     /// <param name="address">The address, or empty for none.</param>
     /// <param name="expected">Whether it is accepted.</param>
@@ -493,7 +729,8 @@ public sealed class ManagementEndpointsTests : IAsyncDisposable
         _lifecycle,
         () => _rtmpListening,
         () => _httpListening ?? origin?.IsListening ?? false,
-        NullLogger<ManagementEndpoints>.Instance);
+        NullLogger<ManagementEndpoints>.Instance,
+        _catalog.Catalog);
 
     /// <summary>Creates an origin, not started, whose pipeline serves management endpoints unless disabled.</summary>
     /// <param name="endpoints">The endpoints, or <see langword="null"/> to create them over this origin.</param>
@@ -507,7 +744,7 @@ public sealed class ManagementEndpointsTests : IAsyncDisposable
         var meters = _services.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>();
         var store = new InMemoryHlsSegmentStore(MsOptions.Create(hls), time, new HlsMetrics(meters));
         HlsHttpOrigin? origin = null;
-        endpoints ??= new ManagementEndpoints(_lifecycle, () => _rtmpListening, () => _httpListening ?? origin!.IsListening, NullLogger<ManagementEndpoints>.Instance);
+        endpoints ??= new ManagementEndpoints(_lifecycle, () => _rtmpListening, () => _httpListening ?? origin!.IsListening, NullLogger<ManagementEndpoints>.Instance, _catalog.Catalog);
         var application = new HlsHttpApplication(store, MsOptions.Create(hls), new HttpOriginMetrics(meters), time, NullLogger<HlsHttpApplication>.Instance, management ? endpoints : null);
         origin = new HlsHttpOrigin(MsOptions.Create(new HttpOriginOptions { ListenAddress = address, Port = 0 }), application, _services, NullLoggerFactory.Instance);
         return origin;

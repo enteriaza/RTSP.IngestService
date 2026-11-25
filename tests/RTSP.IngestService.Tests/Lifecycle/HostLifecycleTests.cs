@@ -155,9 +155,12 @@ public sealed class HostLifecycleTests
             await service.ExecutionStarted.WithinSafetyTimeout();
             await host.StopAsync(CancellationToken.None).WithinSafetyTimeout();
 
-            var warning = Assert.Single(_logs.GetSnapshot(), static r => r.Id.Id == 1100);
+            // Once the timeout has expired the host stops the remaining background services without waiting for them,
+            // so under load a production service may legitimately be reported as abandoned as well.
+            var warning = Assert.Single(
+                _logs.GetSnapshot(),
+                static r => r.Id.Id == 1100 && r.GetStructuredStateValue("ServiceType") == typeof(UncooperativeBackgroundService).FullName);
             Assert.Equal(LogLevel.Warning, warning.Level);
-            Assert.Equal(typeof(UncooperativeBackgroundService).FullName, warning.GetStructuredStateValue("ServiceType"));
             Assert.Equal(ApplicationState.Stopped, host.Services.GetRequiredService<IApplicationLifecycle>().State);
         }
         finally

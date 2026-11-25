@@ -1,82 +1,164 @@
-// Development and test publisher authenticator: accepts a publish request when the application matches the configured
-// application and the stream name equals one of the configured stream keys. Keys are compared as SHA-256 digests in
-// constant time, and every configured key is checked so that timing does not reveal which entry matched.
+// The configuration-based publisher authenticator: rate-limits failed attempts per remote address, verifies the
+// presented stream key against the one-way hash of every configured credential in constant time, and assigns the
+// matched credential's application and name to the session. No plaintext key is stored or compared.
 
 using System.Security.Cryptography;
 using System.Text;
-using Microsoft.Extensions.Options;
-using RTSP.IngestService.Configuration;
 
 namespace RTSP.IngestService.Rtmp.Publishing;
 
 /// <summary>
-/// Authenticates publishers against <see cref="RtmpAuthenticationOptions"/>.
+/// Authenticates publishers against the credentials in <see cref="PublisherCredentialStore"/>.
 /// </summary>
 /// <remarks>
 /// <para>
 /// The stream name sent by the encoder (the OBS "Stream Key", or the last path segment of an FFmpeg RTMP URL) is the
-/// credential; the query string and <c>tcUrl</c> are ignored. On success the configured publisher name becomes the
-/// session's stream identity.
+/// key; the query string and <c>tcUrl</c> are ignored. Order of checks for one attempt:
 /// </para>
+/// <list type="number">
+///   <item><description>The rate limiter reserves a failure token for the TCP peer address; when none is left the
+///   attempt is rejected before any hashing.</description></item>
+///   <item><description>A key that is not 16 to 256 printable ASCII characters is rejected without hashing.</description></item>
+///   <item><description>The key is verified against every credential in one snapshot, enabled or not, so the time taken
+///   does not depend on which credential matches. No match, more than one match, a disabled match, or a match whose
+///   application differs from the application the publisher connected to is rejected.</description></item>
+///   <item><description>On success the reserved token is returned and the result carries the credential's name as the
+///   stream identity and its application, which the session, registry, HLS store, events and catalog use.</description></item>
+/// </list>
 /// <para>
-/// Limitations: keys are plain text in configuration and read once at startup; there is no rate limiting, expiry,
-/// revocation without restart, or per-key application scoping. Intended for local and interoperability testing; a
-/// production deployment should register its own <see cref="IPublisherAuthenticator"/>. Thread-safe.
+/// Rejection reasons are fixed strings that name neither keys, hashes nor credentials. Thread-safe.
 /// </para>
 /// </remarks>
-public sealed class ConfiguredPublisherAuthenticator : IPublisherAuthenticator
+internal sealed class ConfiguredPublisherAuthenticator : IPublisherAuthenticator
 {
-    /// <summary>The accepted application name.</summary>
-    private readonly string _application;
+    /// <summary>The credential source.</summary>
+    private readonly PublisherCredentialStore _store;
 
-    /// <summary>Publisher names with the SHA-256 digest of their stream keys.</summary>
-    private readonly (string Name, byte[] KeyHash)[] _publishers;
+    /// <summary>The failure rate limiter.</summary>
+    private readonly PublisherAuthenticationRateLimiter _rateLimiter;
+
+    /// <summary>The metrics.</summary>
+    private readonly RtmpMetrics _metrics;
 
     /// <summary>Initializes a new instance of the <see cref="ConfiguredPublisherAuthenticator"/> class.</summary>
-    /// <param name="options">The RTMP options; their authentication settings are read once.</param>
-    public ConfiguredPublisherAuthenticator(IOptions<RtmpOptions> options)
+    /// <param name="store">The credential source.</param>
+    /// <param name="rateLimiter">The failure rate limiter.</param>
+    /// <param name="metrics">The RTMP metrics.</param>
+    public ConfiguredPublisherAuthenticator(PublisherCredentialStore store, PublisherAuthenticationRateLimiter rateLimiter, RtmpMetrics metrics)
     {
-        ArgumentNullException.ThrowIfNull(options);
-        var authentication = options.Value.Authentication;
-        _application = authentication.Application;
-        _publishers = [.. authentication.Publishers.Select(static p => (p.Name, Hash(p.StreamKey)))];
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(rateLimiter);
+        ArgumentNullException.ThrowIfNull(metrics);
+        _store = store;
+        _rateLimiter = rateLimiter;
+        _metrics = metrics;
     }
 
-    /// <summary>
-    /// Accepts the request if the application matches and the stream name is a configured key.
-    /// </summary>
+    /// <summary>Authenticates a publish request.</summary>
     /// <param name="request">The publish request.</param>
     /// <param name="cancellationToken">Not observed; the method completes synchronously.</param>
-    /// <returns>
-    /// <see cref="PublishAuthenticationResult.Authorize"/> with the publisher name, or a rejection whose reason names
-    /// neither the key nor the stream name.
-    /// </returns>
+    /// <returns>An authorization with the credential's name and application, or a rejection.</returns>
     public ValueTask<PublishAuthenticationResult> AuthenticateAsync(PublishAuthenticationRequest request, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        if (!string.Equals(request.Application, _application, StringComparison.Ordinal))
+        var snapshot = _store.Current;
+        if (!_rateLimiter.TryAcquire(request.RemoteEndPoint, out var address))
         {
-            return ValueTask.FromResult(PublishAuthenticationResult.Reject("The application is not accepted for publishing."));
+            return Fail(AuthenticationResult.RateLimited, "Too many failed publish attempts from this address.");
         }
 
-        var presented = Hash(request.StreamName);
-        string? match = null;
-        foreach (var (name, keyHash) in _publishers)
+        var (outcome, credential) = Verify(snapshot, request);
+        if (outcome != AuthenticationResult.Success)
         {
-            if (CryptographicOperations.FixedTimeEquals(presented, keyHash))
+            return Fail(outcome, outcome switch
             {
-                match ??= name;
-            }
+                AuthenticationResult.MalformedKey => "The stream key is not in an accepted format.",
+                AuthenticationResult.Disabled => "The credential is disabled.",
+                AuthenticationResult.Ambiguous => "The stream key matches more than one credential.",
+                AuthenticationResult.ApplicationMismatch => "The application is not accepted for this credential.",
+                _ => "The stream key is not recognised.",
+            });
         }
 
-        return ValueTask.FromResult(match is null
-            ? PublishAuthenticationResult.Reject("The stream key is not recognised.")
-            : PublishAuthenticationResult.Authorize(match));
+        _rateLimiter.Release(address);
+        _metrics.AuthenticationAttempt(AuthenticationResult.Success);
+        return ValueTask.FromResult(PublishAuthenticationResult.Authorize(credential!.Name, credential.Application));
     }
 
-    /// <summary>Computes the SHA-256 digest of the UTF-8 encoding of <paramref name="value"/>.</summary>
-    /// <param name="value">The key.</param>
-    /// <returns>The digest.</returns>
-    private static byte[] Hash(string value) => SHA256.HashData(Encoding.UTF8.GetBytes(value));
+    /// <summary>Verifies the presented key against every credential in <paramref name="snapshot"/>.</summary>
+    /// <param name="snapshot">The credential snapshot.</param>
+    /// <param name="request">The request.</param>
+    /// <returns>The outcome and, on success, the matched credential.</returns>
+    private static (AuthenticationResult Outcome, PublisherCredential? Credential) Verify(PublisherCredentialSnapshot snapshot, PublishAuthenticationRequest request)
+    {
+        if (!PublisherKeyHash.IsAcceptableKey(request.StreamName))
+        {
+            return (AuthenticationResult.MalformedKey, null);
+        }
+
+        Span<byte> key = stackalloc byte[PublisherKeyHash.MaxKeyLength];
+        var length = Encoding.ASCII.GetBytes(request.StreamName, key);
+        PublisherCredential? match = null;
+        var matches = 0;
+        try
+        {
+            foreach (var credential in snapshot.Credentials)
+            {
+                if (credential.KeyHash.Matches(key[..length]))
+                {
+                    match ??= credential;
+                    matches++;
+                }
+            }
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(key);
+        }
+
+        return matches switch
+        {
+            0 => (AuthenticationResult.InvalidCredential, null),
+            > 1 => (AuthenticationResult.Ambiguous, null),
+            _ when !match!.Enabled => (AuthenticationResult.Disabled, null),
+            _ when !string.Equals(match.Application, request.Application, StringComparison.Ordinal) => (AuthenticationResult.ApplicationMismatch, null),
+            _ => (AuthenticationResult.Success, match),
+        };
+    }
+
+    /// <summary>Records a failed attempt and creates its rejection.</summary>
+    /// <param name="outcome">The failure.</param>
+    /// <param name="reason">The fixed, non-secret reason.</param>
+    /// <returns>The rejection.</returns>
+    private ValueTask<PublishAuthenticationResult> Fail(AuthenticationResult outcome, string reason)
+    {
+        _metrics.AuthenticationAttempt(outcome);
+        return ValueTask.FromResult(PublishAuthenticationResult.Reject(reason));
+    }
+}
+
+/// <summary>The outcome of one publish authentication attempt, recorded as the <c>result</c> metric tag.</summary>
+internal enum AuthenticationResult
+{
+    /// <summary>The key matched one enabled credential for the requested application.</summary>
+    Success,
+
+    /// <summary>The key matched no credential.</summary>
+    InvalidCredential,
+
+    /// <summary>The key matched a disabled credential.</summary>
+    Disabled,
+
+    /// <summary>The key matched more than one credential.</summary>
+    Ambiguous,
+
+    /// <summary>The key matched a credential for a different application.</summary>
+    ApplicationMismatch,
+
+    /// <summary>The key was not 16 to 256 printable ASCII characters.</summary>
+    MalformedKey,
+
+    /// <summary>The remote address exhausted its failure allowance.</summary>
+    RateLimited,
 }

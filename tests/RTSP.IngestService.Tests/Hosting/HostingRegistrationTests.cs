@@ -95,6 +95,7 @@ public sealed class HostingRegistrationTests
         using var host = TestHosts.CreateBuilder(_logs, HostingMode.Systemd).Build();
 
         await host.StartAsync(TestContext.Current.CancellationToken);
+        await Eventually.WaitUntilAsync(() => _logs.GetSnapshot().Any(static r => r.Id.Id == 2000), "the watchdog reports that it is disabled");
         await host.StopAsync(TestContext.Current.CancellationToken);
 
         Assert.Equal(ApplicationState.Stopped, host.Services.GetRequiredService<IApplicationLifecycle>().State);

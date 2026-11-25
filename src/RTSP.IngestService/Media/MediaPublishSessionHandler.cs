@@ -82,6 +82,11 @@ public sealed partial class MediaPublishSessionHandler : IPublishSessionHandler
     /// <summary>Gets the number of sessions with media state; for diagnostics and tests.</summary>
     internal int ActiveSessionCount => _sessions.Count;
 
+    /// <summary>Returns the current immutable stream description of an active session.</summary>
+    /// <param name="sessionId">The session.</param>
+    /// <returns>The description, or <see langword="null"/> if the session has no media state.</returns>
+    internal MediaStreamInfo? FindStreamInfo(Guid sessionId) => _sessions.TryGetValue(sessionId, out var state) ? state.Media.StreamInfo : null;
+
     /// <inheritdoc />
     public async ValueTask OnSessionStartedAsync(PublisherSession session, CancellationToken cancellationToken)
     {

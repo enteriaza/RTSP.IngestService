@@ -10,7 +10,10 @@ namespace RTSP.IngestService.Configuration;
 /// Settings for the RTMP ingest listener (<see cref="Rtmp.RtmpListener"/>) and the per-connection protocol limits.
 /// </summary>
 /// <remarks>
-/// The options are read once when the listener starts; changing them requires a restart.
+/// The options are read once when the listener starts and changing them requires a restart, except
+/// <see cref="RtmpAuthenticationOptions.Publishers"/>, which is reloaded when the configuration changes (see
+/// <see cref="Rtmp.Publishing.PublisherCredentialStore"/>). A reload is validated as a whole, so an invalid value
+/// anywhere in the section keeps the previous credentials.
 /// </remarks>
 public sealed class RtmpOptions : IValidatableObject
 {
@@ -88,7 +91,7 @@ public sealed class RtmpOptions : IValidatableObject
     public int MaxBufferedBytes { get; set; } = 16 * 1024 * 1024;
 
     /// <summary>
-    /// Gets or sets the settings of the configuration-based publisher authenticator.
+    /// Gets or sets the publisher credentials and failure rate limit of the configuration-based publisher authenticator.
     /// </summary>
     [ValidateObjectMembers]
     public RtmpAuthenticationOptions Authentication { get; set; } = new();

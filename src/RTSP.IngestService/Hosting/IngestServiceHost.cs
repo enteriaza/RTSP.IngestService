@@ -1,7 +1,8 @@
 // Composition root. This is the single place where the host builder is created and every service registration is
 // applied, in an order that matters: lifecycle before other hosted services, platform hosting before logging (so
-// logging can remove providers that the platform integration adds), and the RTMP listener last so that it starts
-// after every other service and is the first to stop.
+// logging can remove providers that the platform integration adds), telemetry export before the ingest components (so
+// its final flush runs after they have stopped), and the RTMP listener last so that it starts after every other
+// service and is the first to stop.
 
 using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Hls;
@@ -12,6 +13,7 @@ using RTSP.IngestService.Management;
 using RTSP.IngestService.Media;
 using RTSP.IngestService.Rtmp;
 using RTSP.IngestService.Streams;
+using RTSP.IngestService.Telemetry;
 
 namespace RTSP.IngestService.Hosting;
 
@@ -48,7 +50,9 @@ public static class IngestServiceHost
         builder.Services.AddApplicationLifecycle();
         builder.Services.AddPlatformHosting(mode);
         builder.Logging.AddIngestServiceLogging(mode);
+        builder.Services.AddTelemetryExport();
         builder.Services.AddStreamEvents();
+        builder.Services.AddStreamCatalog();
         builder.Services.AddHlsPackaging();
         builder.Services.AddMediaProcessing();
         builder.Services.AddManagementEndpoints();

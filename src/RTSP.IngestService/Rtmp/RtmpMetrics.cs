@@ -34,6 +34,12 @@ internal sealed class RtmpMetrics
     /// <summary>Rejected publish requests.</summary>
     private readonly Counter<long> _authenticationFailures;
 
+    /// <summary>Publish authentication attempts by result.</summary>
+    private readonly Counter<long> _authenticationAttempts;
+
+    /// <summary>Publisher credential reloads by result.</summary>
+    private readonly Counter<long> _credentialReloads;
+
     /// <summary>Connections closed for protocol violations.</summary>
     private readonly Counter<long> _protocolErrors;
 
@@ -62,6 +68,8 @@ internal sealed class RtmpMetrics
         _duration = meter.CreateHistogram<double>("rtmp.connection.duration", "s", "Duration of closed RTMP connections; tag close_reason.");
         _handshakes = meter.CreateCounter<long>("rtmp.handshakes", "{handshake}", "Completed or failed RTMP handshakes; tag result.");
         _authenticationFailures = meter.CreateCounter<long>("rtmp.authentication.failures", "{request}", "Publish requests rejected by the authenticator.");
+        _authenticationAttempts = meter.CreateCounter<long>("rtmp.authentication.attempts", "{request}", "Publish requests checked by the configured authenticator; tag result.");
+        _credentialReloads = meter.CreateCounter<long>("rtmp.authentication.reloads", "{reload}", "Publisher credential reloads; tag result.");
         _protocolErrors = meter.CreateCounter<long>("rtmp.protocol_errors", "{connection}", "Connections closed because of RTMP protocol violations.");
         _activeSessions = meter.CreateUpDownCounter<long>("rtmp.sessions.active", "{session}", "Streams currently being published.");
         _publisherDisconnects = meter.CreateCounter<long>("rtmp.publisher.disconnects", "{session}", "Ended publishing sessions; tag reason.");
@@ -98,6 +106,16 @@ internal sealed class RtmpMetrics
 
     /// <summary>Records a rejected publish request.</summary>
     public void AuthenticationFailed() => _authenticationFailures.Add(1);
+
+    /// <summary>Records the outcome of a publish authentication attempt by the configured authenticator.</summary>
+    /// <param name="result">The outcome.</param>
+    public void AuthenticationAttempt(AuthenticationResult result) =>
+        _authenticationAttempts.Add(1, new KeyValuePair<string, object?>("result", Name(result)));
+
+    /// <summary>Records a publisher credential reload.</summary>
+    /// <param name="succeeded">Whether the new credentials were applied.</param>
+    public void CredentialReload(bool succeeded) =>
+        _credentialReloads.Add(1, new KeyValuePair<string, object?>("result", succeeded ? "success" : "failure"));
 
     /// <summary>Records a started publishing session.</summary>
     public void SessionStarted() => _activeSessions.Add(1);
@@ -148,5 +166,19 @@ internal sealed class RtmpMetrics
         PublishEndReason.ConnectionError => "connection_error",
         PublishEndReason.ServerShutdown => "server_shutdown",
         _ => "handler_failed",
+    };
+
+    /// <summary>Returns the snake-case metric value of <paramref name="result"/>.</summary>
+    /// <param name="result">The authentication outcome.</param>
+    /// <returns>The tag value.</returns>
+    private static string Name(AuthenticationResult result) => result switch
+    {
+        AuthenticationResult.Success => "success",
+        AuthenticationResult.InvalidCredential => "invalid_credential",
+        AuthenticationResult.Disabled => "disabled",
+        AuthenticationResult.Ambiguous => "ambiguous",
+        AuthenticationResult.ApplicationMismatch => "application_mismatch",
+        AuthenticationResult.MalformedKey => "malformed_key",
+        _ => "rate_limited",
     };
 }

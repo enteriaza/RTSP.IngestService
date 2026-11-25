@@ -1,4 +1,4 @@
-// Management routes of the shared HTTP origin: liveness and readiness. They run inside the HLS origin's Kestrel
+// Management routes of the shared HTTP origin: liveness, readiness and the read-only stream inventory. They run inside the HLS origin's Kestrel
 // request pipeline (there is no second server or listener) and are restricted to loopback clients by the transport's
 // remote address; forwarding headers are never consulted, so a client cannot claim to be local.
 
@@ -6,10 +6,11 @@ using System.Net;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http;
 using RTSP.IngestService.Lifecycle;
+using RTSP.IngestService.Streams;
 
 namespace RTSP.IngestService.Management;
 
-/// <summary>Serves <c>/health/live</c> and <c>/health/ready</c> to loopback clients.</summary>
+/// <summary>Serves <c>/health/live</c>, <c>/health/ready</c> and, with a catalog, <c>/health/streams</c> to loopback clients.</summary>
 /// <remarks>
 /// <para>
 /// Every path under <see cref="PathPrefix"/> is a management path. A request whose connection is not from a loopback
@@ -23,6 +24,11 @@ namespace RTSP.IngestService.Management;
 /// listeners report that they are bound; otherwise 503. Both return a small JSON body with
 /// <c>Cache-Control: no-store</c>; <c>HEAD</c> returns the same status and headers without the body; other methods
 /// are 405.
+/// </para>
+/// <para>
+/// <c>/health/streams</c> lists the stream catalog and <c>/health/streams/{application}/{stream}</c> returns the
+/// current incarnation of one stream (404 if unknown); both are 503 until the catalog's first reconciliation, and
+/// each response is serialized from one immutable catalog snapshot.
 /// </para>
 /// <para>
 /// Requests never touch the media pipeline, and a failure is answered 500 (or aborts the response) without affecting
@@ -39,6 +45,9 @@ internal sealed partial class ManagementEndpoints
 
     /// <summary>Readiness path.</summary>
     public const string ReadyPath = "/health/ready";
+
+    /// <summary>Stream inventory path; <c>{StreamsPath}/{application}/{stream}</c> is one stream's current incarnation.</summary>
+    public const string StreamsPath = "/health/streams";
 
     /// <summary>Cache policy of every management response.</summary>
     public const string CacheControl = "no-store";
@@ -61,13 +70,18 @@ internal sealed partial class ManagementEndpoints
     /// <summary>Logger.</summary>
     private readonly ILogger _logger;
 
+    /// <summary>The stream catalog, if the stream inventory is served.</summary>
+    private readonly StreamCatalog? _catalog;
+
     /// <summary>Initializes a new instance of the <see cref="ManagementEndpoints"/> class.</summary>
     /// <param name="lifecycle">The application lifecycle.</param>
     /// <param name="rtmpListening">Reports whether the RTMP listener is bound; called on every readiness request.</param>
     /// <param name="httpListening">Reports whether the HTTP listener is bound; called on every readiness request.</param>
     /// <param name="logger">Logger.</param>
-    public ManagementEndpoints(IApplicationLifecycle lifecycle, Func<bool> rtmpListening, Func<bool> httpListening, ILogger<ManagementEndpoints> logger)
+    /// <param name="catalog">The stream catalog; <see langword="null"/> to not serve the stream inventory (its paths are then 404).</param>
+    public ManagementEndpoints(IApplicationLifecycle lifecycle, Func<bool> rtmpListening, Func<bool> httpListening, ILogger<ManagementEndpoints> logger, StreamCatalog? catalog = null)
     {
+        _catalog = catalog;
         ArgumentNullException.ThrowIfNull(lifecycle);
         ArgumentNullException.ThrowIfNull(rtmpListening);
         ArgumentNullException.ThrowIfNull(httpListening);
@@ -110,7 +124,8 @@ internal sealed partial class ManagementEndpoints
             }
 
             var path = context.Request.Path.Value;
-            if (path is not (LivePath or ReadyPath))
+            (string Application, string Stream)? detail = null;
+            if (path is not (LivePath or ReadyPath) && !(_catalog is not null && IsStreamsPath(path, out detail)))
             {
                 response.StatusCode = StatusCodes.Status404NotFound;
                 response.ContentLength = 0;
@@ -127,8 +142,24 @@ internal sealed partial class ManagementEndpoints
                 return;
             }
 
-            var (status, body) = path == LivePath ? Live() : Ready();
-            var bytes = JsonSerializer.SerializeToUtf8Bytes(body, ManagementJsonContext.Default.HealthReport);
+            int status;
+            byte[] bytes;
+            if (path is LivePath or ReadyPath)
+            {
+                (status, var body) = path == LivePath ? Live() : Ready();
+                bytes = JsonSerializer.SerializeToUtf8Bytes(body, ManagementJsonContext.Default.HealthReport);
+            }
+            else if (Streams(detail) is { } streams)
+            {
+                (status, bytes) = streams;
+            }
+            else
+            {
+                response.StatusCode = StatusCodes.Status404NotFound;
+                response.ContentLength = 0;
+                return;
+            }
+
             response.StatusCode = status;
             response.ContentType = JsonContentType;
             response.ContentLength = bytes.Length;
@@ -175,6 +206,56 @@ internal sealed partial class ManagementEndpoints
         var http = _httpListening();
         var ready = state == ApplicationState.Running && rtmp && http;
         return (ready ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable, new HealthReport(ready ? "ready" : "not_ready", state.ToString(), rtmp, http));
+    }
+
+    /// <summary>Serializes the stream inventory or one stream from a single catalog snapshot.</summary>
+    /// <param name="detail">The requested stream, or <see langword="null"/> for the whole inventory.</param>
+    /// <returns>The status code and body, or <see langword="null"/> if the stream is unknown.</returns>
+    internal (int Status, byte[] Body)? Streams((string Application, string Stream)? detail)
+    {
+        var snapshot = _catalog!.Current;
+        if (!snapshot.IsInitialized)
+        {
+            return (StatusCodes.Status503ServiceUnavailable, JsonSerializer.SerializeToUtf8Bytes(new StreamInventoryStatus("initializing"), ManagementJsonContext.Default.StreamInventoryStatus));
+        }
+
+        if (detail is not { } stream)
+        {
+            return (StatusCodes.Status200OK, JsonSerializer.SerializeToUtf8Bytes(
+                new StreamInventoryReport(snapshot.Version, snapshot.ReconciledAt, snapshot.Streams), ManagementJsonContext.Default.StreamInventoryReport));
+        }
+
+        return snapshot.Find(stream.Application, stream.Stream) is { } entry
+            ? (StatusCodes.Status200OK, JsonSerializer.SerializeToUtf8Bytes(
+                new StreamDetailReport(snapshot.Version, snapshot.ReconciledAt, entry), ManagementJsonContext.Default.StreamDetailReport))
+            : null;
+    }
+
+    /// <summary>Recognizes <see cref="StreamsPath"/> and <c>/health/streams/{application}/{stream}</c>.</summary>
+    /// <param name="path">The request path.</param>
+    /// <param name="detail">The requested stream, or <see langword="null"/> for the inventory.</param>
+    /// <returns><see langword="true"/> if the path is a stream inventory path.</returns>
+    private static bool IsStreamsPath(string? path, out (string Application, string Stream)? detail)
+    {
+        detail = null;
+        if (path == StreamsPath)
+        {
+            return true;
+        }
+
+        if (path is null || !path.StartsWith(StreamsPath + "/", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var segments = path[(StreamsPath.Length + 1)..].Split('/');
+        if (segments is not [{ Length: > 0 } application, { Length: > 0 } stream])
+        {
+            return false;
+        }
+
+        detail = (application, stream);
+        return true;
     }
 
     /// <summary>Logs an unexpected management request failure.</summary>

@@ -18,8 +18,8 @@ public sealed partial class LifetimeOptionsValidator : IValidateOptions<Lifetime
 public sealed partial class FileLoggingOptionsValidator : IValidateOptions<FileLoggingOptions>;
 
 /// <summary>
-/// Validates <see cref="RtmpOptions"/>, including the nested <see cref="RtmpAuthenticationOptions"/> and each
-/// <see cref="RtmpPublisherCredential"/>, against their data annotations and <see cref="System.ComponentModel.DataAnnotations.IValidatableObject"/> rules.
+/// Validates <see cref="RtmpOptions"/>, including the nested <see cref="RtmpAuthenticationOptions"/>, its
+/// <see cref="RtmpAuthenticationRateLimitOptions"/> and each <see cref="RtmpPublisherCredential"/>, against their data annotations and <see cref="System.ComponentModel.DataAnnotations.IValidatableObject"/> rules.
 /// </summary>
 [OptionsValidator]
 public sealed partial class RtmpOptionsValidator : IValidateOptions<RtmpOptions>;
@@ -39,6 +39,17 @@ public sealed partial class HttpOriginOptionsValidator : IValidateOptions<HttpOr
 /// <summary>Validates <see cref="StreamEventOptions"/> against its data annotations.</summary>
 [OptionsValidator]
 public sealed partial class StreamEventOptionsValidator : IValidateOptions<StreamEventOptions>;
+
+/// <summary>Validates <see cref="StreamCatalogOptions"/> against its data annotations.</summary>
+[OptionsValidator]
+public sealed partial class StreamCatalogOptionsValidator : IValidateOptions<StreamCatalogOptions>;
+
+/// <summary>
+/// Validates <see cref="TelemetryOptions"/>, including the nested <see cref="OtlpOptions"/>, against their data
+/// annotations and <see cref="System.ComponentModel.DataAnnotations.IValidatableObject"/> rules.
+/// </summary>
+[OptionsValidator]
+public sealed partial class TelemetryOptionsValidator : IValidateOptions<TelemetryOptions>;
 
 /// <summary>
 /// Validates <see cref="ManagementOptions"/>. Every value of its only setting is valid, so this validator always

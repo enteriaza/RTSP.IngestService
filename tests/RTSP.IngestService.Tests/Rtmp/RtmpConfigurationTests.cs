@@ -1,6 +1,6 @@
-// Tests for RTMP configuration validation (RtmpOptions, RtmpAuthenticationOptions) and for the configured publisher
-// authenticator: ranges, address parsing, the cross-property buffer rule, duplicate publishers without echoing keys,
-// constant-time key matching and redaction of secrets in request text.
+// Tests for RTMP configuration validation (RtmpOptions, RtmpAuthenticationOptions): ranges, address parsing, the
+// cross-property buffer rule, credential names, applications and key hashes, duplicates without echoing hashes, and
+// redaction of secrets in request text. Authentication behaviour is tested in PublisherAuthenticationTests.
 
 using System.Net;
 using Microsoft.Extensions.Options;
@@ -10,7 +10,7 @@ using RTSP.IngestService.Rtmp.Publishing;
 namespace RTSP.IngestService.Tests.Rtmp;
 
 /// <summary>
-/// Tests for <see cref="RtmpOptionsValidator"/> and <see cref="ConfiguredPublisherAuthenticator"/>.
+/// Tests for <see cref="RtmpOptionsValidator"/> and <see cref="PublishAuthenticationRequest"/>.
 /// </summary>
 public sealed class RtmpConfigurationTests
 {
@@ -27,8 +27,8 @@ public sealed class RtmpConfigurationTests
         Assert.Equal(("0.0.0.0", 1935, 100), (options.ListenAddress, options.Port, options.MaxConnections));
         Assert.Equal((TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30)), (options.HandshakeTimeout, options.ConnectionTimeout));
         Assert.Equal((8 * 1024 * 1024, 128, 4096, 16 * 1024 * 1024), (options.MaxMessageSize, options.InboundChunkSize, options.OutboundChunkSize, options.MaxBufferedBytes));
-        Assert.Equal("live", options.Authentication.Application);
         Assert.Empty(options.Authentication.Publishers);
+        Assert.Equal((10, TimeSpan.FromMinutes(1)), (options.Authentication.RateLimit.FailureLimit, options.Authentication.RateLimit.Window));
     }
 
     /// <summary>Verifies that each out-of-range value fails validation naming the property, without clamping it.</summary>
@@ -117,75 +117,79 @@ public sealed class RtmpConfigurationTests
     [InlineData("has space", false)]
     public void Names_AreValidated(string name, bool valid)
     {
-        var application = new RtmpOptions();
-        application.Authentication.Application = name;
-        var publisher = WithPublishers((name, Key));
+        var publisherName = WithPublishers((name, "live", Key));
+        var application = WithPublishers(("cam", name, Key));
 
+        Assert.Equal(valid, Validate(publisherName).Succeeded);
         Assert.Equal(valid, Validate(application).Succeeded);
-        Assert.Equal(valid, Validate(publisher).Succeeded);
     }
 
-    /// <summary>Verifies that stream keys must be 16 to 256 characters.</summary>
-    /// <param name="length">The key length.</param>
-    /// <param name="valid">Whether it is valid.</param>
-    [Theory]
-    [InlineData(0, false)]
-    [InlineData(15, false)]
-    [InlineData(16, true)]
-    [InlineData(256, true)]
-    [InlineData(257, false)]
-    public void StreamKeyLength_IsValidated(int length, bool valid)
-    {
-        Assert.Equal(valid, Validate(WithPublishers(("cam", new string('k', length)))).Succeeded);
-    }
-
-    /// <summary>Verifies that duplicate publisher names and duplicate keys fail validation and the key is never echoed.</summary>
+    /// <summary>Verifies that a credential without an application or key hash fails validation: there is no default application.</summary>
     [Fact]
-    public void DuplicatePublishers_FailValidationWithoutEchoingKeys()
+    public void MissingApplicationOrKeyHash_FailsValidation()
     {
-        var duplicateName = Validate(WithPublishers(("cam", Key), ("cam", Key + "x")));
-        var duplicateKey = Validate(WithPublishers(("cam1", Key), ("cam2", Key)));
+        var noApplication = WithPublishers(("cam", "live", Key));
+        noApplication.Authentication.Publishers[0].Application = string.Empty;
+        var noHash = WithPublishers(("cam", "live", Key));
+        noHash.Authentication.Publishers[0].KeyHash = string.Empty;
+
+        Assert.Contains(nameof(RtmpPublisherCredential.Application), Validate(noApplication).FailureMessage, StringComparison.Ordinal);
+        Assert.Contains(nameof(RtmpPublisherCredential.KeyHash), Validate(noHash).FailureMessage, StringComparison.Ordinal);
+    }
+
+    /// <summary>Verifies that a malformed key hash, including a plaintext key in its place, fails validation without echoing the value.</summary>
+    /// <param name="keyHash">The configured value.</param>
+    [Theory]
+    [InlineData(Key)]
+    [InlineData("hmac-sha256$AAAA$BBBB")]
+    [InlineData("sha256$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
+    [InlineData("hmac-sha256$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA*")]
+    [InlineData("hmac-sha256$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA$extra")]
+    public void MalformedKeyHash_FailsValidationWithoutEchoingIt(string keyHash)
+    {
+        var options = WithPublishers(("cam", "live", Key));
+        options.Authentication.Publishers[0].KeyHash = keyHash;
+
+        var result = Validate(options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(nameof(RtmpPublisherCredential.KeyHash), result.FailureMessage, StringComparison.Ordinal);
+        Assert.DoesNotContain(keyHash, result.FailureMessage, StringComparison.Ordinal);
+    }
+
+    /// <summary>Verifies that duplicate publisher names and duplicate key hashes fail validation and the hash is never echoed.</summary>
+    [Fact]
+    public void DuplicatePublishers_FailValidationWithoutEchoingHashes()
+    {
+        var duplicateName = Validate(WithPublishers(("cam", "live", Key), ("cam", "other", Key + "x")));
+        var duplicateHash = WithPublishers(("cam1", "live", Key), ("cam2", "live", Key + "x"));
+        var hash = duplicateHash.Authentication.Publishers[0].KeyHash;
+        duplicateHash.Authentication.Publishers[1].KeyHash = hash;
+
+        var duplicateHashResult = Validate(duplicateHash);
 
         Assert.True(duplicateName.Failed);
-        Assert.True(duplicateKey.Failed);
-        Assert.DoesNotContain(Key, duplicateName.FailureMessage, StringComparison.Ordinal);
-        Assert.DoesNotContain(Key, duplicateKey.FailureMessage, StringComparison.Ordinal);
+        Assert.True(duplicateHashResult.Failed);
+        Assert.DoesNotContain(hash, duplicateHashResult.FailureMessage, StringComparison.Ordinal);
     }
 
-    /// <summary>Verifies that a configured key for the configured application authorises with the publisher name as identity.</summary>
-    /// <returns>A task that completes when the test is finished.</returns>
+    /// <summary>Verifies the publisher count bound and the rate-limit ranges.</summary>
     [Fact]
-    public async Task Authenticator_KnownKey_AuthorisesWithPublisherName()
+    public void PublisherCountAndRateLimit_AreValidated()
     {
-        var authenticator = new ConfiguredPublisherAuthenticator(Options.Create(WithPublishers(("cam1", Key + "1"), ("cam2", Key + "2"))));
+        var tooMany = new RtmpOptions();
+        var hash = PublisherKeyHash.Create(Key);
+        for (var i = 0; i <= RtmpAuthenticationOptions.MaxPublishers; i++)
+        {
+            tooMany.Authentication.Publishers.Add(new RtmpPublisherCredential { Name = $"cam{i}", Application = "live", KeyHash = hash });
+        }
 
-        var result = await authenticator.AuthenticateAsync(Request("live", Key + "2"), TestContext.Current.CancellationToken);
-
-        Assert.True(result.IsAuthorized);
-        Assert.Equal("cam2", result.StreamIdentity);
-    }
-
-    /// <summary>Verifies rejections: unknown key, key prefix, wrong application, application case, and no publishers configured.</summary>
-    /// <param name="application">The requested application.</param>
-    /// <param name="streamName">The presented stream name.</param>
-    /// <param name="configured">Whether a publisher is configured.</param>
-    /// <returns>A task that completes when the test is finished.</returns>
-    [Theory]
-    [InlineData("live", "wrong-key-000000000", true)]
-    [InlineData("live", "key-0123456789abcde", true)]
-    [InlineData("other", Key, true)]
-    [InlineData("LIVE", Key, true)]
-    [InlineData("live", Key, false)]
-    public async Task Authenticator_InvalidRequest_IsRejectedWithoutSecrets(string application, string streamName, bool configured)
-    {
-        var options = configured ? WithPublishers(("cam", Key)) : new RtmpOptions();
-        var authenticator = new ConfiguredPublisherAuthenticator(Options.Create(options));
-
-        var result = await authenticator.AuthenticateAsync(Request(application, streamName), TestContext.Current.CancellationToken);
-
-        Assert.False(result.IsAuthorized);
-        Assert.False(string.IsNullOrEmpty(result.RejectionReason));
-        Assert.DoesNotContain(streamName, result.RejectionReason!, StringComparison.Ordinal);
+        Assert.Contains($"At most {RtmpAuthenticationOptions.MaxPublishers}", Validate(tooMany).FailureMessage, StringComparison.Ordinal);
+        Assert.True(Validate(new RtmpOptions { Authentication = { RateLimit = { FailureLimit = 0 } } }).Failed);
+        Assert.True(Validate(new RtmpOptions { Authentication = { RateLimit = { FailureLimit = 1001 } } }).Failed);
+        Assert.True(Validate(new RtmpOptions { Authentication = { RateLimit = { Window = TimeSpan.FromMilliseconds(500) } } }).Failed);
+        Assert.True(Validate(new RtmpOptions { Authentication = { RateLimit = { Window = TimeSpan.FromHours(2) } } }).Failed);
+        Assert.True(Validate(new RtmpOptions { Authentication = { RateLimit = { FailureLimit = 1, Window = TimeSpan.FromSeconds(1) } } }).Succeeded);
     }
 
     /// <summary>Verifies that a request's text form omits the stream name, query and tcUrl, which may contain secrets.</summary>
@@ -207,24 +211,17 @@ public sealed class RtmpConfigurationTests
     /// <returns>The result.</returns>
     private static ValidateOptionsResult Validate(RtmpOptions options) => new RtmpOptionsValidator().Validate(null, options);
 
-    /// <summary>Creates default options with the given publishers.</summary>
-    /// <param name="publishers">Name and key pairs.</param>
+    /// <summary>Creates default options with the given publishers, hashing each key.</summary>
+    /// <param name="publishers">Name, application and key triples.</param>
     /// <returns>The options.</returns>
-    private static RtmpOptions WithPublishers(params (string Name, string Key)[] publishers)
+    private static RtmpOptions WithPublishers(params (string Name, string Application, string Key)[] publishers)
     {
         var options = new RtmpOptions();
-        foreach (var (name, key) in publishers)
+        foreach (var (name, application, key) in publishers)
         {
-            options.Authentication.Publishers.Add(new RtmpPublisherCredential { Name = name, StreamKey = key });
+            options.Authentication.Publishers.Add(new RtmpPublisherCredential { Name = name, Application = application, KeyHash = PublisherKeyHash.Create(key) });
         }
 
         return options;
     }
-
-    /// <summary>Creates a publish request.</summary>
-    /// <param name="application">The application.</param>
-    /// <param name="streamName">The stream name.</param>
-    /// <returns>The request.</returns>
-    private static PublishAuthenticationRequest Request(string application, string streamName) =>
-        new(1, null, application, streamName, null, null, "live");
 }

@@ -57,8 +57,9 @@ If you change the timeouts in `appsettings.json`, adjust `TimeoutStartSec` and `
 
 The RTMP listener accepts publishers on TCP 1935 by default (`Rtmp:ListenAddress`, `Rtmp:Port`). The port is above
 1024, so no capability is needed. Open it in the host firewall, ideally only for encoder networks (for example
-`sudo ufw allow from <encoder subnet> to any port 1935 proto tcp`). Configure publisher stream keys in
-`appsettings.Production.json` or with `Rtmp__Authentication__Publishers__0__StreamKey`-style environment variables
+`sudo ufw allow from <encoder subnet> to any port 1935 proto tcp`). Configure publisher credentials (`Name`, `Application` and a `KeyHash` from
+`RTSP.IngestService publisher-key generate`; plaintext keys are not accepted) in
+`appsettings.Production.json`, which is reloaded without a restart, or with `Rtmp__Authentication__Publishers__0__KeyHash`-style environment variables, which are read at startup only,
 (see [RTMP ingest](../architecture.md#rtmp-ingest)). If the port is in use the service fails to start with exit code 1
 and logs event 5001.
 
