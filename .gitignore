@@ -6,7 +6,7 @@ riderModule.iml
 
 # Generated evidence and on-demand release packages
 /.artifacts/
-/release/
+/Releases/
 TestResults/
 
 # Local environment configuration (tracked templates use *.example.json)
