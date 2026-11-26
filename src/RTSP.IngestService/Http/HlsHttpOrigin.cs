@@ -104,6 +104,7 @@ public sealed partial class HlsHttpOrigin : IHostedService, IAsyncDisposable
         var port = bound is null ? options.Port : new Uri(bound).Port;
         LocalEndPoint = new IPEndPoint(address, port);
         LogListening(LocalEndPoint);
+        LogHeaders(_application.Headers.CorsDescription, _application.Headers.ResourcePolicy);
         _listening = true;
     }
 
@@ -133,6 +134,12 @@ public sealed partial class HlsHttpOrigin : IHostedService, IAsyncDisposable
     /// <param name="endPoint">The bound endpoint.</param>
     [LoggerMessage(EventId = 8000, Level = LogLevel.Information, Message = "HTTP HLS origin listening on {EndPoint}")]
     private partial void LogListening(IPEndPoint endPoint);
+
+    /// <summary>Logs the CORS and resource policy of HLS responses.</summary>
+    /// <param name="cors">The CORS policy.</param>
+    /// <param name="resourcePolicy">The Cross-Origin-Resource-Policy value.</param>
+    [LoggerMessage(EventId = 8003, Level = LogLevel.Information, Message = "HTTP HLS origin CORS {Cors}; Cross-Origin-Resource-Policy {ResourcePolicy}")]
+    private partial void LogHeaders(string cors, string resourcePolicy);
 
     /// <summary>Logs that the origin stopped.</summary>
     [LoggerMessage(EventId = 8002, Level = LogLevel.Information, Message = "HTTP HLS origin stopped")]

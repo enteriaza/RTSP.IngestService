@@ -40,7 +40,10 @@ public sealed partial class HlsOptionsValidator : IValidateOptions<HlsOptions>;
 [OptionsValidator]
 public sealed partial class RtpOptionsValidator : IValidateOptions<RtpOptions>;
 
-/// <summary>Validates <see cref="HttpOriginOptions"/> against its data annotations.</summary>
+/// <summary>
+/// Validates <see cref="HttpOriginOptions"/>, including the nested <see cref="HttpCorsOptions"/>, against their data
+/// annotations and <see cref="System.ComponentModel.DataAnnotations.IValidatableObject"/> rules.
+/// </summary>
 [OptionsValidator]
 public sealed partial class HttpOriginOptionsValidator : IValidateOptions<HttpOriginOptions>;
 

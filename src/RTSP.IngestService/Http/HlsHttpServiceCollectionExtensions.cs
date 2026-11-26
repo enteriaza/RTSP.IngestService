@@ -40,7 +40,8 @@ public static class HlsHttpServiceCollectionExtensions
             sp.GetRequiredService<HttpOriginMetrics>(),
             sp.GetRequiredService<TimeProvider>(),
             sp.GetRequiredService<ILogger<HlsHttpApplication>>(),
-            sp.GetRequiredService<IOptions<ManagementOptions>>().Value.Enabled ? sp.GetService<ManagementEndpoints>() : null));
+            sp.GetRequiredService<IOptions<ManagementOptions>>().Value.Enabled ? sp.GetService<ManagementEndpoints>() : null,
+            new HlsHttpHeaders(sp.GetRequiredService<IOptions<HttpOriginOptions>>().Value)));
         services.TryAddSingleton(static sp => new HlsHttpOrigin(
             sp.GetRequiredService<IOptions<HttpOriginOptions>>(),
             sp.GetRequiredService<HlsHttpApplication>(),

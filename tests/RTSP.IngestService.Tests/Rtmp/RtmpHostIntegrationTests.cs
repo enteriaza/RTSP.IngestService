@@ -108,6 +108,10 @@ public sealed class RtmpHostIntegrationTests
     [InlineData("Http:RequestHeadersTimeout", "00:00:00")]
     [InlineData("Http:KeepAliveTimeout", "02:00:00")]
     [InlineData("Http:UnknownSetting", "1")]
+    [InlineData("Http:Cors:Enabled", "true")]
+    [InlineData("Http:Cors:AllowedOrigins:0", "*")]
+    [InlineData("Http:Cors:UnknownSetting", "1")]
+    [InlineData("Http:CrossOriginResourcePolicy", "none")]
     public async Task InvalidConfiguration_FailsWithConfigurationError(string key, string value)
     {
         var exitCode = await RunAsync(new Dictionary<string, string?> { [key] = value });

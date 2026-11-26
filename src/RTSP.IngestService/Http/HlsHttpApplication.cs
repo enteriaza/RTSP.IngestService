@@ -28,7 +28,9 @@ namespace RTSP.IngestService.Http;
 /// even if the current process has a segment of the same name.
 /// </para>
 /// <para>
-/// Only <c>GET</c> and <c>HEAD</c> are allowed (405 otherwise). Missing resources are 404 with
+/// Every HLS response carries the headers of <see cref="HlsHttpHeaders"/>. With CORS enabled, a CORS preflight
+/// (<c>OPTIONS</c> with <c>Origin</c> and <c>Access-Control-Request-Method</c>) is answered 204 before the path is
+/// looked up. Only <c>GET</c> and <c>HEAD</c> are allowed otherwise (405). Missing resources are 404 with
 /// <c>Cache-Control: no-store</c>. Byte ranges are not supported (<c>Accept-Ranges: none</c>; a <c>Range</c> header
 /// is ignored and the full resource returned). <c>If-None-Match</c> is honoured after the availability check, so a
 /// withdrawn or expired resource is never 304.
@@ -86,6 +88,9 @@ internal sealed partial class HlsHttpApplication : IHttpApplication<HttpContext>
     /// <summary>Management routes served on the same listener, or <see langword="null"/> when management is disabled.</summary>
     private readonly ManagementEndpoints? _management;
 
+    /// <summary>Security and CORS headers of HLS responses.</summary>
+    private readonly HlsHttpHeaders _headers;
+
     /// <summary>Initializes a new instance of the <see cref="HlsHttpApplication"/> class.</summary>
     /// <param name="store">The segment store.</param>
     /// <param name="hlsOptions">The HLS options, which bound segment cache lifetimes.</param>
@@ -96,7 +101,8 @@ internal sealed partial class HlsHttpApplication : IHttpApplication<HttpContext>
     /// Management routes to serve for paths under <see cref="ManagementEndpoints.PathPrefix"/>, or
     /// <see langword="null"/> to treat those paths as unknown HLS paths.
     /// </param>
-    public HlsHttpApplication(IHlsSegmentStore store, IOptions<HlsOptions> hlsOptions, HttpOriginMetrics metrics, TimeProvider timeProvider, ILogger<HlsHttpApplication> logger, ManagementEndpoints? management = null)
+    /// <param name="headers">The security and CORS headers of HLS responses; <see cref="HlsHttpHeaders.Default"/> when <see langword="null"/>.</param>
+    public HlsHttpApplication(IHlsSegmentStore store, IOptions<HlsOptions> hlsOptions, HttpOriginMetrics metrics, TimeProvider timeProvider, ILogger<HlsHttpApplication> logger, ManagementEndpoints? management = null, HlsHttpHeaders? headers = null)
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(hlsOptions);
@@ -111,6 +117,7 @@ internal sealed partial class HlsHttpApplication : IHttpApplication<HttpContext>
         _segmentCacheControl = $"public, max-age={(long)SegmentCacheLifetime(hlsOptions.Value).TotalSeconds}";
         _epoch = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(4));
         _management = management;
+        _headers = headers ?? HlsHttpHeaders.Default;
     }
 
     /// <summary>
@@ -127,6 +134,9 @@ internal sealed partial class HlsHttpApplication : IHttpApplication<HttpContext>
     /// </remarks>
     internal static TimeSpan SegmentCacheLifetime(HlsOptions options) =>
         options.EndedStreamRetention + (options.MaxSegmentDuration * ((2 * Math.Max(options.PlaylistWindowSize, 4)) + 1));
+
+    /// <summary>Gets the security and CORS headers of HLS responses.</summary>
+    internal HlsHttpHeaders Headers => _headers;
 
     /// <inheritdoc />
     public HttpContext CreateContext(IFeatureCollection contextFeatures) => new DefaultHttpContext(contextFeatures);
@@ -151,6 +161,12 @@ internal sealed partial class HlsHttpApplication : IHttpApplication<HttpContext>
         var route = Route.Parse(context.Request.Path.Value);
         try
         {
+            if (_headers.IsPreflight(context.Request))
+            {
+                _headers.AnswerPreflight(context);
+                return;
+            }
+
             await ServeAsync(context, route).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is OperationCanceledException or IOException)
@@ -169,6 +185,7 @@ internal sealed partial class HlsHttpApplication : IHttpApplication<HttpContext>
             else
             {
                 context.Response.Clear();
+                _headers.Apply(context);
                 context.Response.StatusCode = StatusCodes.Status500InternalServerError;
                 context.Response.Headers.CacheControl = ErrorCacheControl;
             }
@@ -186,7 +203,7 @@ internal sealed partial class HlsHttpApplication : IHttpApplication<HttpContext>
     private async Task ServeAsync(HttpContext context, Route route)
     {
         var response = context.Response;
-        response.Headers.XContentTypeOptions = "nosniff";
+        _headers.Apply(context);
         if (route.Resource == HttpOriginResource.Other)
         {
             NotFound(response, route.Resource, HttpOriginMissReason.InvalidPath);

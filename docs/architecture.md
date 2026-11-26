@@ -109,6 +109,8 @@ RTMP settings are listed under [RTMP ingest](#configuration-1).
 | `Telemetry:Otlp` | `ExportInterval` | `00:00:15` | 1 s – 5 min |
 | `Rtp` | `Outputs` | Empty (RTP output off) | At most 64; per-output settings in [rtp-output.md](rtp-output.md#configuration) |
 | `Rtp:Transport:Qos` | `Enabled`, `Dscp`, `Ecn` | Off; DSCP 0; ECN 0 | DSCP 0–63, ECN 0–3; overridable per output in `Rtp:Outputs:N:Qos`; see [rtp-output.md](rtp-output.md#qos-marking-dscp-and-ecn) |
+| `Http:Cors` | `Enabled`, `AllowedOrigins`, `AllowAnyOrigin`, `AllowCredentials`, `MaxAgeSeconds` | Off; no origins; `false`; `false`; 600 | Up to 100 serialised origins; see [hls-output.md](hls-output.md#configuration) |
+| `Http` | `CrossOriginResourcePolicy` | `cross-origin` | `cross-origin`, `same-site` or `same-origin` |
 
 Sources, in increasing precedence: `appsettings.json`, `appsettings.{Environment}.json`, environment variables,
 command-line arguments. Binding is strict: unknown keys and unconvertible values are configuration errors. Validators are
@@ -136,7 +138,7 @@ hosting environment are logged at startup.
 | 5200–5212 | RTMP session and publishing |
 | 6000–6010 | Media processing |
 | 7000–7013 | HLS packaging |
-| 8000–8002 | HTTP HLS origin |
+| 8000–8003 | HTTP HLS origin |
 | 9000 | Management endpoints |
 | 9100–9102 | Stream event dispatcher |
 | 9200–9202 | Stream catalog |
@@ -781,7 +783,18 @@ unqualified segment path is 404 `invalid_path`. Nothing is persisted.
 - Ranges are not supported: `Accept-Ranges: none`, and `Range` is ignored (full 200). HLS segments are fetched whole
   and are bounded by `MaxSegmentSize`; byte-range playlists are not produced.
 - `GET` and `HEAD` only (HEAD sends the headers and `Content-Length`); other methods on a valid URL are 405 with
-  `Allow: GET, HEAD`. `X-Content-Type-Options: nosniff`; no `Server` header; request bodies are refused.
+  `Allow: GET, HEAD`. No `Server` header; request bodies are refused.
+- Security headers and CORS (`HlsHttpHeaders`, built once from the options): every HLS response, including 304,
+  errors and preflights, carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+  `X-Frame-Options: DENY` and the configured `Cross-Origin-Resource-Policy` (`cross-origin`). With `Http:Cors` enabled:
+  - Listed origins get `Access-Control-Allow-Origin` and `Access-Control-Expose-Headers`, and allowlist responses carry
+    `Vary: Origin`.
+  - Preflights (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) are answered with 204 before path
+    handling, never reaching the store. They are granted only for `GET`/`HEAD` and the `Range` header.
+  - With CORS disabled, `OPTIONS` stays 405.
+
+  There is no CSP, HSTS or cookie, and management routes are unaffected. Details, configuration and a cross-origin
+  hls.js example are in [hls-output.md](hls-output.md).
 - Missing resources are 404: invalid path, unknown stream, withdrawn playlist, or a segment that is not (or no longer)
   stored. Unexpected failures are 500 if the response has not started, otherwise the connection is aborted.
 
@@ -812,6 +825,8 @@ Kestrel's minimum response data rate (240 B/s after a 5 s grace) disconnects vie
 | `MaxConnections` | 1000 | 1–100000 |
 | `RequestHeadersTimeout` | 30 s | 1 s–5 min |
 | `KeepAliveTimeout` | 2 min | 1 s–1 h |
+| `CrossOriginResourcePolicy` | `cross-origin` | `cross-origin`, `same-site`, `same-origin` |
+| `Cors` | Disabled | See [hls-output.md](hls-output.md#configuration); origins are validated at start, `*` and wildcards are rejected, and `AllowAnyOrigin` cannot be combined with credentials |
 
 ### Metrics
 
@@ -819,7 +834,8 @@ Meter `RTSP.IngestService.Http`: `http.origin.requests` (`resource`, `status_cla
 `http.origin.request.duration` (`resource`), `http.origin.response_bytes` (`resource`), `http.origin.cancellations`
 (`resource`), `http.origin.missing` (`resource`, `reason`: `invalid_path`, `unknown_stream`, `playlist_withdrawn`,
 `segment_unavailable`), `http.origin.failures` (`resource`). `resource` is `playlist`, `initialization`, `segment` or
-`other`. No application, stream, segment name or client address is ever a tag.
+`other`. No application, stream, segment name, client address or request origin is ever a tag; preflights are counted
+like other requests (`resource` from the path, `status_class` `2xx`).
 
 ### Events
 
@@ -828,6 +844,7 @@ Meter `RTSP.IngestService.Http`: `http.origin.requests` (`resource`, `status_cla
 | 8000 | Information | HTTP origin listening (bound endpoint) |
 | 8001 | Error | Unexpected request failure (resource kind only) |
 | 8002 | Information | HTTP origin stopped |
+| 8003 | Information | CORS policy and `Cross-Origin-Resource-Policy` at start (configured origins are not secret) |
 
 ### Tests
 
@@ -840,11 +857,15 @@ expiry during a 24 MiB response, disconnected and stalled viewers (raw sockets w
 responses stay in progress), low-cardinality tags, bind failure and graceful drain on stop. `HlsHttpPlaybackTests` run the real service host: binding before readiness, HTTP port conflict
 (exit 1), and real-time FFmpeg publishes over RTMP played over HTTP with ffprobe and `ffmpeg -xerror` (live playlist
 refresh while publishing, ENDLIST, streams, frame counts, duration equal to the `#EXTINF` total), with A/V and
-audio only.
+audio only. `HlsHttpSecurityTests` cover CORS and security-header configuration validation, headers on every response
+kind, allowlist, any-origin and credential grants, preflights (granted, denied, not touching the store), `Range`, 304,
+unchanged content types and caching, zero per-request allocation of the header code, and the real host (HLS only,
+management unchanged, event 8003).
 
 ### Limitations
 
-- No HTTPS, authentication or CORS headers; expose it through a reverse proxy for TLS or cross-origin browser players.
+- **HLS is currently served over HTTP. CORS and security headers do not encrypt media traffic. Anyone able to observe the network path may be able to inspect the stream. HTTPS/TLS remains a planned security enhancement.**
+- No authentication; CORS only governs which browser pages may read responses and is not access control.
 - After a restart, pre-restart segment URLs are 404 (their media is gone); players must reload the playlist, which
   then lists the new generation. Cached pre-restart segments are only ever served for their own URLs.
 - No byte ranges, no master playlist, HTTP/1.1 only.
