@@ -1,6 +1,8 @@
 // Tests for publisher authentication rate limiting and provisioning: the token bucket limits failures per address,
 // refunds successes, refills over the window, is bounded and reclaims idle entries, is race-free, is keyed by the TCP
-// peer only, and is applied by the authenticator before verification. Also tests the publisher-key command.
+// peer only, and is applied by the authenticator before verification; attempts contending with in-flight ones wait
+// (bounded in number and time, cancellable) instead of being rejected, without exceeding the allowance. Also tests the
+// publisher-key command.
 
 using System.Net;
 using Microsoft.Extensions.Time.Testing;
@@ -137,6 +139,147 @@ public sealed class PublisherRateLimitTests
     }
 
     /// <summary>
+    /// Verifies an attempt that finds every token reserved by in-flight attempts waits for them: a released token
+    /// passes to it, and once the in-flight attempts have all failed it is rejected, so failures never exceed the
+    /// allowance.
+    /// </summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task ContendedAttempt_WaitsForInFlightAttempts()
+    {
+        var limiter = new PublisherAuthenticationRateLimiter(2, TimeSpan.FromHours(1), new FakeTimeProvider());
+        var peer = Peer("192.0.2.1");
+        var token = TestContext.Current.CancellationToken;
+        var first = await limiter.AcquireAsync(peer, token);
+        var second = await limiter.AcquireAsync(peer, token);
+        Assert.NotNull(first);
+        Assert.NotNull(second);
+
+        var third = limiter.AcquireAsync(peer, token).AsTask();
+        Assert.False(third.IsCompleted);
+        limiter.Release(first);
+        Assert.NotNull(await third.WithinSafetyTimeout());
+
+        var fourth = limiter.AcquireAsync(peer, token).AsTask();
+        limiter.RecordFailure(second);
+        Assert.False(fourth.IsCompleted);
+        limiter.RecordFailure((await third)!);
+        Assert.Null(await fourth.WithinSafetyTimeout());
+        Assert.False(limiter.TryAcquire(peer, out _));
+    }
+
+    /// <summary>Verifies the wait is bounded by <see cref="PublisherAuthenticationRateLimiter.MaxContendedWait"/>.</summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task ContendedAttempt_IsRejectedAfterTheMaximumWait()
+    {
+        var time = new FakeTimeProvider();
+        var limiter = new PublisherAuthenticationRateLimiter(1, TimeSpan.FromHours(1), time);
+        var peer = Peer("192.0.2.1");
+        var token = TestContext.Current.CancellationToken;
+        var held = await limiter.AcquireAsync(peer, token);
+
+        var waiting = limiter.AcquireAsync(peer, token).AsTask();
+        time.Advance(PublisherAuthenticationRateLimiter.MaxContendedWait - TimeSpan.FromMilliseconds(1));
+        Assert.False(waiting.IsCompleted);
+        time.Advance(TimeSpan.FromMilliseconds(1));
+        Assert.Null(await waiting.WithinSafetyTimeout());
+
+        limiter.Release(held!);
+        Assert.True(limiter.TryAcquire(peer, out _));
+    }
+
+    /// <summary>Verifies a cancelled wait throws and holds no token: the token released afterwards stays free.</summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task ContendedAttempt_CancellationReleasesNothing()
+    {
+        var limiter = new PublisherAuthenticationRateLimiter(1, TimeSpan.FromHours(1), new FakeTimeProvider());
+        var peer = Peer("192.0.2.1");
+        var held = await limiter.AcquireAsync(peer, TestContext.Current.CancellationToken);
+        using var cancel = new CancellationTokenSource();
+
+        var waiting = limiter.AcquireAsync(peer, cancel.Token).AsTask();
+        await cancel.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waiting).WithinSafetyTimeout();
+
+        limiter.Release(held!);
+        Assert.Equal(0, limiter.TrackedAddressCount);
+        Assert.True(limiter.TryAcquire(peer, out _));
+    }
+
+    /// <summary>Verifies at most <see cref="PublisherAuthenticationRateLimiter.MaxWaitersPerAddress"/> attempts wait per address; the next is rejected at once.</summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task Waiters_AreBoundedPerAddress()
+    {
+        var limiter = new PublisherAuthenticationRateLimiter(1, TimeSpan.FromHours(1), new FakeTimeProvider());
+        var peer = Peer("192.0.2.1");
+        var token = TestContext.Current.CancellationToken;
+        var held = await limiter.AcquireAsync(peer, token);
+        var waiting = Enumerable.Range(0, PublisherAuthenticationRateLimiter.MaxWaitersPerAddress).Select(_ => limiter.AcquireAsync(peer, token).AsTask()).ToList();
+
+        var excess = limiter.AcquireAsync(peer, token).AsTask();
+        Assert.True(excess.IsCompleted);
+        Assert.Null(await excess);
+        Assert.True(limiter.AcquireAsync(Peer("192.0.2.2"), token).AsTask().IsCompletedSuccessfully);
+
+        limiter.RecordFailure(held!);
+        Assert.All(await Task.WhenAll(waiting).WithinSafetyTimeout(), Assert.Null);
+    }
+
+    /// <summary>
+    /// Verifies concurrent attempts that wait still cannot exceed the allowance: of 200 failing attempts from one
+    /// address exactly the allowance is verified, while 200 concurrent succeeding attempts are all admitted.
+    /// </summary>
+    /// <param name="succeed">Whether each admitted attempt succeeds.</param>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ConcurrentWaitingAttempts_KeepTheAllowance(bool succeed)
+    {
+        var limiter = new PublisherAuthenticationRateLimiter(10, TimeSpan.FromHours(1), new FakeTimeProvider());
+        var peer = Peer("192.0.2.1");
+        var token = TestContext.Current.CancellationToken;
+        using var start = new ManualResetEventSlim();
+        var verifying = 0;
+        var maxVerifying = 0;
+
+        var attempts = Enumerable.Range(0, 200).Select(_ => Task.Run(
+            async () =>
+            {
+                start.Wait(token);
+                if (await limiter.AcquireAsync(peer, token) is not { } address)
+                {
+                    return false;
+                }
+
+                var now = Interlocked.Increment(ref verifying);
+                InterlockedMax(ref maxVerifying, now);
+                await Task.Yield();
+                Interlocked.Decrement(ref verifying);
+                if (succeed)
+                {
+                    limiter.Release(address);
+                }
+                else
+                {
+                    limiter.RecordFailure(address);
+                }
+
+                return true;
+            },
+            token)).ToList();
+        start.Set();
+        var admitted = (await Task.WhenAll(attempts).WithinSafetyTimeout()).Count(static r => r);
+
+        Assert.Equal(succeed ? 200 : 10, admitted);
+        Assert.InRange(maxVerifying, 1, 10);
+        Assert.Equal(succeed ? 0 : 1, limiter.TrackedAddressCount);
+    }
+
+    /// <summary>
     /// Verifies the authenticator applies the limit before verification: once an address is limited even the correct
     /// key is rejected as rate limited, other addresses are unaffected, and the limit lifts after the window.
     /// </summary>
@@ -247,6 +390,18 @@ public sealed class PublisherRateLimitTests
         Assert.Equal(ExitCodes.UsageError, shortKey);
         Assert.Empty(output.ToString());
         Assert.DoesNotContain("short", error.ToString(), StringComparison.Ordinal);
+    }
+
+    /// <summary>Raises <paramref name="target"/> to <paramref name="value"/> if it is larger.</summary>
+    /// <param name="target">The maximum.</param>
+    /// <param name="value">The candidate.</param>
+    private static void InterlockedMax(ref int target, int value)
+    {
+        var current = Volatile.Read(ref target);
+        while (value > current && Interlocked.CompareExchange(ref target, value, current) is var seen && seen != current)
+        {
+            current = seen;
+        }
     }
 
     /// <summary>Creates a TCP peer endpoint.</summary>

@@ -18,6 +18,40 @@ using RTSP.IngestService.Tests.Media;
 
 namespace RTSP.IngestService.Tests.Hls;
 
+/// <summary>Reads segment bytes through a lease, as the HTTP origin does.</summary>
+internal static class HlsSegmentStoreTestExtensions
+{
+    /// <summary>Copies a stored segment's bytes.</summary>
+    /// <param name="store">The store.</param>
+    /// <param name="application">The application.</param>
+    /// <param name="identity">The stream identity.</param>
+    /// <param name="name">The segment name.</param>
+    /// <returns>A copy of the bytes, or <see langword="null"/> if the segment is not stored.</returns>
+    public static byte[]? ReadSegment(this IHlsSegmentStore store, string application, string identity, string name)
+    {
+        using var lease = store.AcquireSegment(application, identity, name);
+        return lease?.ToArray();
+    }
+
+    /// <summary>Creates a segment holding <paramref name="content"/> in chunks rented from <paramref name="pool"/>.</summary>
+    /// <param name="pool">The pool.</param>
+    /// <param name="kind">The kind.</param>
+    /// <param name="name">The name.</param>
+    /// <param name="content">The bytes.</param>
+    /// <returns>The segment, holding its creator's reference.</returns>
+    public static HlsSegment Pooled(HlsSegmentBufferPool pool, HlsSegmentKind kind, string name, ReadOnlySpan<byte> content)
+    {
+        var chunks = pool.Rent(content.Length);
+        for (var i = 0; i < chunks.Length; i++)
+        {
+            var part = content[(i * HlsSegmentBufferPool.ChunkSize)..];
+            part[..Math.Min(part.Length, HlsSegmentBufferPool.ChunkSize)].CopyTo(chunks[i]);
+        }
+
+        return new HlsSegment(kind, name, chunks, content.Length, pool);
+    }
+}
+
 /// <summary>A parsed ISO BMFF box.</summary>
 /// <param name="Type">The four-character type.</param>
 /// <param name="Offset">Offset of the box within the parsed buffer.</param>
@@ -305,7 +339,8 @@ internal sealed class HlsHarness : IDisposable
 
     /// <summary>Initializes a new instance of the <see cref="HlsHarness"/> class.</summary>
     /// <param name="options">HLS options; defaults with a 1 s target and 2 s maximum when <see langword="null"/>.</param>
-    public HlsHarness(HlsOptions? options = null)
+    /// <param name="decorate">Wraps the store the packager writes to, for fault injection; <see langword="null"/> for none.</param>
+    public HlsHarness(HlsOptions? options = null, Func<IHlsSegmentStore, IHlsSegmentStore>? decorate = null)
     {
         Options = options ?? new HlsOptions { TargetSegmentDuration = TimeSpan.FromSeconds(1), MaxSegmentDuration = TimeSpan.FromSeconds(2) };
         _services = new ServiceCollection().AddMetrics().BuildServiceProvider();
@@ -313,7 +348,7 @@ internal sealed class HlsHarness : IDisposable
         _loggerFactory = new LoggerFactory([new FakeLoggerProvider(Logs)]);
         var metrics = new HlsMetrics(MeterFactory);
         Store = new InMemoryHlsSegmentStore(Microsoft.Extensions.Options.Options.Create(Options), Time, metrics, StreamEvents);
-        Packaging = new HlsPackagingHandler(Microsoft.Extensions.Options.Options.Create(Options), Store, metrics, _loggerFactory.CreateLogger<HlsPackagingHandler>());
+        Packaging = new HlsPackagingHandler(Microsoft.Extensions.Options.Options.Create(Options), decorate?.Invoke(Store) ?? Store, metrics, _loggerFactory.CreateLogger<HlsPackagingHandler>(), SegmentPool);
         Processor = new MediaPublishSessionHandler(
             Microsoft.Extensions.Options.Options.Create(new MediaOptions()),
             Packaging,
@@ -349,6 +384,9 @@ internal sealed class HlsHarness : IDisposable
 
     /// <summary>Gets the payload pool.</summary>
     public CountingArrayPool Pool { get; } = new();
+
+    /// <summary>Gets the media segment chunk pool.</summary>
+    public HlsSegmentBufferPool SegmentPool { get; } = new(64);
 
     /// <summary>Starts a session for <c>live/camera1</c>.</summary>
     /// <param name="identity">The stream identity.</param>
@@ -445,12 +483,17 @@ internal sealed class HlsHarness : IDisposable
     /// <param name="identity">The stream identity.</param>
     /// <returns>The bytes.</returns>
     public byte[] Segment(string name, string identity = "camera1") =>
-        (Store.GetSegment("live", identity, name) ?? throw new InvalidOperationException($"{name} is not stored.")).Data.ToArray();
+        Store.ReadSegment("live", identity, name) ?? throw new InvalidOperationException($"{name} is not stored.");
 
-    /// <summary>Disposes the factories.</summary>
+    /// <summary>Releases the store and disposes the factories; throws if a segment chunk was never returned.</summary>
     public void Dispose()
     {
+        Store.Dispose();
         _loggerFactory.Dispose();
         _services.Dispose();
+        if (SegmentPool.OutstandingChunks != 0)
+        {
+            throw new InvalidOperationException($"{SegmentPool.OutstandingChunks} segment chunks were not returned.");
+        }
     }
 }

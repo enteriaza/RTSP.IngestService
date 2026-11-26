@@ -12,3 +12,5 @@ TestResults/
 # Local environment configuration (tracked templates use *.example.json)
 appsettings.Development.json
 appsettings.Production.json
+
+.vs/

@@ -19,6 +19,9 @@ public sealed class StreamCatalogTests : IDisposable
     /// <summary>An incarnation whose identifier sorts first but whose generation is newer.</summary>
     private const string New = "00000000000000000000000000000000";
 
+    /// <summary>A third incarnation, of another stream.</summary>
+    private const string Third = "11111111111111111111111111111111";
+
     /// <summary>The fixture.</summary>
     private readonly CatalogFixture _f = new();
 
@@ -257,6 +260,35 @@ public sealed class StreamCatalogTests : IDisposable
         _f.Source.Fail = false;
         Assert.True(Catalog.Reconcile());
         Assert.Empty(Catalog.Current.Streams);
+    }
+
+    /// <summary>
+    /// Verifies a reconciliation keeps the entries its snapshot did not change, replaces the changed one, removes the
+    /// vanished one, and still publishes a new reconciled state.
+    /// </summary>
+    [Fact]
+    public void Reconcile_ReplacesOnlyChangedEntries()
+    {
+        _f.Source.Publish(Old, 1, "a").Store(Old, 1, HlsStreamState.Live, "a")
+            .Publish(New, 2, "b").Store(New, 2, HlsStreamState.Live, "b")
+            .Publish(Third, 3, "c");
+        Catalog.Reconcile();
+        var before = Catalog.Current;
+
+        _f.Source.Hls.RemoveAll(static h => h.IncarnationId == New);
+        _f.Source.Store(New, 2, HlsStreamState.Ended, "b");
+        _f.Source.Forget(Third);
+        _f.Time.Advance(TimeSpan.FromSeconds(1));
+        Catalog.Reconcile();
+        var after = Catalog.Current;
+
+        Assert.Same(before.FindIncarnation(Old), after.FindIncarnation(Old));
+        Assert.Equal(StreamHlsState.Ended, after.FindIncarnation(New)!.Hls.State);
+        Assert.Equal(StreamHlsState.Live, before.FindIncarnation(New)!.Hls.State);
+        Assert.Null(after.FindIncarnation(Third));
+        Assert.Equal([Old, New], after.Streams.Select(static s => s.IncarnationId));
+        Assert.True(after.Version > before.Version);
+        Assert.Equal(_f.Time.GetUtcNow(), after.ReconciledAt);
     }
 
     /// <summary>Verifies a failed first reconciliation leaves the catalog uninitialized.</summary>

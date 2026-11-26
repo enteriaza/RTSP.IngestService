@@ -2,6 +2,8 @@
 // mp4a/esds sample entries and mvex/trex) and media fragments (moof with one traf per track, then one mdat). Codec
 // configuration records and sample bytes are copied verbatim; nothing is converted or re-encoded.
 
+using System.Buffers;
+
 namespace RTSP.IngestService.Hls;
 
 /// <summary>Writes fragmented MP4 initialization segments and media fragments.</summary>
@@ -32,7 +34,24 @@ internal static class Mp4Segments
             throw new ArgumentException("At least one track is required.", nameof(video));
         }
 
-        var buffer = new byte[maxSize];
+        var buffer = ArrayPool<byte>.Shared.Rent(maxSize);
+        try
+        {
+            return WriteInitialization(buffer.AsSpan(0, maxSize), video, audio);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    /// <summary>Writes an initialization segment into a scratch buffer and copies it out.</summary>
+    /// <param name="buffer">The scratch buffer, as large as the largest permitted output.</param>
+    /// <param name="video">The video track, if any.</param>
+    /// <param name="audio">The audio track, if any.</param>
+    /// <returns>The segment bytes.</returns>
+    private static byte[] WriteInitialization(Span<byte> buffer, Mp4VideoTrack? video, Mp4AudioTrack? audio)
+    {
         var writer = new Mp4Writer(buffer);
 
         var ftyp = writer.Begin("ftyp");
@@ -80,7 +99,7 @@ internal static class Mp4Segments
 
         writer.End(mvex);
         writer.End(moov);
-        return buffer.AsSpan(0, writer.Position).ToArray();
+        return buffer[..writer.Position].ToArray();
     }
 
     /// <summary>Computes the exact size of a media fragment.</summary>
@@ -118,25 +137,130 @@ internal static class Mp4Segments
     /// <exception cref="Mp4SizeException">The output would exceed <paramref name="maxSize"/>.</exception>
     public static byte[] WriteFragment(uint sequenceNumber, IReadOnlyList<Mp4TrackFragment> tracks, int maxSize)
     {
+        var total = CheckFragment(tracks, maxSize, out var moofSize);
+        var buffer = new byte[total];
+        WriteFragment(sequenceNumber, tracks, moofSize, total, [buffer], total);
+        return buffer;
+    }
+
+    /// <summary>Writes a media fragment into chunks rented from <paramref name="pool"/>.</summary>
+    /// <param name="sequenceNumber">The <c>mfhd</c> sequence number; at least 1 and increasing.</param>
+    /// <param name="tracks">The track fragments, each with at least one sample.</param>
+    /// <param name="maxSize">The largest permitted output.</param>
+    /// <param name="pool">The chunk pool.</param>
+    /// <param name="name">The segment URI.</param>
+    /// <returns>The segment, holding its creator's reference; nothing is rented if writing fails.</returns>
+    /// <exception cref="Mp4SizeException">The output would exceed <paramref name="maxSize"/>.</exception>
+    public static HlsSegment WriteFragment(uint sequenceNumber, IReadOnlyList<Mp4TrackFragment> tracks, int maxSize, HlsSegmentBufferPool pool, string name)
+    {
+        var total = CheckFragment(tracks, maxSize, out var moofSize);
+        var chunks = pool.Rent(total);
+        try
+        {
+            WriteFragment(sequenceNumber, tracks, moofSize, total, chunks, HlsSegmentBufferPool.ChunkSize);
+            return new HlsSegment(HlsSegmentKind.Media, name, chunks, total, pool);
+        }
+        catch
+        {
+            pool.Return(chunks);
+            throw;
+        }
+    }
+
+    /// <summary>Validates the tracks and computes the fragment size.</summary>
+    /// <param name="tracks">The track fragments.</param>
+    /// <param name="maxSize">The largest permitted output.</param>
+    /// <param name="moofSize">The size of the <c>moof</c> box.</param>
+    /// <returns>The total size.</returns>
+    /// <exception cref="Mp4SizeException">The output would exceed <paramref name="maxSize"/>.</exception>
+    private static int CheckFragment(IReadOnlyList<Mp4TrackFragment> tracks, int maxSize, out int moofSize)
+    {
         if (tracks.Count == 0 || tracks.Any(static t => t.Samples.Count == 0))
         {
             throw new ArgumentException("Every track fragment needs at least one sample.", nameof(tracks));
         }
 
-        var total = MeasureFragment(tracks, out var moofSize);
+        var total = MeasureFragment(tracks, out var moof);
         if (total > maxSize)
         {
             throw new Mp4SizeException($"The media fragment would be {total} bytes; the limit is {maxSize}.");
         }
 
-        var buffer = new byte[total];
-        var writer = new Mp4Writer(buffer);
+        moofSize = (int)moof;
+        return (int)total;
+    }
+
+    /// <summary>
+    /// Writes a fragment of a measured size into <paramref name="chunks"/>: the <c>moof</c> and <c>mdat</c> header are
+    /// built in a pooled scratch buffer, then they and the sample bytes are copied once into the output.
+    /// </summary>
+    /// <param name="sequenceNumber">The <c>mfhd</c> sequence number.</param>
+    /// <param name="tracks">The validated track fragments.</param>
+    /// <param name="moofSize">The measured <c>moof</c> size.</param>
+    /// <param name="total">The measured total size.</param>
+    /// <param name="chunks">The output: consecutive chunks of <paramref name="chunkSize"/> bytes holding at least <paramref name="total"/>.</param>
+    /// <param name="chunkSize">The size of every chunk but the last.</param>
+    private static void WriteFragment(uint sequenceNumber, IReadOnlyList<Mp4TrackFragment> tracks, int moofSize, int total, byte[][] chunks, int chunkSize)
+    {
+        var headerSize = moofSize + 8;
+        var scratch = ArrayPool<byte>.Shared.Rent(headerSize);
+        try
+        {
+            var writer = new Mp4Writer(scratch.AsSpan(0, headerSize));
+            WriteMoof(ref writer, sequenceNumber, tracks, moofSize);
+            writer.UInt32(checked((uint)(total - moofSize)));
+            writer.FourCC("mdat");
+            long position = 0;
+            Copy(scratch.AsSpan(0, writer.Position), chunks, chunkSize, ref position);
+            foreach (var track in tracks)
+            {
+                foreach (var sample in track.Samples)
+                {
+                    Copy(sample.Data.Span, chunks, chunkSize, ref position);
+                }
+            }
+
+            if (writer.Position != headerSize || position != total)
+            {
+                throw new InvalidOperationException($"The fragment is {position} bytes; {total} were computed.");
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(scratch);
+        }
+    }
+
+    /// <summary>Copies bytes to the output chunks.</summary>
+    /// <param name="source">The bytes.</param>
+    /// <param name="chunks">The output chunks.</param>
+    /// <param name="chunkSize">The size of every chunk but the last.</param>
+    /// <param name="position">The output position, advanced.</param>
+    private static void Copy(ReadOnlySpan<byte> source, byte[][] chunks, int chunkSize, ref long position)
+    {
+        while (!source.IsEmpty)
+        {
+            var offset = (int)(position % chunkSize);
+            var destination = chunks[(int)(position / chunkSize)].AsSpan(offset, Math.Min(chunkSize - offset, source.Length));
+            source[..destination.Length].CopyTo(destination);
+            source = source[destination.Length..];
+            position += destination.Length;
+        }
+    }
+
+    /// <summary>Writes the <c>moof</c> box.</summary>
+    /// <param name="writer">The writer.</param>
+    /// <param name="sequenceNumber">The <c>mfhd</c> sequence number.</param>
+    /// <param name="tracks">The track fragments.</param>
+    /// <param name="moofSize">The measured <c>moof</c> size.</param>
+    private static void WriteMoof(ref Mp4Writer writer, uint sequenceNumber, IReadOnlyList<Mp4TrackFragment> tracks, int moofSize)
+    {
         var moof = writer.Begin("moof");
         var mfhd = writer.BeginFull("mfhd", 0, 0);
         writer.UInt32(sequenceNumber);
         writer.End(mfhd);
 
-        var dataOffset = moofSize + 8;
+        long dataOffset = moofSize + 8;
         foreach (var track in tracks)
         {
             var traf = writer.Begin("traf");
@@ -167,22 +291,10 @@ internal static class Mp4Segments
         }
 
         writer.End(moof);
-        var mdat = writer.Begin("mdat");
-        foreach (var track in tracks)
+        if (writer.Position != moofSize)
         {
-            foreach (var sample in track.Samples)
-            {
-                writer.Bytes(sample.Data.Span);
-            }
+            throw new InvalidOperationException($"The moof box is {writer.Position} bytes; {moofSize} were computed.");
         }
-
-        writer.End(mdat);
-        if (writer.Position != total)
-        {
-            throw new InvalidOperationException($"The fragment is {writer.Position} bytes; {total} were computed.");
-        }
-
-        return buffer;
     }
 
     /// <summary>Writes the video <c>trak</c>.</summary>

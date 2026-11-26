@@ -216,6 +216,62 @@ public sealed class PublisherAuthenticationTests
     }
 
     /// <summary>
+    /// Verifies the verified-key memo never changes an outcome: a key that has succeeded (and is memoized) is still
+    /// rejected for another application, and after a reload that disables, rotates or reassigns its credential, whose
+    /// new snapshot starts with an empty memo; only successes are memoized, at most one per credential.
+    /// </summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task MemoizedKeys_NeverChangeOutcomesAndFollowReloads()
+    {
+        using var fixture = new AuthenticationFixture(TestCredential.Settings(new TestCredential("cam-a", "live", KeyA), new TestCredential("cam-b", "live", KeyB)), Unlimited);
+        for (var i = 0; i < 3; i++)
+        {
+            Assert.True((await fixture.AuthenticateAsync(AuthenticationFixture.Request(KeyA))).IsAuthorized);
+        }
+
+        var first = fixture.Store.Current;
+        Assert.True(first.TryGetVerified(first.Tag(Encoding.ASCII.GetBytes(KeyA)), out var index));
+        Assert.Equal("cam-a", first.Credentials[index].Name);
+        Assert.False((await fixture.AuthenticateAsync(AuthenticationFixture.Request(KeyA, "studio"))).IsAuthorized);
+        Assert.False((await fixture.AuthenticateAsync(AuthenticationFixture.Request(KeyC))).IsAuthorized);
+        Assert.False(first.TryGetVerified(first.Tag(Encoding.ASCII.GetBytes(KeyC)), out _));
+        Assert.False(first.TryGetVerified(first.Tag(Encoding.ASCII.GetBytes(KeyB)), out _));
+
+        fixture.Reload(TestCredential.Settings(new TestCredential("cam-a", "live", KeyA, Enabled: false), new TestCredential("cam-b", "live", KeyB)));
+        Assert.False(fixture.Store.Current.TryGetVerified(fixture.Store.Current.Tag(Encoding.ASCII.GetBytes(KeyA)), out _));
+        Assert.False((await fixture.AuthenticateAsync(AuthenticationFixture.Request(KeyA))).IsAuthorized);
+
+        fixture.Reload(TestCredential.Settings(new TestCredential("cam-a", "live", KeyC), new TestCredential("cam-b", "live", KeyB)));
+        Assert.True((await fixture.AuthenticateAsync(AuthenticationFixture.Request(KeyC))).IsAuthorized);
+        Assert.False((await fixture.AuthenticateAsync(AuthenticationFixture.Request(KeyA))).IsAuthorized);
+
+        fixture.Reload(TestCredential.Settings(new TestCredential("cam-a", "studio", KeyC), new TestCredential("cam-b", "live", KeyB)));
+        Assert.False((await fixture.AuthenticateAsync(AuthenticationFixture.Request(KeyC))).IsAuthorized);
+        var reassigned = await fixture.AuthenticateAsync(AuthenticationFixture.Request(KeyC, "studio"));
+        Assert.Equal(("cam-a", "studio"), (reassigned.StreamIdentity, reassigned.Application));
+
+        Assert.Equal(
+            ["success", "success", "success", "application_mismatch", "invalid_credential", "disabled", "success", "invalid_credential", "application_mismatch", "success"],
+            fixture.AttemptResults());
+    }
+
+    /// <summary>Verifies a key matching two credentials stays ambiguous however often it is presented, and is never memoized.</summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task AmbiguousKey_IsNeverMemoized()
+    {
+        using var fixture = new AuthenticationFixture(TestCredential.Settings(new TestCredential("cam-a", "live", KeyA), new TestCredential("cam-b", "live", KeyA)), Unlimited);
+        for (var i = 0; i < 3; i++)
+        {
+            Assert.False((await fixture.AuthenticateAsync(AuthenticationFixture.Request(KeyA))).IsAuthorized);
+        }
+
+        Assert.False(fixture.Store.Current.TryGetVerified(fixture.Store.Current.Tag(Encoding.ASCII.GetBytes(KeyA)), out _));
+        Assert.Equal(["ambiguous", "ambiguous", "ambiguous"], fixture.AttemptResults());
+    }
+
+    /// <summary>
     /// Verifies that invalid reloads (malformed hash, plaintext key, duplicate name, missing application, unknown key)
     /// keep the last known-good credentials, are logged and counted without secrets, and that a later valid reload applies.
     /// </summary>

@@ -37,8 +37,8 @@ public sealed class RtmpOptions : IValidatableObject
 
     /// <summary>
     /// Gets or sets the maximum number of concurrent TCP connections, including connections still handshaking.
-    /// Connections beyond the limit are closed immediately after they are accepted. Defaults to 100; valid range is
-    /// 1 to 10000.
+    /// Connections beyond the limit are closed immediately after they are accepted. The listen backlog is sized from
+    /// it (see <see cref="Rtmp.RtmpListener.GetListenBacklog"/>). Defaults to 100; valid range is 1 to 10000.
     /// </summary>
     [Range(1, 10000)]
     public int MaxConnections { get; set; } = 100;

@@ -2,6 +2,7 @@
 // resources, and the snapshot that groups them. A snapshot is built completely before it is published and never
 // changes afterwards, so readers can enumerate and serialize it without locks.
 
+using System.Collections.Immutable;
 using System.Text.Json.Serialization;
 
 namespace RTSP.IngestService.Streams;
@@ -104,13 +105,43 @@ public sealed record StreamCatalogEntry
 }
 
 /// <summary>An immutable, complete catalog state.</summary>
+/// <remarks>
+/// Persistent: <see cref="With"/> derives a new snapshot that shares every unchanged entry and tree node with this
+/// one, in O(changes × log n), so neither readers of this snapshot nor its contents are affected.
+/// </remarks>
 public sealed class StreamCatalogSnapshot
 {
+    /// <summary>Orders entries by application, stream, newest generation first, then incarnation identifier.</summary>
+    private static readonly IComparer<StreamCatalogEntry> Order = Comparer<StreamCatalogEntry>.Create(static (x, y) =>
+    {
+        var order = string.CompareOrdinal(x.Application, y.Application);
+        if (order == 0)
+        {
+            order = string.CompareOrdinal(x.Stream, y.Stream);
+        }
+
+        if (order == 0)
+        {
+            order = y.Generation.CompareTo(x.Generation);
+        }
+
+        return order != 0 ? order : string.CompareOrdinal(x.IncarnationId, y.IncarnationId);
+    });
+
+    /// <summary>Placeholder publishing information of search probes.</summary>
+    private static readonly StreamPublishingInfo ProbePublishing = new() { State = StreamPublishingState.Publishing };
+
+    /// <summary>Placeholder HLS information of search probes.</summary>
+    private static readonly StreamHlsInfo ProbeHls = new() { State = StreamHlsState.Pending };
+
     /// <summary>Entries by incarnation identifier.</summary>
-    private readonly Dictionary<string, StreamCatalogEntry> _byIncarnation;
+    private readonly ImmutableDictionary<string, StreamCatalogEntry> _byIncarnation;
 
     /// <summary>The current (newest) entry of each application and stream.</summary>
-    private readonly Dictionary<(string Application, string Stream), StreamCatalogEntry> _current;
+    private readonly ImmutableDictionary<(string Application, string Stream), StreamCatalogEntry> _current;
+
+    /// <summary>The entries in <see cref="Order"/>.</summary>
+    private readonly ImmutableSortedSet<StreamCatalogEntry> _streams;
 
     /// <summary>Initializes a new instance of the <see cref="StreamCatalogSnapshot"/> class, deriving <see cref="StreamCatalogEntry.Current"/>.</summary>
     /// <param name="version">The publication version.</param>
@@ -118,29 +149,100 @@ public sealed class StreamCatalogSnapshot
     /// <param name="reconciledAt">When the last successful reconciliation completed.</param>
     /// <param name="entries">The entries; each incarnation at most once.</param>
     internal StreamCatalogSnapshot(long version, bool initialized, DateTimeOffset? reconciledAt, IEnumerable<StreamCatalogEntry> entries)
+        : this(
+            version,
+            initialized,
+            reconciledAt,
+            ImmutableDictionary.Create<string, StreamCatalogEntry>(StringComparer.Ordinal),
+            ImmutableDictionary<(string, string), StreamCatalogEntry>.Empty,
+            ImmutableSortedSet.Create(Order),
+            entries,
+            [])
+    {
+    }
+
+    /// <summary>Initializes a new instance of the <see cref="StreamCatalogSnapshot"/> class from a base state and changes to it.</summary>
+    /// <param name="version">The publication version.</param>
+    /// <param name="initialized">Whether a reconciliation has completed.</param>
+    /// <param name="reconciledAt">When the last successful reconciliation completed.</param>
+    /// <param name="byIncarnation">The base entries by incarnation.</param>
+    /// <param name="current">The base current entries.</param>
+    /// <param name="streams">The base ordered entries.</param>
+    /// <param name="upserts">Entries added or replacing the base entry of their incarnation; each incarnation at most once.</param>
+    /// <param name="removals">Incarnations whose base entries are removed.</param>
+    private StreamCatalogSnapshot(
+        long version,
+        bool initialized,
+        DateTimeOffset? reconciledAt,
+        ImmutableDictionary<string, StreamCatalogEntry> byIncarnation,
+        ImmutableDictionary<(string, string), StreamCatalogEntry> current,
+        ImmutableSortedSet<StreamCatalogEntry> streams,
+        IEnumerable<StreamCatalogEntry> upserts,
+        IEnumerable<string> removals)
     {
         Version = version;
         IsInitialized = initialized;
         ReconciledAt = reconciledAt;
-        var newest = new Dictionary<(string, string), StreamCatalogEntry>();
-        foreach (var entry in entries)
+        var entries = byIncarnation.ToBuilder();
+        var newest = current.ToBuilder();
+        var ordered = streams.ToBuilder();
+        var changed = new HashSet<(string, string)>();
+        foreach (var incarnation in removals)
         {
-            var key = (entry.Application, entry.Stream);
-            if (!newest.TryGetValue(key, out var other) || entry.Generation > other.Generation)
+            if (entries.TryGetValue(incarnation, out var old))
             {
-                newest[key] = entry;
+                entries.Remove(incarnation);
+                ordered.Remove(old);
+                changed.Add((old.Application, old.Stream));
             }
         }
 
-        var streams = entries
-            .Select(e => e with { Current = ReferenceEquals(newest[(e.Application, e.Stream)], e) })
-            .OrderBy(static e => e.Application, StringComparer.Ordinal)
-            .ThenBy(static e => e.Stream, StringComparer.Ordinal)
-            .ThenByDescending(static e => e.Generation)
-            .ToArray();
-        Streams = streams.AsReadOnly();
-        _byIncarnation = streams.ToDictionary(static e => e.IncarnationId, StringComparer.Ordinal);
-        _current = streams.Where(static e => e.Current).ToDictionary(static e => (e.Application, e.Stream));
+        foreach (var entry in upserts)
+        {
+            if (entries.TryGetValue(entry.IncarnationId, out var old))
+            {
+                ordered.Remove(old);
+                changed.Add((old.Application, old.Stream));
+            }
+
+            entries[entry.IncarnationId] = entry;
+            ordered.Add(entry);
+            changed.Add((entry.Application, entry.Stream));
+        }
+
+        // Only the changed streams' Current flags can change: the first entry of each in order is its newest.
+        foreach (var (application, stream) in changed)
+        {
+            var probe = new StreamCatalogEntry { Application = application, Stream = stream, IncarnationId = string.Empty, Generation = long.MaxValue, Publishing = ProbePublishing, Hls = ProbeHls };
+            var index = ordered.IndexOf(probe);
+            var first = index < 0 ? ~index : index;
+            newest.Remove((application, stream));
+            for (var i = first; i < ordered.Count; i++)
+            {
+                var entry = ordered[i];
+                if (!string.Equals(entry.Application, application, StringComparison.Ordinal) || !string.Equals(entry.Stream, stream, StringComparison.Ordinal))
+                {
+                    break;
+                }
+
+                if (entry.Current != (i == first))
+                {
+                    ordered.Remove(entry);
+                    entry = entry with { Current = i == first };
+                    ordered.Add(entry);
+                    entries[entry.IncarnationId] = entry;
+                }
+
+                if (i == first)
+                {
+                    newest[(application, stream)] = entry;
+                }
+            }
+        }
+
+        _byIncarnation = entries.ToImmutable();
+        _current = newest.ToImmutable();
+        _streams = ordered.ToImmutable();
     }
 
     /// <summary>Gets the empty, uninitialized catalog.</summary>
@@ -156,7 +258,7 @@ public sealed class StreamCatalogSnapshot
     public DateTimeOffset? ReconciledAt { get; }
 
     /// <summary>Gets the entries, ordered by application, stream and newest incarnation first.</summary>
-    public IReadOnlyList<StreamCatalogEntry> Streams { get; }
+    public IReadOnlyList<StreamCatalogEntry> Streams => _streams;
 
     /// <summary>Returns the current (newest) entry of a stream.</summary>
     /// <param name="application">The application.</param>
@@ -168,4 +270,14 @@ public sealed class StreamCatalogSnapshot
     /// <param name="incarnationId">The incarnation identifier.</param>
     /// <returns>The entry, or <see langword="null"/>.</returns>
     internal StreamCatalogEntry? FindIncarnation(string incarnationId) => _byIncarnation.GetValueOrDefault(incarnationId);
+
+    /// <summary>Returns a new snapshot with entries added, replaced and removed; this snapshot is unchanged.</summary>
+    /// <param name="version">The publication version.</param>
+    /// <param name="initialized">Whether a reconciliation has completed.</param>
+    /// <param name="reconciledAt">When the last successful reconciliation completed.</param>
+    /// <param name="upserts">Entries added or replacing the entry of their incarnation; each incarnation at most once.</param>
+    /// <param name="removals">Incarnations whose entries are removed.</param>
+    /// <returns>The new snapshot, deriving <see cref="StreamCatalogEntry.Current"/>.</returns>
+    internal StreamCatalogSnapshot With(long version, bool initialized, DateTimeOffset? reconciledAt, IEnumerable<StreamCatalogEntry> upserts, IEnumerable<string> removals) =>
+        new(version, initialized, reconciledAt, _byIncarnation, _current, _streams, upserts, removals);
 }

@@ -16,7 +16,7 @@ logging), the RTMP ingest server, media processing, HLS packaging, the HTTP HLS 
 | systemd | `Hosting/SystemdWatchdogService`, `SystemdWatchdogSettings` | Send `WATCHDOG=1` at half of `WATCHDOG_USEC`. |
 | Lifecycle | `Lifecycle/ApplicationLifecycle`, `ApplicationLifecycleCoordinator` | Application state machine and readiness, driven by host events. |
 | Configuration | `Configuration/*Options`, `IngestServiceOptionsExtensions` | Strict binding, source-generated validation, fail fast at startup. |
-| Logging | `Logging/SerilogPipeline`, `SystemdConsoleFormatter` | Serilog sinks per hosting mode; bootstrap logger for pre-host failures. |
+| Logging | `Logging/SerilogPipeline`, `SystemdConsoleFormatter`, `BoundedAsyncSink`, `BufferedConsoleSink` | Serilog sinks per hosting mode, written asynchronously through a bounded queue; bootstrap logger for pre-host failures. |
 | RTMP ingest | `Rtmp/*` | RTMP publishing server: listener, connections, chunk protocol, AMF0, sessions (see [RTMP ingest](#rtmp-ingest)). |
 | Media processing | `Media/*` | H.264/AAC parsing into typed samples and stream descriptions (see [Media processing](#media-processing)). |
 | HLS packaging | `Hls/*` | fMP4 segments and live playlists in a bounded in-memory store (see [HLS packaging](#hls-packaging)). |
@@ -128,6 +128,16 @@ All events carry `Application`, `Environment`, `HostingMode`, `MachineName` and 
 `Logging:LogLevel` configuration section. Configuration values are never logged wholesale; only timeouts and the
 hosting environment are logged at startup.
 
+Log calls do not write to the sinks themselves. `BoundedAsyncSink` queues each enriched event (at most 10,000) and
+one dedicated thread, `Log writer`, writes them to the sinks in order, in batches of at most 1,000. When the queue
+is full, the log call waits for space: no event is ever dropped, and a sustained excess slows the callers to the
+sinks' rate, as synchronous logging would. Redirected console output (always under systemd) is formatted into a buffer
+and written once per batch by `BufferedConsoleSink`, with the same output template or formatter; an interactive
+console keeps the themed console sink, and the file sink is unchanged. On shutdown the logger is disposed after the
+host: it stops accepting events, writes the queued ones (waiting at most 10 s, for example if standard output is
+blocked), then flushes the sinks. Events still queued when the process terminates abnormally are lost. The bootstrap
+logger writes synchronously.
+
 | Event IDs | Source |
 |-----------|--------|
 | 1000–1002, 1100 | Application lifecycle |
@@ -236,16 +246,28 @@ keys are 43 characters. Exit code 64 reports a usage error. Example configuratio
 **Verification.** Steps for one `publish` command:
 
 1. The rate limiter reserves a failure token for the TCP peer address. If none is left, the attempt is rejected
-   before any hashing (`rate_limited`).
+   before any hashing (`rate_limited`). The credential snapshot is read after the reservation.
 2. A key that is not 16 to 256 printable ASCII characters is rejected without hashing (`malformed_key`).
-3. The key is checked against every credential in one immutable snapshot, enabled or not, with
+3. If the snapshot's verified-key memo records that this key already authenticated, in this snapshot, as an enabled
+   credential of the requested application, the key is checked against that credential's hash alone and succeeds on
+   a `FixedTimeEquals` match.
+4. Otherwise the key is checked against every credential in the snapshot, enabled or not, with
    `CryptographicOperations.FixedTimeEquals`, so timing does not reveal which credential matched. The attempt is
    rejected if it matches no credential (`invalid_credential`), more than one (`ambiguous`), a disabled one
    (`disabled`), or one whose `Application` differs from the application the publisher connected to
-   (`application_mismatch`).
-4. On success the token is returned. The session is created with the credential's `Name` and `Application`, so the
+   (`application_mismatch`). A success is memoized.
+5. On success the token is returned. The session is created with the credential's `Name` and `Application`, so the
    registry, HLS store, events and catalog use the authenticated application. A publisher cannot choose a different
    one.
+
+**Verified-key memo.** Each credential snapshot keeps an in-memory map from a tag of a presented key to the
+credential it authenticated as. The tag is the HMAC-SHA256 of the key under a random 32-byte pepper that is created
+with the snapshot and exists only in memory. The memo stores no key and no configured hash, is never persisted or
+logged, and holds at most one entry per credential, because only unambiguous successes are recorded. A reload creates
+a new snapshot with an empty memo, so a revoked, disabled, rotated or reassigned credential is never served from it.
+A repeated publish with a known key costs two HMACs instead of one per configured credential. Every rejection still
+performs the full check, so only an attempt that succeeds, which the publisher learns anyway, can be faster. The
+first attempt with each key after startup or a reload costs the full check.
 
 Every rejection keeps the existing behaviour:
 - `NetStream.Publish.Unauthorized`, then the connection closes;
@@ -287,6 +309,12 @@ publisher-supplied fields such as `tcUrl`, the application or the query. The lim
 - The allowance refills evenly over `RateLimit:Window` (default 1 minute, range 1 s – 1 h).
 - A token is reserved before verification and returned on success, so concurrent attempts cannot exceed the
   allowance and successful publishers are never charged.
+- An attempt that finds every remaining token reserved by attempts still in flight from the same address waits for
+  them instead of being rejected. It waits in a FIFO queue of at most 1,024 attempts per address, for at most 2 s,
+  and can be cancelled when the connection closes. A token returned by a success passes directly to the first waiter.
+  Once no attempt is in flight and no token is left, the waiters are rejected (`rate_limited`). The number of
+  attempts verifying at once per address therefore never exceeds the free tokens, and a burst of valid publishers
+  behind one address (for example a NAT or a restarting encoder farm) is not rejected merely for being concurrent.
 - Once an address is limited, even a correct key from it is rejected until tokens refill. This prevents guessing
   through the limit.
 
@@ -327,12 +355,19 @@ and `PublisherKeyHash.ToString` never formats a salt or digest.
   disposes it.
 - Worst-case memory is roughly `MaxConnections × (MaxBufferedBytes + MaxMessageSize + 128 KiB of pipe buffers)`; size
   the limits for the host.
+- The listen backlog (connections the operating system has completed but the accept loop has not yet taken) is
+  `max(128, MaxConnections)`, so a reconnect burst of up to `MaxConnections` encoders queues instead of being refused.
+  On Windows it is requested with `SOMAXCONN_HINT`, because a plain backlog is capped at 200. The operating system
+  may cap it lower; on Linux the cap is `net.core.somaxconn` (4096 by default since kernel 5.4).
 
 ### Timeouts
 
 `HandshakeTimeout` bounds the whole handshake. `ConnectionTimeout` is an inactivity timeout armed only while the
 connection waits for data or for its own output to flush; time spent in the handler does not count. Both run on
-`TimeProvider`.
+`TimeProvider` through one `ConnectionDeadline` per connection: arming and disarming record a timestamp, and a single
+timer, rescheduled only when it fires or when an earlier deadline is armed (about once per timeout period rather than
+four times per read), cancels the connection when an armed deadline passes. Server shutdown takes precedence over a
+timeout that expires at the same time.
 
 ### Configuration
 
@@ -561,7 +596,9 @@ bytes are copied verbatim into `mdat`. The store is served by the [HTTP HLS orig
 | `IHlsSegmentStore`, `InMemoryHlsSegmentStore` | Storage boundary and its bounded in-memory implementation; owns each stream's playlist |
 
 Calls are sequential and awaited per session (no queues or workers); sessions share only the store, which is guarded
-by one lock with short, bounded operations.
+by one lock with short, bounded operations. Writes touch only their own stream plus the streams with a due deadline
+(an expiry index); viewer reads use immutable per-stream views republished under the lock and take the lock only when
+a deadline is due.
 
 ### MP4 structure
 
@@ -642,8 +679,25 @@ generation per store instance, so URIs from different processes never collide (s
 
 ### Storage
 
-Segments are immutable `byte[]` owned by `HlsSegment`, safe for any number of concurrent readers. Appending a segment
-and publishing the playlist that lists it is atomic; a rejected publication changes nothing.
+Segments are immutable and owned by `HlsSegment`. Media segments are written into 64 KiB chunks from a bounded
+process-wide pool (`HlsSegmentBufferPool`, keeping at most one eighth of `MaxTotalStorageMegabytes` as free chunks);
+initialization segments are small exact arrays. A segment is reference-counted: the store holds one reference while it
+is stored and every reader holds one through an `HlsSegmentLease` (`AcquireSegment`), so the chunks return to the pool
+exactly once, after the store has released the segment and the last response using it has completed, failed or been
+cancelled. Any number of readers may use a segment concurrently, before or after it is evicted. A segment the store
+does not publish (rejected or failed) stays with the packager, which releases it. Appending a segment and publishing
+the playlist that lists it is atomic; a rejected publication changes nothing. The storage limits and
+`hls.storage.bytes` count each stored segment's footprint (whole chunks for a media segment, at most 64 KiB more than
+its length), so they bound the memory stored segments hold however small the segments are.
+
+Reader memory: the HTTP origin leases segments through `TryAcquireSegment`, against a reader budget equal to
+`MaxTotalStorageMegabytes`. A segment's footprint is reserved by its first lease and returned by its last, so viewers
+sharing a segment cost it once and a segment already being sent is always served. A segment that no response is
+sending and whose footprint does not fit is refused (HTTP 503 with `Retry-After: 1`, counted by
+`hls.readers.refused`) until responses end. Segment memory is therefore bounded by twice `MaxTotalStorageMegabytes`
+(stored segments plus evicted ones still being sent), plus the pool's free chunks (one eighth) and the samples held
+for segments being built (at most `MaxSegmentSize` per session, `hls.pending.bytes`). Ingest is never refused
+because of readers.
 
 Availability (RFC 8216, 6.2.2): a listed segment is never released. A segment removed from the playlist, by
 rollover or by withdrawal of the whole playlist, stays readable until
@@ -688,8 +742,9 @@ is rejected.
 
 Meter `RTSP.IngestService.Hls`: `hls.sessions.active`, `hls.initialization_segments`, `hls.segments` (`boundary`),
 `hls.segment_bytes`, `hls.segment.duration`, `hls.keyframe_wait`, `hls.storage.bytes`, `hls.storage.evictions`
-(`reason`), `hls.errors` (`kind`), `hls.discontinuities` (`reason`), `hls.samples.dropped` (`track`, `reason`). Tags
-are fixed enumerations; no stream or session identifiers.
+(`reason`), `hls.errors` (`kind`), `hls.discontinuities` (`reason`), `hls.samples.dropped` (`track`, `reason`),
+`hls.pending.bytes`, `hls.readers.bytes`, `hls.readers.refused`, `hls.segment_pool.bytes` (`state`: `in_use`,
+`free`). Tags are fixed enumerations; no stream or session identifiers.
 
 ### Events
 
@@ -733,7 +788,9 @@ drift, a video stall under continuous audio, and the entry cap through the packa
 - `StorageFull` drops media (a discontinuity); a session limit too small for the window, or a live playlist at the
   1000-entry cap that cannot shrink, ends the publish.
 - SPS VUI (sample aspect ratio, colour) is not parsed; no `pasp`/`colr` boxes are written.
-- Segments are single contiguous arrays, so large segments are large-object-heap allocations.
+- Evicted segments still being sent to slow viewers stay allocated until those responses end; they count against the
+  reader budget, so very slow viewers can make other viewers' requests for new segments 503 until they finish or
+  Kestrel's minimum response data rate disconnects them.
 - A track that appears later, and audio before the first video IDR, cause a new period or are dropped.
 
 ## HTTP HLS origin
@@ -771,7 +828,7 @@ unqualified segment path is 404 `invalid_path`. Nothing is persisted.
 | Playlist | `application/vnd.apple.mpegurl` | `no-cache` | process epoch + snapshot `Version` |
 | Initialization | `video/mp4` | `public, max-age=L` | process epoch + name |
 | Segment | `video/iso.segment` | `public, max-age=L` | process epoch + name |
-| 404 / 405 / 500 | none | `no-store` | none |
+| 404 / 405 / 500 / 503 | none | `no-store` | none |
 
 - Playlist text is served byte-for-byte as published. `no-cache` lets caches store it but forces revalidation, so a
   refresh is never stale; an unchanged playlist costs a 304.
@@ -797,6 +854,8 @@ unqualified segment path is 404 `invalid_path`. Nothing is persisted.
   hls.js example are in [hls-output.md](hls-output.md).
 - Missing resources are 404: invalid path, unknown stream, withdrawn playlist, or a segment that is not (or no longer)
   stored. Unexpected failures are 500 if the response has not started, otherwise the connection is aborted.
+- A stored initialization or media segment is 503 with `Retry-After: 1` while the reader memory budget is exhausted
+  and no other response is sending it (see [Storage](#storage)).
 
 Lifecycle as seen over HTTP: an active stream serves a live playlist; an ended stream serves the `#EXT-X-ENDLIST`
 playlist for `EndedStreamRetention`; an aborted or withdrawn stream's playlist is 404 at once while its segments are
@@ -1192,13 +1251,21 @@ stream closes without an event of its own), by an increase in the event channel'
 settle timer armed after any reconciliation that left an incarnation unsettled (at most one request per second, only
 while that lasts). Requests set a single pending flag and release a one-slot semaphore: at most one request is
 pending and one reconciliation runs at a time. A request made while a reconciliation runs makes another pending, so
-it is never lost; extra requests are counted as coalesced. Stopping cancels the loop, waits for it (it only waits
-for a request or finishes an in-memory reconciliation) and disposes the timers.
+it is never lost; extra requests are counted as coalesced. The loop also starts reconciliations at least
+`StreamCatalogService.CoalescingWindow` (100 ms) apart: a request arriving sooner after the previous start waits for
+the rest of the window and is served, together with every request made meanwhile, by one reconciliation, whose
+snapshot is acquired after all of them. An isolated request is served at once. Under lifecycle churn this bounds the
+full-snapshot work to at most ten reconciliations per second, instead of one per event, and delays a new publication's
+first catalog entry by at most the window. Stopping cancels the loop, waits for it (it only waits for a request or the
+window, or finishes an in-memory reconciliation) and disposes the timers.
 
 ### Atomic publication
 
-Every change builds a complete new immutable `StreamCatalogSnapshot` (entries, lookups, version, reconciliation time)
-and publishes it with one volatile reference write. Readers (`StreamCatalog.Current`, the HTTP routes) never lock or
+Every change derives a new immutable `StreamCatalogSnapshot` (entries, lookups, version, reconciliation time) from the
+published one and publishes it with one volatile reference write. Snapshots are persistent (immutable sorted set and
+dictionaries): an applied event replaces or removes one entry in O(log n), and a reconciliation, which still merges
+every incarnation of its source snapshot, replaces only the entries whose merged state differs and shares the rest;
+only the changed streams' `current` flags are recomputed. Readers (`StreamCatalog.Current`, the HTTP routes) never lock or
 wait; each response is serialized from the one snapshot it read. A short writer lock serializes publication between
 the event consumer and reconciliation; it is never held while acquiring a snapshot or serializing. A failed
 reconciliation (logged as event 9200, counted) keeps the previous snapshot.

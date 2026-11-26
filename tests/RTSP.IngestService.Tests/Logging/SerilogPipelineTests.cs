@@ -1,5 +1,6 @@
 // Tests for the Serilog pipeline: file-sink activation per hosting mode, log path resolution, structured JSON file
-// output with the identity properties, and the journald-oriented systemd console formatter.
+// output with the identity properties, context properties across the asynchronous writer, and the journald-oriented
+// systemd console formatter.
 
 using System.Text.Json;
 using Microsoft.Extensions.Hosting;
@@ -69,6 +70,67 @@ public sealed class SerilogPipelineTests : IDisposable
         Assert.Equal("PipelineTest", properties.GetProperty("Application").GetString());
         Assert.Equal("Staging", properties.GetProperty("Environment").GetString());
         Assert.Equal("WindowsService", properties.GetProperty("HostingMode").GetString());
+    }
+
+    /// <summary>
+    /// Verifies that properties pushed on the logging thread's context reach the file although the sinks are written
+    /// on the background writer, and that disposal writes every event.
+    /// </summary>
+    [Fact]
+    public void CreateLogger_KeepsContextPropertiesAndWritesEveryEvent()
+    {
+        var environment = new TestEnvironment { ContentRootPath = _directory };
+        var fileOptions = new FileLoggingOptions { Mode = FileLoggingMode.Enabled, Path = "logs/test-.log" };
+
+        using (var logger = SerilogPipeline.CreateLogger(new ApplicationOptions { Name = "PipelineTest" }, fileOptions, environment, HostingMode.WindowsService))
+        {
+            for (var i = 0; i < 500; i++)
+            {
+                using (Serilog.Context.LogContext.PushProperty("Scope", i))
+                {
+                    logger.Information("Event {Number}", i);
+                }
+            }
+        }
+
+        var lines = File.ReadAllLines(Assert.Single(Directory.GetFiles(Path.Combine(_directory, "logs"))));
+        Assert.Equal(500, lines.Length);
+        Assert.All(lines.Select(static (line, i) => (line, i)), static entry =>
+        {
+            using var json = JsonDocument.Parse(entry.line);
+            var properties = json.RootElement.GetProperty("Properties");
+            Assert.Equal(entry.i, properties.GetProperty("Number").GetInt32());
+            Assert.Equal(entry.i, properties.GetProperty("Scope").GetInt32());
+        });
+    }
+
+    /// <summary>
+    /// Verifies that the buffered console template renders a line as the console sink does: strings, identifiers,
+    /// enums, Booleans and time spans unquoted.
+    /// </summary>
+    [Fact]
+    public void BufferedConsoleTemplate_RendersScalarsAsTheConsoleSinkDoes()
+    {
+        var logEvent = new LogEvent(
+            new DateTimeOffset(2026, 1, 2, 3, 4, 5, 678, TimeSpan.FromHours(2)),
+            LogEventLevel.Information,
+            exception: null,
+            new MessageTemplateParser().Parse("Session {SessionId} on {Application} ended ({Completed}): {Reason} after {Duration}"),
+            [
+                new LogEventProperty("SessionId", new ScalarValue(Guid.Parse("01a214a9-d3ad-7c7c-b808-311b8e0eee4e"))),
+                new LogEventProperty("Application", new ScalarValue("live")),
+                new LogEventProperty("Completed", new ScalarValue(true)),
+                new LogEventProperty("Reason", new ScalarValue(HostingMode.Console)),
+                new LogEventProperty("Duration", new ScalarValue(TimeSpan.FromSeconds(30))),
+                new LogEventProperty("SourceContext", new ScalarValue("RTSP.IngestService.Test")),
+            ]);
+        using var output = new StringWriter();
+
+        new Serilog.Formatting.Display.MessageTemplateTextFormatter(SerilogPipeline.BufferedConsoleOutputTemplate, System.Globalization.CultureInfo.InvariantCulture).Format(logEvent, output);
+
+        Assert.Equal(
+            "[2026-01-02 03:04:05.678 +02:00 INF] RTSP.IngestService.Test: Session 01a214a9-d3ad-7c7c-b808-311b8e0eee4e on live ended (True): Console after 00:00:30" + Environment.NewLine,
+            output.ToString());
     }
 
     /// <summary>Verifies that no file is written when file logging is disabled.</summary>

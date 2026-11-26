@@ -33,7 +33,8 @@ namespace RTSP.IngestService.Http;
 /// looked up. Only <c>GET</c> and <c>HEAD</c> are allowed otherwise (405). Missing resources are 404 with
 /// <c>Cache-Control: no-store</c>. Byte ranges are not supported (<c>Accept-Ranges: none</c>; a <c>Range</c> header
 /// is ignored and the full resource returned). <c>If-None-Match</c> is honoured after the availability check, so a
-/// withdrawn or expired resource is never 304.
+/// withdrawn or expired resource is never 304. A stored segment no other response is sending is 503 with
+/// <c>Retry-After</c> while the store's reader memory budget is exhausted by responses still in progress.
 /// </para>
 /// <para>
 /// Bodies are written in chunks of <see cref="ChunkSize"/>, each awaited, so a slow viewer only holds back its own
@@ -66,6 +67,9 @@ internal sealed partial class HlsHttpApplication : IHttpApplication<HttpContext>
 
     /// <summary>The <c>Allow</c> value of 405 responses.</summary>
     public const string AllowedMethods = "GET, HEAD";
+
+    /// <summary>The <c>Retry-After</c> seconds of 503 responses refused by the reader memory budget.</summary>
+    public const string ReaderMemoryRetryAfter = "1";
 
     /// <summary>The segment store.</summary>
     private readonly IHlsSegmentStore _store;
@@ -239,9 +243,19 @@ internal sealed partial class HlsHttpApplication : IHttpApplication<HttpContext>
             return;
         }
 
-        var segment = string.Equals(route.Generation, _store.Generation, StringComparison.Ordinal)
-            ? _store.GetSegment(route.Application, route.Stream, route.File)
-            : null;
+        HlsSegmentLease? segment = null;
+        var access = string.Equals(route.Generation, _store.Generation, StringComparison.Ordinal)
+            ? _store.TryAcquireSegment(route.Application, route.Stream, route.File, out segment)
+            : HlsSegmentAccess.NotStored;
+        using var lease = segment;
+        if (access == HlsSegmentAccess.ReaderMemoryExhausted)
+        {
+            response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            response.Headers.RetryAfter = ReaderMemoryRetryAfter;
+            response.Headers.CacheControl = ErrorCacheControl;
+            return;
+        }
+
         if (segment is null)
         {
             NotFound(response, route.Resource, _store.ContainsStream(route.Application, route.Stream) ? HttpOriginMissReason.SegmentUnavailable : HttpOriginMissReason.UnknownStream);
@@ -252,7 +266,11 @@ internal sealed partial class HlsHttpApplication : IHttpApplication<HttpContext>
         response.Headers.CacheControl = _segmentCacheControl;
         if (!NotModified(context, $"\"{_epoch}-{segment.Name}\""))
         {
-            await WriteBodyAsync(context, route.Resource, segment.Data, head).ConfigureAwait(false);
+            StartBody(response, segment.Length);
+            for (var i = 0; !head && i < segment.PartCount; i++)
+            {
+                await WriteChunksAsync(context, route.Resource, segment.GetPart(i)).ConfigureAwait(false);
+            }
         }
     }
 
@@ -301,15 +319,34 @@ internal sealed partial class HlsHttpApplication : IHttpApplication<HttpContext>
     /// <returns>A task that completes when the body is written.</returns>
     private async Task WriteBodyAsync(HttpContext context, HttpOriginResource resource, ReadOnlyMemory<byte> data, bool head)
     {
-        var response = context.Response;
-        response.StatusCode = StatusCodes.Status200OK;
-        response.ContentLength = data.Length;
-        response.Headers.AcceptRanges = "none";
-        if (head)
+        StartBody(context.Response, data.Length);
+        if (!head)
         {
-            return;
+            await WriteChunksAsync(context, resource, data).ConfigureAwait(false);
         }
+    }
 
+    /// <summary>Sets the status and headers of a 200 response.</summary>
+    /// <param name="response">The response.</param>
+    /// <param name="length">The body length.</param>
+    private static void StartBody(HttpResponse response, int length)
+    {
+        response.StatusCode = StatusCodes.Status200OK;
+        response.ContentLength = length;
+        response.Headers.AcceptRanges = "none";
+    }
+
+    /// <summary>
+    /// Writes body bytes in awaited chunks, honouring response backpressure and cancellation. Each write copies the
+    /// chunk into the response pipe before it completes, so <paramref name="data"/> is not used after this returns.
+    /// </summary>
+    /// <param name="context">The request.</param>
+    /// <param name="resource">The resource kind.</param>
+    /// <param name="data">The bytes; must stay valid and unchanged until this completes.</param>
+    /// <returns>A task that completes when the bytes are written.</returns>
+    private async Task WriteChunksAsync(HttpContext context, HttpOriginResource resource, ReadOnlyMemory<byte> data)
+    {
+        var response = context.Response;
         var cancellationToken = context.RequestAborted;
         for (var offset = 0; offset < data.Length; offset += ChunkSize)
         {

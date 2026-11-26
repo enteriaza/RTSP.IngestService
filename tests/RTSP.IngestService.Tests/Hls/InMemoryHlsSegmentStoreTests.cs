@@ -380,7 +380,7 @@ public sealed class InMemoryHlsSegmentStoreTests : IDisposable
         Assert.Equal(3, store.GetPlaylist("live", "cam")!.Segments.Count);
     }
 
-    /// <summary>Verifies a segment obtained before it expires stays intact afterwards: expiry never mutates buffers.</summary>
+    /// <summary>Verifies a segment leased before it expires stays intact afterwards: expiry never mutates buffers.</summary>
     [Fact]
     public void Expiry_DoesNotInvalidateAnActiveRead()
     {
@@ -388,15 +388,16 @@ public sealed class InMemoryHlsSegmentStoreTests : IDisposable
         var session = Open(store, targetDuration: 1);
         store.AddInitialization(session, Init(0));
         store.AppendSegment(session, Media(0, 1000), HlsPlaylistTests.Entry(0, 1.0));
-        var segment = store.GetSegment("live", "cam", "segment-0.m4s")!;
-        var copy = segment.Data.ToArray();
+        using var lease = store.AcquireSegment("live", "cam", "segment-0.m4s")!;
+        var copy = lease.ToArray();
         store.CloseStream(session, completed: false);
         _time.Advance(TimeSpan.FromMinutes(1));
 
         Assert.Null(store.GetSegment("live", "cam", "segment-0.m4s"));
+        Assert.Null(store.AcquireSegment("live", "cam", "segment-0.m4s"));
         Assert.Equal(0L, store.TotalBytes);
-        Assert.Equal(copy, segment.Data.ToArray());
-        Assert.Equal(1000, segment.Length);
+        Assert.Equal(copy, lease.ToArray());
+        Assert.Equal(1000, lease.Length);
     }
 
     /// <summary>
@@ -427,9 +428,10 @@ public sealed class InMemoryHlsSegmentStoreTests : IDisposable
                     var listedFor = playlist.Segments.Aggregate(TimeSpan.Zero, static (t, s) => t + s.Duration);
                     foreach (var entry in playlist.Segments)
                     {
-                        if (store.GetSegment("live", "cam", entry.Name) is { } segment)
+                        using var segment = store.AcquireSegment("live", "cam", entry.Name);
+                        if (segment is not null)
                         {
-                            Assert.Equal((byte)entry.Sequence, segment.Data.Span[0]);
+                            Assert.Equal((byte)entry.Sequence, segment.GetPart(0).Span[0]);
                         }
                         else
                         {

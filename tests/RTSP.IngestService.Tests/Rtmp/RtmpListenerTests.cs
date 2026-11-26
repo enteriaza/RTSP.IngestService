@@ -1,6 +1,6 @@
 // Tests for the RTMP TCP listener over real loopback sockets on OS-assigned ports: concurrent publishers, the
-// connection limit, abrupt disconnects, isolation of a malformed client, graceful shutdown with active publishers,
-// bind failures and IPv6.
+// connection limit, the listen backlog under connect bursts within and beyond the limit, abrupt disconnects,
+// isolation of a malformed client, graceful shutdown with active publishers and during a burst, bind failures and IPv6.
 
 using System.Net;
 using System.Net.Sockets;
@@ -83,6 +83,171 @@ public sealed class RtmpListenerTests : IAsyncDisposable
         var fourth = await ConnectAsync(listener);
         await fourth.HandshakeAsync();
         Assert.Equal(3, accepted.GetMeasurementSnapshot().Count);
+    }
+
+    /// <summary>Verifies that the listen backlog has room for a burst of the connection limit and never falls below the minimum.</summary>
+    /// <param name="maxConnections">The connection limit.</param>
+    /// <param name="expected">The expected backlog.</param>
+    [Theory]
+    [InlineData(1, RtmpListener.MinimumListenBacklog)]
+    [InlineData(100, RtmpListener.MinimumListenBacklog)]
+    [InlineData(RtmpListener.MinimumListenBacklog, RtmpListener.MinimumListenBacklog)]
+    [InlineData(129, 129)]
+    [InlineData(2000, 2000)]
+    [InlineData(10000, 10000)]
+    public void ListenBacklog_CoversTheConnectionLimit(int maxConnections, int expected)
+    {
+        Assert.Equal(expected, RtmpListener.GetListenBacklog(new RtmpOptions { MaxConnections = maxConnections }));
+    }
+
+    /// <summary>
+    /// Verifies that the operating system queues the whole requested backlog, above the 200 that Windows allows for a
+    /// plain backlog, while nothing accepts.
+    /// </summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task Listen_QueuesTheWholeBacklogWithoutAccepting()
+    {
+        const int Backlog = 4 * RtmpListener.MinimumListenBacklog;
+        using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        socket.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        RtmpListener.Listen(socket, Backlog);
+        var clients = Enumerable.Range(0, Backlog).Select(static _ => new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)).ToList();
+        try
+        {
+            await Task.WhenAll(clients.Select(c => c.ConnectAsync(socket.LocalEndPoint!, TestContext.Current.CancellationToken).AsTask())).WithinSafetyTimeout();
+
+            Assert.All(clients, static c => Assert.True(c.Connected));
+        }
+        finally
+        {
+            foreach (var client in clients)
+            {
+                client.LingerState = new LingerOption(enable: true, seconds: 0);
+                client.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Verifies that a burst of simultaneous connections several times the minimum backlog is served completely, and
+    /// that stopping the listener then closes all of them.
+    /// </summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task ConnectBurst_WithinTheLimit_IsServed()
+    {
+        const int Burst = 4 * RtmpListener.MinimumListenBacklog;
+        var options = LoopbackOptions();
+        options.MaxConnections = Burst;
+        _server.Dispose();
+        _server = new RtmpTestServer(options);
+        var listener = await StartAsync();
+
+        var clients = await Task.WhenAll(Enumerable.Range(0, Burst).Select(async _ =>
+        {
+            var client = await ConnectAsync(listener);
+            await client.HandshakeAsync();
+            return client;
+        })).WithinSafetyTimeout();
+
+        Assert.Equal(Burst, listener.ActiveConnectionCount);
+        Assert.DoesNotContain(_server.Logs.GetSnapshot(), static r => r.Id.Id == 5002);
+
+        await listener.StopAsync(TestContext.Current.CancellationToken).WithinSafetyTimeout();
+
+        Assert.True(listener.ExecuteTask!.IsCompletedSuccessfully);
+        Assert.Equal(0, listener.ActiveConnectionCount);
+        await Task.WhenAll(clients.Select(static c => c.WaitForCloseAsync())).WithinSafetyTimeout();
+    }
+
+    /// <summary>
+    /// Verifies a burst beyond the connection limit: the limit is admitted, every other connection that reaches the
+    /// listener is closed and logged rather than queued, and connections are admitted again once admitted ones close.
+    /// </summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task ConnectBurst_BeyondTheLimit_AdmitsTheLimitAndRecovers()
+    {
+        const int Limit = 2 * RtmpListener.MinimumListenBacklog;
+        var options = LoopbackOptions();
+        options.MaxConnections = Limit;
+        _server.Dispose();
+        _server = new RtmpTestServer(options);
+        var listener = await StartAsync();
+
+        var outcomes = await Task.WhenAll(Enumerable.Range(0, 2 * Limit).Select(async _ =>
+        {
+            RtmpTestClient client;
+            try
+            {
+                client = await ConnectAsync(listener);
+            }
+            catch (SocketException)
+            {
+                return (Client: (RtmpTestClient?)null, Closed: false);
+            }
+
+            try
+            {
+                await client.HandshakeAsync();
+                return (Client: client, Closed: false);
+            }
+            catch (Exception ex) when (ex is IOException or SocketException)
+            {
+                return (Client: (RtmpTestClient?)null, Closed: true);
+            }
+        })).WithinSafetyTimeout();
+
+        var admitted = outcomes.Where(static o => o.Client is not null).Select(static o => o.Client!).ToList();
+        var closed = outcomes.Count(static o => o.Closed);
+        Assert.Equal(Limit, admitted.Count);
+        Assert.Equal(Limit, listener.ActiveConnectionCount);
+        await Eventually.WaitUntilAsync(() => _server.Logs.GetSnapshot().Count(static r => r.Id.Id == 5002) == closed, "every connection beyond the limit is logged");
+
+        foreach (var client in admitted)
+        {
+            await client.DisposeAsync();
+        }
+
+        await Eventually.WaitUntilAsync(() => listener.ActiveConnectionCount == 0, "the admitted connections are released");
+        var next = await ConnectAsync(listener);
+        Assert.Equal("NetStream.Publish.Start", (await next.PublishFlowAsync(RtmpTestServer.StreamKey)).Code);
+    }
+
+    /// <summary>
+    /// Verifies that stopping the listener while a burst is still arriving completes, closes every admitted connection
+    /// and leaves no client waiting, including those still queued in the backlog.
+    /// </summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task Stop_DuringConnectBurst_ClosesEverything()
+    {
+        const int Burst = 4 * RtmpListener.MinimumListenBacklog;
+        var options = LoopbackOptions();
+        options.MaxConnections = Burst;
+        _server.Dispose();
+        _server = new RtmpTestServer(options);
+        var listener = await StartAsync();
+
+        var attempts = Enumerable.Range(0, Burst).Select(async _ =>
+        {
+            try
+            {
+                var client = await ConnectAsync(listener);
+                await client.HandshakeAsync();
+                await client.WaitForCloseAsync();
+            }
+            catch (Exception ex) when (ex is IOException or SocketException)
+            {
+            }
+        }).ToList();
+        await listener.StopAsync(TestContext.Current.CancellationToken).WithinSafetyTimeout();
+
+        Assert.True(listener.ExecuteTask!.IsCompletedSuccessfully);
+        Assert.Equal(0, listener.ActiveConnectionCount);
+        Assert.False(listener.IsListening);
+        await Task.WhenAll(attempts).WithinSafetyTimeout();
     }
 
     /// <summary>Verifies that a TCP reset while publishing ends the session as a disconnect and the listener keeps accepting.</summary>
