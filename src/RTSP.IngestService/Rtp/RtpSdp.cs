@@ -17,6 +17,9 @@ internal static class RtpSdp
     /// <summary>Media type of session descriptions.</summary>
     public const string ContentType = "application/sdp";
 
+    /// <summary>The <c>a=tool</c> attribute, naming the service.</summary>
+    private static readonly string ToolAttribute = "a=tool:" + ApplicationIdentity.ServiceAssemblyName;
+
     /// <summary>Renders the description of a session for a stream description.</summary>
     /// <param name="session">The output session.</param>
     /// <param name="info">The publication's current stream description.</param>
@@ -45,7 +48,7 @@ internal static class RtpSdp
         Line(sdp, $"s={output.Name}");
         Line(sdp, $"c=IN {family} {connection}");
         Line(sdp, "t=0 0");
-        Line(sdp, "a=tool:RTSP.IngestService");
+        Line(sdp, ToolAttribute);
 
         if (video)
         {

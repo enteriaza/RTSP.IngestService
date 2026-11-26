@@ -137,6 +137,19 @@ This replaces the shipped defaults and the unit. `appsettings.Production.json` a
 
 If you change the timeouts in `appsettings.json`, adjust `TimeoutStartSec` and `TimeoutStopSec` to stay above them.
 
+To tell nodes apart in logs and telemetry, set the optional deployment identity per machine, for example in a drop-in
+(`sudo systemctl edit rtsp-ingest-service`):
+
+```ini
+[Service]
+Environment=Application__InstanceId=i-0a1b2c3d4e5f60718 Application__NodeId=ingest-a
+Environment=Application__Region=eu-west-2 Application__AvailabilityZone=eu-west-2a
+```
+
+Unset values are omitted. `Application__Name` is not a setting: the service fails to start with exit code 78 if it is
+set, and the application name is always `RTSP.IngestService` (see
+[Application and deployment identity](../architecture.md#application-and-deployment-identity)).
+
 ### Network
 
 The RTMP listener accepts publishers on TCP 1935 on all addresses by default (`Rtmp:ListenAddress` `0.0.0.0`,

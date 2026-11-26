@@ -73,6 +73,7 @@ public sealed class RtpOutputTests
             Assert.Contains("mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1210\r\n", sdp, StringComparison.Ordinal);
             Assert.Contains($"a=ssrc:{videoPackets[0].Ssrc} cname:", sdp, StringComparison.Ordinal);
             Assert.Contains("c=IN IP4 127.0.0.1\r\n", sdp, StringComparison.Ordinal);
+            Assert.Contains($"a=tool:{ApplicationIdentity.ServiceAssemblyName}\r\n", sdp, StringComparison.Ordinal);
 
             var forwarded = Assert.Single(harness.Inner.Video);
             Assert.Equal(idr, Assert.Single(forwarded.NalUnits));

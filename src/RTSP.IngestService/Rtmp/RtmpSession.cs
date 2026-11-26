@@ -619,9 +619,9 @@ internal sealed partial class RtmpSession
 
     /// <summary>Logs a successful <c>connect</c>.</summary>
     /// <param name="connectionId">The connection.</param>
-    /// <param name="application">The application name.</param>
-    [LoggerMessage(EventId = 5200, Level = LogLevel.Information, Message = "RTMP connection {ConnectionId} connected to application {Application}")]
-    private partial void LogConnected(long connectionId, string application);
+    /// <param name="rtmpApplication">The RTMP application name.</param>
+    [LoggerMessage(EventId = 5200, Level = LogLevel.Information, Message = "RTMP connection {ConnectionId} connected to application {RtmpApplication}")]
+    private partial void LogConnected(long connectionId, string rtmpApplication);
 
     /// <summary>Logs a rejected <c>connect</c>.</summary>
     /// <param name="connectionId">The connection.</param>
@@ -643,25 +643,25 @@ internal sealed partial class RtmpSession
     /// <summary>Logs a started publishing session.</summary>
     /// <param name="sessionId">The session.</param>
     /// <param name="connectionId">The connection.</param>
-    /// <param name="application">The application.</param>
+    /// <param name="rtmpApplication">The RTMP application.</param>
     /// <param name="streamIdentity">The non-secret stream identity.</param>
     /// <param name="publishType">The publishing type.</param>
-    [LoggerMessage(EventId = 5204, Level = LogLevel.Information, Message = "Publishing started: session {SessionId} on RTMP connection {ConnectionId}, application {Application}, stream {StreamIdentity} ({PublishType})")]
-    private partial void LogPublishStarted(Guid sessionId, long connectionId, string application, string streamIdentity, string publishType);
+    [LoggerMessage(EventId = 5204, Level = LogLevel.Information, Message = "Publishing started: session {SessionId} on RTMP connection {ConnectionId}, application {RtmpApplication}, stream {StreamIdentity} ({PublishType})")]
+    private partial void LogPublishStarted(Guid sessionId, long connectionId, string rtmpApplication, string streamIdentity, string publishType);
 
     /// <summary>Logs a publish request rejected by the authenticator.</summary>
     /// <param name="connectionId">The connection.</param>
-    /// <param name="application">The application.</param>
+    /// <param name="rtmpApplication">The RTMP application.</param>
     /// <param name="reason">The authenticator's non-secret reason.</param>
-    [LoggerMessage(EventId = 5205, Level = LogLevel.Warning, Message = "Publish rejected by authentication on RTMP connection {ConnectionId}, application {Application}: {Reason}; closing")]
-    private partial void LogPublishRejected(long connectionId, string application, string reason);
+    [LoggerMessage(EventId = 5205, Level = LogLevel.Warning, Message = "Publish rejected by authentication on RTMP connection {ConnectionId}, application {RtmpApplication}: {Reason}; closing")]
+    private partial void LogPublishRejected(long connectionId, string rtmpApplication, string reason);
 
     /// <summary>Logs a publish for an identity that another session is already publishing.</summary>
     /// <param name="connectionId">The connection.</param>
-    /// <param name="application">The application.</param>
+    /// <param name="rtmpApplication">The RTMP application.</param>
     /// <param name="streamIdentity">The identity.</param>
-    [LoggerMessage(EventId = 5206, Level = LogLevel.Warning, Message = "Publish rejected on RTMP connection {ConnectionId}: stream {StreamIdentity} in application {Application} is already being published")]
-    private partial void LogStreamAlreadyPublished(long connectionId, string application, string streamIdentity);
+    [LoggerMessage(EventId = 5206, Level = LogLevel.Warning, Message = "Publish rejected on RTMP connection {ConnectionId}: stream {StreamIdentity} in application {RtmpApplication} is already being published")]
+    private partial void LogStreamAlreadyPublished(long connectionId, string rtmpApplication, string streamIdentity);
 
     /// <summary>Logs an ended publishing session.</summary>
     /// <param name="sessionId">The session.</param>

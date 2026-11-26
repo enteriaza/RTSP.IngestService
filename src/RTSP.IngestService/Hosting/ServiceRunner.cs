@@ -38,8 +38,8 @@ namespace RTSP.IngestService.Hosting;
 /// </remarks>
 public static partial class ServiceRunner
 {
-    /// <summary>Logger category used by the runner.</summary>
-    private const string LoggerCategory = "RTSP.IngestService.Hosting.ServiceRunner";
+    /// <summary>Logger category used by the runner: its full type name, as for <c>ILogger&lt;T&gt;</c>.</summary>
+    private static readonly string LoggerCategory = typeof(ServiceRunner).FullName!;
 
     /// <summary>First recorded reason for startup cancellation; stored as <see cref="int"/> for atomic updates.</summary>
     private static class StartupAbortCause
@@ -157,6 +157,9 @@ public static partial class ServiceRunner
 
             try
             {
+                // Resolving the identity validates the Application section; a failure is a configuration error of startup.
+                var identity = services.GetRequiredService<ApplicationIdentity>().Description;
+                LogIdentity(logger, identity);
                 await host.StartAsync(startupSource.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (Volatile.Read(ref abortCause) == StartupAbortCause.ShutdownRequested)
@@ -265,6 +268,15 @@ public static partial class ServiceRunner
     /// <param name="processId">The process identifier.</param>
     [LoggerMessage(EventId = 4000, Level = LogLevel.Information, Message = "Starting service host in {HostingMode} mode; environment {EnvironmentName}; content root {ContentRoot}; runtime {Framework}; process {ProcessId}")]
     private static partial void LogHostStarting(ILogger logger, HostingMode hostingMode, string environmentName, string contentRoot, string framework, int processId);
+
+    /// <summary>
+    /// Logs the application and deployment identity once, so that sinks that do not render the identity properties
+    /// (console, systemd) still show it.
+    /// </summary>
+    /// <param name="logger">The runner logger.</param>
+    /// <param name="identity">The <see cref="ApplicationIdentity.Description"/>.</param>
+    [LoggerMessage(EventId = 4008, Level = LogLevel.Information, Message = "Application identity: {Identity}")]
+    private static partial void LogIdentity(ILogger logger, string identity);
 
     /// <summary>Logs the effective startup and shutdown timeouts.</summary>
     /// <param name="logger">The runner logger.</param>

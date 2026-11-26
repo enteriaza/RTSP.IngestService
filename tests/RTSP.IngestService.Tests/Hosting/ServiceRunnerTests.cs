@@ -72,7 +72,8 @@ public sealed class ServiceRunnerTests
     /// <param name="key">The configuration key to override.</param>
     /// <param name="value">An invalid value for <paramref name="key"/>.</param>
     [Theory]
-    [InlineData("Application:Name", "")]
+    [InlineData("Application:NodeId", "")]
+    [InlineData("Application:Name", "RTSP.IngestService")]
     [InlineData("Lifetime:StartupTimeout", "00:00:00")]
     [InlineData("FileLogging:Mode", "Sometimes")]
     [InlineData("Lifetime:Unexpected", "1")]

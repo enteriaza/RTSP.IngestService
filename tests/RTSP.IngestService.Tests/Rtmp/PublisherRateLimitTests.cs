@@ -6,6 +6,7 @@
 
 using System.Net;
 using Microsoft.Extensions.Time.Testing;
+using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Hosting;
 using RTSP.IngestService.Rtmp.Publishing;
 using RTSP.IngestService.Tests.Infrastructure;
@@ -390,6 +391,7 @@ public sealed class PublisherRateLimitTests
         Assert.Equal(ExitCodes.UsageError, shortKey);
         Assert.Empty(output.ToString());
         Assert.DoesNotContain("short", error.ToString(), StringComparison.Ordinal);
+        Assert.Contains($"{ApplicationIdentity.ServiceAssemblyName} publisher-key generate ", error.ToString(), StringComparison.Ordinal);
     }
 
     /// <summary>Raises <paramref name="target"/> to <paramref name="value"/> if it is larger.</summary>

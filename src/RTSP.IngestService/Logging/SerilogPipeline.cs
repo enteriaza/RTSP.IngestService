@@ -21,8 +21,10 @@ namespace RTSP.IngestService.Logging;
 /// <remarks>
 /// The main logger accepts every level; level filtering is performed by Microsoft.Extensions.Logging using the
 /// standard <c>Logging:LogLevel</c> configuration, which reloads with the configuration file. Only the application
-/// name, environment, hosting mode, machine name and process ID are attached as properties; configuration values are
-/// never logged by the pipeline. The main logger's sinks are written by one background thread through a
+/// identity (<see cref="ApplicationIdentityEnricher"/>), environment, hosting mode, machine name and process ID are
+/// attached as properties; other configuration values are never logged by the pipeline. The identity properties are
+/// rendered by the JSON file sink; the console and systemd templates show only the message, and the identity appears
+/// there once, in startup event 4008. The main logger's sinks are written by one background thread through a
 /// <see cref="BoundedAsyncSink"/>; console output that is redirected (always under systemd) is written once per batch
 /// through a <see cref="BufferedConsoleSink"/> with the same template or formatter, and an interactive console keeps
 /// the themed console sink. The bootstrap logger writes synchronously.
@@ -44,16 +46,16 @@ public static class SerilogPipeline
     /// <summary>
     /// Creates the main application logger.
     /// </summary>
-    /// <param name="application">Validated application identity.</param>
+    /// <param name="identity">The application and deployment identity.</param>
     /// <param name="fileLogging">Validated file logging settings.</param>
     /// <param name="environment">The host environment, supplying the environment name and content root.</param>
     /// <param name="mode">The hosting mode, which selects the sinks.</param>
     /// <returns>A logger the caller owns and must dispose to flush the file sink.</returns>
     /// <exception cref="IOException">The log directory could not be created.</exception>
     /// <exception cref="UnauthorizedAccessException">The process may not create the log directory.</exception>
-    public static Logger CreateLogger(ApplicationOptions application, FileLoggingOptions fileLogging, IHostEnvironment environment, HostingMode mode)
+    public static Logger CreateLogger(ApplicationIdentity identity, FileLoggingOptions fileLogging, IHostEnvironment environment, HostingMode mode)
     {
-        ArgumentNullException.ThrowIfNull(application);
+        ArgumentNullException.ThrowIfNull(identity);
         ArgumentNullException.ThrowIfNull(fileLogging);
         ArgumentNullException.ThrowIfNull(environment);
 
@@ -96,7 +98,7 @@ public static class SerilogPipeline
         return new LoggerConfiguration()
             .MinimumLevel.Verbose()
             .Enrich.FromLogContext()
-            .Enrich.WithProperty("Application", application.Name)
+            .Enrich.With(new ApplicationIdentityEnricher(identity))
             .Enrich.WithProperty("Environment", environment.EnvironmentName)
             .Enrich.WithProperty("HostingMode", mode.ToString())
             .Enrich.WithProperty("MachineName", Environment.MachineName)
@@ -116,8 +118,15 @@ public static class SerilogPipeline
     {
         var configuration = new LoggerConfiguration()
             .MinimumLevel.Information()
-            .Enrich.WithProperty("SourceContext", "RTSP.IngestService.Bootstrap")
+            .Enrich.WithProperty("SourceContext", ApplicationIdentity.ServiceAssemblyName + ".Bootstrap")
             .Enrich.WithProperty("HostingMode", mode.ToString());
+
+        // Configuration is not loaded yet, so only the name is known; without an entry assembly the bootstrap logger
+        // still has to report the failure that the host build will then raise.
+        if (System.Reflection.Assembly.GetEntryAssembly()?.GetName().Name is { Length: > 0 } name)
+        {
+            configuration.Enrich.WithProperty(ApplicationIdentityEnricher.ApplicationName, name);
+        }
 
         _ = mode switch
         {

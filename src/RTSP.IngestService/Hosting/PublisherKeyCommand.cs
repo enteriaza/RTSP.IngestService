@@ -2,6 +2,7 @@
 // creates a new stream key and prints it once with its hash; "hash" reads an existing key from standard input (so it
 // never appears in the process arguments or shell history) and prints only its hash.
 
+using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Rtmp.Publishing;
 
 namespace RTSP.IngestService.Hosting;
@@ -21,12 +22,12 @@ public static class PublisherKeyCommand
     /// <summary>The command name.</summary>
     public const string CommandName = "publisher-key";
 
-    /// <summary>Usage text.</summary>
-    private const string Usage =
-        """
+    /// <summary>Usage text, naming the executable.</summary>
+    private static readonly string Usage =
+        $"""
         Usage:
-          RTSP.IngestService publisher-key generate   Create a new stream key; prints the key once and its KeyHash.
-          RTSP.IngestService publisher-key hash       Read one stream key from standard input; prints its KeyHash.
+          {ApplicationIdentity.ServiceAssemblyName} publisher-key generate   Create a new stream key; prints the key once and its KeyHash.
+          {ApplicationIdentity.ServiceAssemblyName} publisher-key hash       Read one stream key from standard input; prints its KeyHash.
         Store only the KeyHash in configuration. Give the stream key to the encoder operator and do not keep a copy.
         """;
 

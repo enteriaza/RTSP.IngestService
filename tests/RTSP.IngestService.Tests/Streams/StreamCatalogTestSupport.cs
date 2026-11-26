@@ -26,7 +26,10 @@ internal sealed class FakeInventorySource : IStreamInventorySource
     /// <summary>Gets or sets an action run after the copy is taken and before it is returned, simulating concurrent changes.</summary>
     public Action? DuringAcquire { get; set; }
 
-    /// <summary>Gets the number of acquisitions.</summary>
+    /// <summary>
+    /// Gets the number of acquisitions. An acquisition is counted once its <see cref="DuringAcquire"/> action has run,
+    /// so a test that observes the count also observes everything that action did.
+    /// </summary>
     public int Acquisitions => Volatile.Read(ref _acquisitions);
 
     /// <summary>Backs <see cref="Acquisitions"/>.</summary>
@@ -35,16 +38,24 @@ internal sealed class FakeInventorySource : IStreamInventorySource
     /// <inheritdoc />
     public StreamInventorySnapshot Acquire()
     {
-        Interlocked.Increment(ref _acquisitions);
         if (Fail)
         {
+            Interlocked.Increment(ref _acquisitions);
             throw new InvalidOperationException("Simulated source failure");
         }
 
         var snapshot = new StreamInventorySnapshot([.. Hls], [.. Publishing]);
         var during = DuringAcquire;
         DuringAcquire = null;
-        during?.Invoke();
+        try
+        {
+            during?.Invoke();
+        }
+        finally
+        {
+            Interlocked.Increment(ref _acquisitions);
+        }
+
         return snapshot;
     }
 

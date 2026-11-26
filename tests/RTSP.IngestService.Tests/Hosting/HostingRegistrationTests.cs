@@ -9,6 +9,7 @@ using Microsoft.Extensions.Hosting.WindowsServices;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Testing;
 using Microsoft.Extensions.Options;
+using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Hosting;
 using RTSP.IngestService.Lifecycle;
 using RTSP.IngestService.Tests.Infrastructure;
@@ -103,18 +104,33 @@ public sealed class HostingRegistrationTests
     }
 
     /// <summary>
-    /// Verifies the Windows Service registrations outside SCM: the service name comes from configuration and the
-    /// framework leaves the console lifetime in place because the process was not started by SCM.
+    /// Verifies the Windows Service registrations outside SCM: the service name is always the fixed
+    /// <c>RTSP.IngestService</c>, whatever the deployment identity and although the test host's entry assembly has a
+    /// different name, and the framework leaves the console lifetime in place because the process was not started by SCM.
     /// </summary>
-    [Fact]
-    public void WindowsServiceMode_OutsideScm_KeepsConsoleLifetimeAndSetsServiceName()
+    /// <param name="nodeId">The configured node, if any.</param>
+    /// <param name="instanceId">The configured instance, if any.</param>
+    [Theory]
+    [InlineData(null, null)]
+    [InlineData("node01.af-south-1", "i-0123456789abcdef0")]
+    [InlineData("node02.eu-west-1", "vm-7")]
+    public void WindowsServiceMode_OutsideScm_KeepsConsoleLifetimeAndFixedServiceName(string? nodeId, string? instanceId)
     {
-        using var host = TestHosts.CreateBuilder(
-            _logs,
-            HostingMode.WindowsService,
-            new Dictionary<string, string?> { ["Application:Name"] = "IngestEdge" }).Build();
+        var overrides = new Dictionary<string, string?>();
+        if (nodeId is not null)
+        {
+            overrides["Application:NodeId"] = nodeId;
+            overrides["Application:InstanceId"] = instanceId;
+            overrides["Application:Region"] = "af-south-1";
+            overrides["Application:AvailabilityZone"] = "af-south-1a";
+        }
 
-        Assert.Equal("IngestEdge", host.Services.GetRequiredService<IOptions<WindowsServiceLifetimeOptions>>().Value.ServiceName);
+        using var host = TestHosts.CreateBuilder(_logs, HostingMode.WindowsService, overrides).Build();
+
+        Assert.Equal("RTSP.IngestService", ApplicationIdentity.WindowsServiceName);
+        Assert.Equal(ApplicationIdentity.WindowsServiceName, host.Services.GetRequiredService<IOptions<WindowsServiceLifetimeOptions>>().Value.ServiceName);
+        Assert.NotEqual(ApplicationIdentity.WindowsServiceName, host.Services.GetRequiredService<ApplicationIdentity>().Name);
+        Assert.Equal(nodeId, host.Services.GetRequiredService<ApplicationIdentity>().NodeId);
         Assert.Equal(ConsoleLifetimeTypeName, host.Services.GetRequiredService<IHostLifetime>().GetType().FullName);
     }
 

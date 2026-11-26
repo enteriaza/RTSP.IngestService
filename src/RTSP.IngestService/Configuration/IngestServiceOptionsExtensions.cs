@@ -3,6 +3,7 @@
 // so that every configuration error is classified and reported the same way by the service runner.
 
 using System.Diagnostics.CodeAnalysis;
+using System.Reflection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 
@@ -22,7 +23,8 @@ public static class IngestServiceOptionsExtensions
     /// <summary>
     /// Registers <see cref="ApplicationOptions"/>, <see cref="LifetimeOptions"/>,
     /// <see cref="FileLoggingOptions"/>, <see cref="RtmpOptions"/>, <see cref="MediaOptions"/>, <see cref="HlsOptions"/>, <see cref="RtpOptions"/>, <see cref="HttpOriginOptions"/>, <see cref="ManagementOptions"/>, <see cref="StreamEventOptions"/>, <see cref="StreamCatalogOptions"/> and <see cref="TelemetryOptions"/>, each bound from its configuration section,
-    /// validated when first resolved and validated eagerly when the host starts.
+    /// validated when first resolved and validated eagerly when the host starts, and the <see cref="ApplicationIdentity"/>
+    /// built from the entry assembly and the validated <see cref="ApplicationOptions"/>.
     /// </summary>
     /// <param name="services">The service collection to add registrations to.</param>
     /// <param name="configuration">The application configuration containing the option sections.</param>
@@ -40,7 +42,11 @@ public static class IngestServiceOptionsExtensions
         // Each bind delegate calls ConfigurationBinder.Bind with a concrete type so that the configuration binding
         // source generator can intercept it; a generic call site would fall back to reflection.
         AddValidatedOptions<ApplicationOptions, ApplicationOptionsValidator>(
-            services, configuration, ApplicationOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
+            services, configuration, ApplicationOptions.SectionName, static (section, options) =>
+            {
+                ApplicationOptions.ThrowIfNameConfigured(section);
+                section.Bind(options, StrictBinding);
+            });
         AddValidatedOptions<LifetimeOptions, LifetimeOptionsValidator>(
             services, configuration, LifetimeOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
         AddValidatedOptions<FileLoggingOptions, FileLoggingOptionsValidator>(
@@ -63,6 +69,8 @@ public static class IngestServiceOptionsExtensions
             services, configuration, StreamCatalogOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
         AddValidatedOptions<TelemetryOptions, TelemetryOptionsValidator>(
             services, configuration, TelemetryOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
+
+        services.TryAddSingleton(static sp => ApplicationIdentity.Create(Assembly.GetEntryAssembly(), sp.GetRequiredService<IOptions<ApplicationOptions>>().Value));
 
         return services;
     }

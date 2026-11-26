@@ -7,7 +7,6 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using OpenTelemetry.Exporter;
 using OpenTelemetry.Metrics;
-using OpenTelemetry.Resources;
 using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Hls;
 using RTSP.IngestService.Http;
@@ -47,7 +46,8 @@ public static class TelemetryServiceCollectionExtensions
     /// <returns>The same <paramref name="services"/> instance for chaining.</returns>
     /// <remarks>
     /// Register before the ingest components so the flush runs after they have stopped and includes their final
-    /// measurements. Only metrics are configured: there is no tracing or log export.
+    /// measurements. Only metrics are configured: there is no tracing or log export. The provider's resource is the
+    /// <see cref="ApplicationIdentity"/> whether or not export is enabled (<see cref="ApplicationIdentity.ConfigureResource"/>).
     /// </remarks>
     public static IServiceCollection AddTelemetryExport(this IServiceCollection services)
     {
@@ -66,15 +66,16 @@ public static class TelemetryServiceCollectionExtensions
 
         services.ConfigureOpenTelemetryMeterProvider(static (provider, builder) =>
         {
+            var identity = provider.GetRequiredService<ApplicationIdentity>();
+            builder.ConfigureResource(identity.ConfigureResource);
+
             var otlp = provider.GetRequiredService<IOptions<TelemetryOptions>>().Value.Otlp;
             if (!otlp.Enabled)
             {
                 return;
             }
 
-            var service = provider.GetRequiredService<IOptions<ApplicationOptions>>().Value.Name;
             builder
-                .ConfigureResource(resource => resource.AddService(service, autoGenerateServiceInstanceId: false))
                 .AddMeter(MeterNames)
                 .AddReader(CreateReader(otlp));
         });

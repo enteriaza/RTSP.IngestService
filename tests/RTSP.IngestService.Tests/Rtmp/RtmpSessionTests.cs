@@ -237,6 +237,7 @@ public sealed class RtmpSessionTests : IDisposable
         Assert.Equal(0, _server.Registry.Count);
         Assert.Equal(1, failures.LastMeasurement?.Value);
         Assert.Contains(_server.Logs.GetSnapshot(), static r => r.Id.Id == 5205);
+        AssertRtmpApplication(5200, 5205);
         Assert.DoesNotContain(_server.Logs.GetSnapshot(), r => r.Message.Contains(key, StringComparison.Ordinal));
         await client.DisposeAsync();
     }
@@ -293,6 +294,7 @@ public sealed class RtmpSessionTests : IDisposable
 
         Assert.Equal(1, _server.Registry.Count);
         Assert.Contains(_server.Logs.GetSnapshot(), static r => r.Id.Id == 5206);
+        AssertRtmpApplication(5200, 5204, 5206);
         await first.DisposeAsync();
         await second.DisposeAsync();
         await Task.WhenAll(firstRun, secondRun).WithinSafetyTimeout();
@@ -744,6 +746,23 @@ public sealed class RtmpSessionTests : IDisposable
 
     /// <summary>Disposes the server.</summary>
     public void Dispose() => _server.Dispose();
+
+    /// <summary>
+    /// Asserts that the events, under their unchanged IDs and levels, carry the RTMP application as
+    /// <c>RtmpApplication</c> and no <c>Application</c> property that could be taken for the service identity.
+    /// </summary>
+    /// <param name="eventIds">The event IDs.</param>
+    private void AssertRtmpApplication(params int[] eventIds)
+    {
+        foreach (var id in eventIds)
+        {
+            var record = _server.Logs.GetSnapshot().First(r => r.Id.Id == id);
+            Assert.Equal(id is 5200 or 5204 ? Microsoft.Extensions.Logging.LogLevel.Information : Microsoft.Extensions.Logging.LogLevel.Warning, record.Level);
+            var state = record.StructuredState!;
+            Assert.Contains(new KeyValuePair<string, string?>("RtmpApplication", "live"), state);
+            Assert.DoesNotContain(state, static p => p.Key == "Application");
+        }
+    }
 
     /// <summary>Encodes an <c>@setDataFrame onMetaData</c> data message body.</summary>
     /// <param name="properties">Numeric metadata properties.</param>

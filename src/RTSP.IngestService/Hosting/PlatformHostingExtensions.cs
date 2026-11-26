@@ -57,8 +57,8 @@ public static class PlatformHostingExtensions
     /// SIGQUIT and SIGTERM.
     /// </para>
     /// <para>
-    /// <see cref="HostingMode.WindowsService"/>: calls <c>AddWindowsService</c>, sets the service name from
-    /// <see cref="ApplicationOptions.Name"/> and replaces the framework lifetime with
+    /// <see cref="HostingMode.WindowsService"/>: calls <c>AddWindowsService</c>, sets the service name to
+    /// <see cref="ApplicationIdentity.WindowsServiceName"/> and replaces the framework lifetime with
     /// <see cref="WindowsServiceControlLifetime"/>. The framework only registers its lifetime when the process was
     /// actually started by SCM; otherwise the console lifetime remains.
     /// </para>
@@ -77,8 +77,7 @@ public static class PlatformHostingExtensions
         {
             case HostingMode.WindowsService:
                 services.AddWindowsService();
-                services.AddOptions<WindowsServiceLifetimeOptions>()
-                    .Configure<IOptions<ApplicationOptions>>(static (windows, application) => windows.ServiceName = application.Value.Name);
+                services.Configure<WindowsServiceLifetimeOptions>(static windows => windows.ServiceName = ApplicationIdentity.WindowsServiceName);
                 if (OperatingSystem.IsWindows())
                 {
                     ReplaceWindowsServiceLifetime(services);

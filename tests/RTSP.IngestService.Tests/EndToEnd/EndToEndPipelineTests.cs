@@ -15,6 +15,8 @@ using OpenTelemetry.Metrics;
 using RTSP.IngestService.Hls;
 using RTSP.IngestService.Http;
 using RTSP.IngestService.Lifecycle;
+using RTSP.IngestService.Media;
+using RTSP.IngestService.Rtmp;
 using RTSP.IngestService.Streams;
 using RTSP.IngestService.Tests.Hls;
 using RTSP.IngestService.Tests.Infrastructure;
@@ -27,7 +29,7 @@ namespace RTSP.IngestService.Tests.EndToEnd;
 public sealed class EndToEndPipelineTests : IDisposable
 {
     /// <summary>Meters that must appear in the OTLP payload.</summary>
-    private static readonly string[] Meters = ["RTSP.IngestService.Rtmp", "RTSP.IngestService.Media", "RTSP.IngestService.Hls", "RTSP.IngestService.Http", "RTSP.IngestService.Streams"];
+    private static readonly string[] Meters = [RtmpMetrics.MeterName, MediaMetrics.MeterName, HlsMetrics.MeterName, HttpOriginMetrics.MeterName, StreamEventMetrics.MeterName];
 
     /// <summary>Instruments whose totals must grow with the workload.</summary>
     private static readonly string[] Growing = ["rtmp.connections.accepted", "rtmp.bytes_received", "media.samples", "hls.segments", "http.origin.requests", "stream_events.published", "stream_catalog.reconciliations"];

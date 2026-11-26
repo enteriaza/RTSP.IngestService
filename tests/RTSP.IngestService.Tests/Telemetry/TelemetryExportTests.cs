@@ -15,6 +15,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Testing;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Time.Testing;
+using OpenTelemetry;
 using OpenTelemetry.Metrics;
 using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Hls;
@@ -72,6 +73,10 @@ public sealed class TelemetryExportTests
         ["hls.errors"] = new() { ["kind=storage_full"] = 1 },
         ["hls.discontinuities"] = new() { ["reason=timestamp"] = 1 },
         ["hls.samples.dropped"] = new() { ["reason=before_sync_sample;track=video"] = 3 },
+        ["hls.pending.bytes"] = new() { [""] = 1200 },
+        ["hls.readers.bytes"] = new() { [""] = 65536 },
+        ["hls.readers.refused"] = new() { [""] = 1 },
+        ["hls.segment_pool.bytes"] = new() { ["state=in_use"] = 131072, ["state=free"] = -65536 },
         ["rtp.sessions.active"] = new() { ["mode=unicast"] = 1 },
         ["rtp.packets.sent"] = new() { ["mode=unicast;track=video"] = 10 },
         ["rtp.bytes.sent"] = new() { ["mode=unicast;track=video"] = 8000 },
@@ -104,6 +109,9 @@ public sealed class TelemetryExportTests
 
     /// <summary>Instruments a real publish, playback and missing-stream request must have recorded.</summary>
     private static readonly string[] FromTraffic = ["rtmp.bytes_received", "media.samples", "hls.segments", "rtp.packets.sent", "http.origin.requests", "http.origin.missing", "stream_events.published", "stream_catalog.reconciliations"];
+
+    /// <summary>HLS memory instruments a real publish and playback must have exported; their values can net to zero.</summary>
+    private static readonly string[] HlsMemoryFromTraffic = ["hls.pending.bytes", "hls.segment_pool.bytes", "hls.readers.bytes"];
 
     /// <summary>Captured host logs.</summary>
     private readonly FakeLogCollector _logs = new();
@@ -231,10 +239,21 @@ public sealed class TelemetryExportTests
         provider.ForceFlush(10_000);
         var latest = Latest(exported);
 
-        Assert.Equal(56, instruments.Count);
+        Assert.Equal(60, instruments.Count);
+        Assert.Equal(instruments.Count, instruments.Select(static i => i.Name).Distinct(StringComparer.Ordinal).Count());
         Assert.Equal(TelemetryTestSupport.Vocabulary.Keys.Order(StringComparer.Ordinal), instruments.Select(static i => i.Name).Order(StringComparer.Ordinal));
+        Assert.Equal(TelemetryTestSupport.Vocabulary.Keys.Order(StringComparer.Ordinal), Expected.Keys.Order(StringComparer.Ordinal));
+        Assert.Equal(
+            TelemetryTestSupport.Vocabulary.Keys.Where(static n => n.StartsWith("hls.", StringComparison.Ordinal)).Order(StringComparer.Ordinal),
+            instruments.Where(static i => i.Meter.Name == HlsMetrics.MeterName).Select(static i => i.Name).Order(StringComparer.Ordinal));
         Assert.Equal(TelemetryServiceCollectionExtensions.MeterNames.Order(StringComparer.Ordinal), instruments.Select(static i => i.Meter.Name).Distinct().Order(StringComparer.Ordinal));
         Assert.Equal(instruments.Select(static i => i.Name).Order(StringComparer.Ordinal), latest.Keys.Order(StringComparer.Ordinal));
+        lock (exported)
+        {
+            Assert.All(exported.GroupBy(static m => m.Name), static g => Assert.True(g.Count() == 1, $"{g.Key} exported {g.Count()} times in one flush"));
+        }
+
+        Assert.Equal(host.Services.GetRequiredService<ApplicationIdentity>().Name, provider.GetResource().Attributes.Single(static a => a.Key == ApplicationIdentity.ServiceNameAttribute).Value);
         foreach (var instrument in instruments)
         {
             var metric = latest[instrument.Name];
@@ -324,6 +343,7 @@ public sealed class TelemetryExportTests
         var latest = Latest(exported);
         Assert.Equal(TelemetryServiceCollectionExtensions.MeterNames.Order(StringComparer.Ordinal), latest.Values.Select(static m => m.MeterName).Distinct().Order(StringComparer.Ordinal));
         Assert.All(FromTraffic, name => Assert.True(Points(latest[name]).Values.Sum() > 0, name));
+        Assert.All(HlsMemoryFromTraffic, name => Assert.Contains(name, latest.Keys));
         AssertVocabulary(latest.Values);
         foreach (var (key, value) in latest.Values.SelectMany(static m => m.MetricPoints).SelectMany(static p => Tags(p)))
         {
@@ -386,6 +406,10 @@ public sealed class TelemetryExportTests
         hls.Error(HlsErrorKind.StorageFull);
         hls.Discontinuity("timestamp");
         hls.SamplesDropped(video: true, "before_sync_sample", 3);
+        hls.PendingChanged(1200);
+        hls.ReaderMemoryChanged(65536);
+        hls.ReaderRefused();
+        hls.PoolChanged(131072, -65536);
 
         var rtp = services.GetRequiredService<RtpMetrics>();
         var clock = new FakeTimeProvider();

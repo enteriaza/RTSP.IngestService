@@ -242,12 +242,18 @@ public sealed class RtmpListenerTests : IAsyncDisposable
             {
             }
         }).ToList();
+        var endPoint = listener.LocalEndPoint!;
         await listener.StopAsync(TestContext.Current.CancellationToken).WithinSafetyTimeout();
 
-        Assert.True(listener.ExecuteTask!.IsCompletedSuccessfully);
+        // Under load the stop can win the race with BackgroundService's Task.Run, leaving ExecuteTask cancelled
+        // without running the accept loop (see Stop_BeforeAcceptLoopRuns_ClosesTheListeningSocket); it must never fault.
+        var execute = listener.ExecuteTask!;
+        Assert.True(execute is { IsCompleted: true, IsFaulted: false }, $"accept loop ended {execute.Status}: {execute.Exception}");
         Assert.Equal(0, listener.ActiveConnectionCount);
         Assert.False(listener.IsListening);
         await Task.WhenAll(attempts).WithinSafetyTimeout();
+        await Assert.ThrowsAnyAsync<SocketException>(() => RtmpTestClient.ConnectAsync(endPoint));
+        Assert.Single(_server.Logs.GetSnapshot(), static r => r.Id.Id == 5005);
     }
 
     /// <summary>Verifies that a TCP reset while publishing ends the session as a disconnect and the listener keeps accepting.</summary>
@@ -318,6 +324,33 @@ public sealed class RtmpListenerTests : IAsyncDisposable
         Assert.Contains(_server.Logs.GetSnapshot(), static r => r.Id.Id == 5004);
         Assert.Contains(_server.Logs.GetSnapshot(), static r => r.Id.Id == 5005);
         await Assert.ThrowsAnyAsync<SocketException>(() => RtmpTestClient.ConnectAsync(listener.LocalEndPoint!));
+    }
+
+    /// <summary>
+    /// Verifies that stopping a listener whose accept loop never ran still closes it. <c>BackgroundService</c> starts
+    /// <c>ExecuteAsync</c> with <c>Task.Run</c> on the stopping token, so a stop requested before the thread pool runs
+    /// it (here forced by starting with a cancelled token, as a startup timeout or shutdown during startup does)
+    /// cancels <c>ExecuteTask</c> without running the loop and its shutdown. The listening
+    /// socket must still be closed, <see cref="RtmpListener.IsListening"/> cleared and the stop logged once.
+    /// </summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task Stop_BeforeAcceptLoopRuns_ClosesTheListeningSocket()
+    {
+        _listener = _server.CreateListener();
+        await _listener.StartAsync(new CancellationToken(canceled: true));
+        var endPoint = _listener.LocalEndPoint!;
+        Assert.True(_listener.IsListening);
+
+        await _listener.StopAsync(TestContext.Current.CancellationToken).WithinSafetyTimeout();
+        await _listener.StopAsync(TestContext.Current.CancellationToken).WithinSafetyTimeout();
+
+        Assert.True(_listener.ExecuteTask!.IsCanceled);
+        Assert.False(_listener.IsListening);
+        Assert.Equal(0, _listener.ActiveConnectionCount);
+        await Assert.ThrowsAnyAsync<SocketException>(() => RtmpTestClient.ConnectAsync(endPoint));
+        Assert.Single(_server.Logs.GetSnapshot(), static r => r.Id.Id == 5004);
+        Assert.Single(_server.Logs.GetSnapshot(), static r => r.Id.Id == 5005);
     }
 
     /// <summary>Verifies that binding to a port in use fails start with the socket error as the inner exception.</summary>

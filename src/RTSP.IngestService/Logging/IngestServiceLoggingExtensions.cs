@@ -32,7 +32,7 @@ public static class IngestServiceLoggingExtensions
         logging.ClearProviders();
         logging.Services.AddSingleton<ILoggerProvider>(sp => new SerilogLoggerProvider(
             SerilogPipeline.CreateLogger(
-                sp.GetRequiredService<IOptions<ApplicationOptions>>().Value,
+                sp.GetRequiredService<ApplicationIdentity>(),
                 sp.GetRequiredService<IOptions<FileLoggingOptions>>().Value,
                 sp.GetRequiredService<IHostEnvironment>(),
                 mode),

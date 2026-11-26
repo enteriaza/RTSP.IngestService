@@ -5,7 +5,10 @@ using Microsoft.Extensions.Options;
 
 namespace RTSP.IngestService.Configuration;
 
-/// <summary>Validates <see cref="ApplicationOptions"/> against its data annotations.</summary>
+/// <summary>
+/// Validates <see cref="ApplicationOptions"/> against its data annotations and
+/// <see cref="System.ComponentModel.DataAnnotations.IValidatableObject"/> rules.
+/// </summary>
 [OptionsValidator]
 public sealed partial class ApplicationOptionsValidator : IValidateOptions<ApplicationOptions>;
 

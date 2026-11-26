@@ -6,8 +6,10 @@
     <Sdk Name="StuDev.AotAnywhere" Version="1.1.0" />
 
     <PropertyGroup>
-        <RootNamespace>RTSP.IngestService</RootNamespace>
+        <!-- The one source of the application name (ApplicationIdentity), the executable's file name and the root
+             namespace. The Windows Service name is a separate constant, ApplicationIdentity.WindowsServiceName. -->
         <AssemblyName>RTSP.IngestService</AssemblyName>
+        <RootNamespace>$(AssemblyName)</RootNamespace>
         <InvariantGlobalization>true</InvariantGlobalization>
         <PublishAot>true</PublishAot>
         <EnableConfigurationBindingGenerator>true</EnableConfigurationBindingGenerator>

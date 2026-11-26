@@ -24,7 +24,6 @@ public sealed class RtpQosTests
     /// <summary>A valid unicast output.</summary>
     private static readonly Dictionary<string, string?> Valid = new()
     {
-        ["Application:Name"] = "TestService",
         ["Rtp:Outputs:0:Name"] = "studio-a",
         ["Rtp:Outputs:0:Application"] = "live",
         ["Rtp:Outputs:0:Stream"] = "camera1",

@@ -25,7 +25,7 @@ public sealed class TelemetryOptionsTests
     public void Defaults_ExportIsDisabled()
     {
         var shipped = new ConfigurationBuilder().SetBasePath(AppContext.BaseDirectory).AddJsonFile("appsettings.json", optional: false).Build();
-        var absent = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { ["Application:Name"] = "TestService" }).Build();
+        var absent = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>()).Build();
 
         foreach (var configuration in new IConfiguration[] { shipped, absent })
         {
@@ -99,7 +99,7 @@ public sealed class TelemetryOptionsTests
     [InlineData("Telemetry:Otlp:ExportInterval", "soon")]
     public void UnknownOrUnconvertible_FailsValidation(string key, string value)
     {
-        var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { ["Application:Name"] = "TestService", [key] = value }).Build();
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { [key] = value }).Build();
 
         var ex = Assert.Throws<OptionsValidationException>(() => Resolve(configuration));
         Assert.Contains("Telemetry", ex.Message, StringComparison.Ordinal);
@@ -154,7 +154,6 @@ public sealed class TelemetryOptionsTests
     {
         var values = new Dictionary<string, string?>
         {
-            ["Application:Name"] = "TestService",
             ["Telemetry:Otlp:Enabled"] = enabled,
             ["Telemetry:Otlp:Protocol"] = protocol,
             ["Telemetry:Otlp:ExportInterval"] = interval,

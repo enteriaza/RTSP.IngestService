@@ -44,7 +44,12 @@ $GlobalJson = Join-Path $RepoRoot 'global.json'
 $SystemdUnit = Join-Path $RepoRoot 'deploy\linux\rtsp-ingest-service.service'
 $ReleaseRoot = Join-Path $RepoRoot 'Releases'
 $StagingParent = Join-Path $RepoRoot '.artifacts\release-staging'
-$ExeBaseName = 'RTSP.IngestService'
+# The executable's base name is the project's AssemblyName, the one source of the application name.
+$ExeBaseName = if (Test-Path -LiteralPath $Project -PathType Leaf) {
+    $node = ([xml](Get-Content -LiteralPath $Project -Raw)).SelectSingleNode('/Project/PropertyGroup/AssemblyName')
+    if ($null -eq $node -or [string]::IsNullOrWhiteSpace($node.InnerText)) { throw "$Project does not define AssemblyName." }
+    $node.InnerText.Trim()
+}
 $AotAnywhereSdk = 'StuDev.AotAnywhere'
 
 # Files published but deliberately not shipped. Anything else not allow-listed fails the run.
@@ -346,7 +351,7 @@ $logDir = Join-Path $StagingParent 'logs'
 $current = $null
 $installed = @()
 try {
-    Write-Step "RTSP.IngestService Native AOT release: $($selected -join ', ')"
+    Write-Step "$ExeBaseName Native AOT release: $($selected -join ', ')"
     Write-Host "Repository: $RepoRoot"
     Assert-Prerequisites -Selected $selected
     New-Item -ItemType Directory -Path $stagingRoot, $logDir -Force | Out-Null
@@ -396,7 +401,7 @@ try {
 
     if ($selected -contains 'linux-x64') {
         Write-Host ''
-        Write-Host 'Linux install: copy RTSP.IngestService and appsettings.json to /opt/rtsp-ingest-service/ (chmod 0755 the'
+        Write-Host "Linux install: copy $ExeBaseName and appsettings.json to /opt/rtsp-ingest-service/ (chmod 0755 the"
         Write-Host 'executable) and systemd/rtsp-ingest-service.service to /etc/systemd/system/; see docs/deployment/linux.md.'
     }
 }

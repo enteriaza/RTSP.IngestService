@@ -487,7 +487,7 @@ public sealed class InMemoryHlsSegmentStoreTests : IDisposable
     /// <summary>Collects eviction measurements.</summary>
     /// <returns>The collector.</returns>
     private MetricCollector<long> Evictions() =>
-        new(_services.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>(), "RTSP.IngestService.Hls", "hls.storage.evictions");
+        new(_services.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>(), HlsMetrics.MeterName, "hls.storage.evictions");
 
     /// <summary>Opens a stream.</summary>
     /// <param name="store">The store.</param>

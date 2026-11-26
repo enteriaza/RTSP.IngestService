@@ -47,7 +47,7 @@ public sealed class SerilogPipelineTests : IDisposable
 
     /// <summary>
     /// Verifies that with file logging enabled the log directory is created and each event is written as a JSON line
-    /// carrying the rendered message and the Application, Environment and HostingMode properties.
+    /// carrying the rendered message, the application and deployment identity, Environment and HostingMode.
     /// </summary>
     [Fact]
     public void CreateLogger_FileEnabled_WritesStructuredJson()
@@ -55,7 +55,7 @@ public sealed class SerilogPipelineTests : IDisposable
         var environment = new TestEnvironment { EnvironmentName = "Staging", ContentRootPath = _directory };
         var fileOptions = new FileLoggingOptions { Mode = FileLoggingMode.Enabled, Path = "nested/logs/test-.log" };
 
-        using (var logger = SerilogPipeline.CreateLogger(new ApplicationOptions { Name = "PipelineTest" }, fileOptions, environment, HostingMode.WindowsService))
+        using (var logger = SerilogPipeline.CreateLogger(Identity(), fileOptions, environment, HostingMode.WindowsService))
         {
             Assert.True(Directory.Exists(Path.Combine(_directory, "nested", "logs")));
             logger.Information("Processed {Count} items", 3);
@@ -67,7 +67,12 @@ public sealed class SerilogPipelineTests : IDisposable
         Assert.Equal("Processed 3 items", root.GetProperty("RenderedMessage").GetString());
         var properties = root.GetProperty("Properties");
         Assert.Equal(3, properties.GetProperty("Count").GetInt32());
-        Assert.Equal("PipelineTest", properties.GetProperty("Application").GetString());
+        Assert.Equal(ApplicationIdentity.ServiceAssemblyName, properties.GetProperty("ApplicationName").GetString());
+        Assert.Equal("i-0123456789abcdef0", properties.GetProperty("ApplicationInstanceId").GetString());
+        Assert.Equal("node01.af-south-1", properties.GetProperty("ApplicationNodeId").GetString());
+        Assert.Equal("af-south-1", properties.GetProperty("ApplicationRegion").GetString());
+        Assert.Equal("af-south-1a", properties.GetProperty("ApplicationAvailabilityZone").GetString());
+        Assert.False(properties.TryGetProperty("Application", out _));
         Assert.Equal("Staging", properties.GetProperty("Environment").GetString());
         Assert.Equal("WindowsService", properties.GetProperty("HostingMode").GetString());
     }
@@ -82,7 +87,7 @@ public sealed class SerilogPipelineTests : IDisposable
         var environment = new TestEnvironment { ContentRootPath = _directory };
         var fileOptions = new FileLoggingOptions { Mode = FileLoggingMode.Enabled, Path = "logs/test-.log" };
 
-        using (var logger = SerilogPipeline.CreateLogger(new ApplicationOptions { Name = "PipelineTest" }, fileOptions, environment, HostingMode.WindowsService))
+        using (var logger = SerilogPipeline.CreateLogger(Identity(), fileOptions, environment, HostingMode.WindowsService))
         {
             for (var i = 0; i < 500; i++)
             {
@@ -115,10 +120,10 @@ public sealed class SerilogPipelineTests : IDisposable
             new DateTimeOffset(2026, 1, 2, 3, 4, 5, 678, TimeSpan.FromHours(2)),
             LogEventLevel.Information,
             exception: null,
-            new MessageTemplateParser().Parse("Session {SessionId} on {Application} ended ({Completed}): {Reason} after {Duration}"),
+            new MessageTemplateParser().Parse("Session {SessionId} on {RtmpApplication} ended ({Completed}): {Reason} after {Duration}"),
             [
                 new LogEventProperty("SessionId", new ScalarValue(Guid.Parse("01a214a9-d3ad-7c7c-b808-311b8e0eee4e"))),
-                new LogEventProperty("Application", new ScalarValue("live")),
+                new LogEventProperty("RtmpApplication", new ScalarValue("live")),
                 new LogEventProperty("Completed", new ScalarValue(true)),
                 new LogEventProperty("Reason", new ScalarValue(HostingMode.Console)),
                 new LogEventProperty("Duration", new ScalarValue(TimeSpan.FromSeconds(30))),
@@ -133,6 +138,64 @@ public sealed class SerilogPipelineTests : IDisposable
             output.ToString());
     }
 
+    /// <summary>
+    /// Verifies that the identity cannot be overwritten: message-template and log-context properties with the identity
+    /// names (as an RTMP application name once could) are replaced by the service's values on every event, and that
+    /// RTMP's own <c>RtmpApplication</c> property is kept.
+    /// </summary>
+    [Fact]
+    public void CreateLogger_IdentityOverridesEventAndContextProperties()
+    {
+        var environment = new TestEnvironment { ContentRootPath = _directory };
+        var fileOptions = new FileLoggingOptions { Mode = FileLoggingMode.Enabled, Path = "logs/test-.log" };
+
+        using (var logger = SerilogPipeline.CreateLogger(Identity(), fileOptions, environment, HostingMode.Console))
+        {
+            logger.Information("Connected to {RtmpApplication} as {ApplicationName} on {ApplicationNodeId}", "live", "live", "spoofed");
+            using (Serilog.Context.LogContext.PushProperty("ApplicationRegion", "spoofed"))
+            {
+                logger.Information("In context");
+            }
+        }
+
+        var lines = File.ReadAllLines(Assert.Single(Directory.GetFiles(Path.Combine(_directory, "logs"))));
+        Assert.Equal(2, lines.Length);
+        Assert.All(lines, static line =>
+        {
+            using var json = JsonDocument.Parse(line);
+            var properties = json.RootElement.GetProperty("Properties");
+            Assert.Equal(ApplicationIdentity.ServiceAssemblyName, properties.GetProperty("ApplicationName").GetString());
+            Assert.Equal("node01.af-south-1", properties.GetProperty("ApplicationNodeId").GetString());
+            Assert.Equal("af-south-1", properties.GetProperty("ApplicationRegion").GetString());
+        });
+        using var first = JsonDocument.Parse(lines[0]);
+        Assert.Equal("live", first.RootElement.GetProperty("Properties").GetProperty("RtmpApplication").GetString());
+    }
+
+    /// <summary>
+    /// Verifies that unconfigured deployment values are absent, not empty, while the application name is always present.
+    /// </summary>
+    [Fact]
+    public void CreateLogger_OmitsUnconfiguredDeploymentIdentity()
+    {
+        var environment = new TestEnvironment { ContentRootPath = _directory };
+        var fileOptions = new FileLoggingOptions { Mode = FileLoggingMode.Enabled, Path = "logs/test-.log" };
+
+        using (var logger = SerilogPipeline.CreateLogger(Identity(new ApplicationOptions { NodeId = "node07" }), fileOptions, environment, HostingMode.Console))
+        {
+            logger.Information("Event");
+        }
+
+        using var json = JsonDocument.Parse(Assert.Single(File.ReadAllLines(Assert.Single(Directory.GetFiles(Path.Combine(_directory, "logs"))))));
+        var properties = json.RootElement.GetProperty("Properties");
+        Assert.Equal(ApplicationIdentity.ServiceAssemblyName, properties.GetProperty("ApplicationName").GetString());
+        Assert.Equal("node07", properties.GetProperty("ApplicationNodeId").GetString());
+        foreach (var absent in new[] { "ApplicationInstanceId", "ApplicationRegion", "ApplicationAvailabilityZone", "Application" })
+        {
+            Assert.False(properties.TryGetProperty(absent, out _), absent);
+        }
+    }
+
     /// <summary>Verifies that no file is written when file logging is disabled.</summary>
     [Fact]
     public void CreateLogger_FileDisabled_WritesNoFile()
@@ -140,7 +203,7 @@ public sealed class SerilogPipelineTests : IDisposable
         var environment = new TestEnvironment { ContentRootPath = _directory };
         var fileOptions = new FileLoggingOptions { Mode = FileLoggingMode.Disabled, Path = "logs/test-.log" };
 
-        using (var logger = SerilogPipeline.CreateLogger(new ApplicationOptions { Name = "PipelineTest" }, fileOptions, environment, HostingMode.WindowsService))
+        using (var logger = SerilogPipeline.CreateLogger(Identity(), fileOptions, environment, HostingMode.WindowsService))
         {
             logger.Information("Not written to a file");
         }
@@ -222,6 +285,15 @@ public sealed class SerilogPipelineTests : IDisposable
 
         Assert.Equal("<6>RTSP.IngestService.Test: svc in Systemd mode after 00:01:30\n", output.ToString());
     }
+
+    /// <summary>
+    /// Creates the identity of the service assembly (as when it is the entry assembly) with a deployment identity.
+    /// </summary>
+    /// <param name="deployment">The deployment identity; a full example identity if omitted.</param>
+    /// <returns>The identity.</returns>
+    private static ApplicationIdentity Identity(ApplicationOptions? deployment = null) => ApplicationIdentity.Create(
+        typeof(SerilogPipeline).Assembly,
+        deployment ?? new ApplicationOptions { InstanceId = "i-0123456789abcdef0", NodeId = "node01.af-south-1", Region = "af-south-1", AvailabilityZone = "af-south-1a" });
 
     /// <summary>Deletes the temporary directory.</summary>
     public void Dispose()

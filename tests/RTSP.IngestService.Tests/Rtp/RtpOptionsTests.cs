@@ -20,7 +20,6 @@ public sealed class RtpOptionsTests
     /// <summary>A valid unicast output.</summary>
     private static readonly Dictionary<string, string?> Valid = new()
     {
-        ["Application:Name"] = "TestService",
         ["Rtp:Outputs:0:Name"] = "studio-a",
         ["Rtp:Outputs:0:Application"] = "live",
         ["Rtp:Outputs:0:Stream"] = "camera1",
@@ -57,7 +56,7 @@ public sealed class RtpOptionsTests
         using var provider = new ServiceCollection().AddIngestServiceOptions(configuration).BuildServiceProvider();
 
         Assert.Empty(provider.GetRequiredService<IOptions<RtpOptions>>().Value.Outputs);
-        Assert.Empty(Bind(new Dictionary<string, string?> { ["Application:Name"] = "TestService" }).Outputs);
+        Assert.Empty(Bind(new Dictionary<string, string?>()).Outputs);
     }
 
     /// <summary>Verifies every setting binds, for a multicast IPv4 output and an IPv6 unicast output.</summary>
@@ -173,7 +172,7 @@ public sealed class RtpOptionsTests
     [Fact]
     public void TooManyOutputs_FailValidation()
     {
-        var values = new Dictionary<string, string?> { ["Application:Name"] = "TestService" };
+        var values = new Dictionary<string, string?>();
         for (var i = 0; i <= RtpOptions.MaxOutputs; i++)
         {
             values[$"Rtp:Outputs:{i}:Name"] = $"out{i}";
@@ -209,7 +208,6 @@ public sealed class RtpOptionsTests
         }
 
         var configured = new Dictionary<string, string?>(Valid);
-        configured.Remove("Application:Name");
         using (var host = TestHosts.CreateBuilder(new FakeLogCollector(), overrides: configured).Build())
         {
             var handler = Assert.IsType<RtpOutputHandler>(host.Services.GetRequiredService<IMediaSessionHandler>());

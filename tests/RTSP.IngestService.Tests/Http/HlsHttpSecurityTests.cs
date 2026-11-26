@@ -625,7 +625,6 @@ public sealed class HlsHttpSecurityTests : IAsyncDisposable
     /// <returns>The options.</returns>
     private static HttpOriginOptions Bind(Dictionary<string, string?> values)
     {
-        values["Application:Name"] = "TestService";
         var configuration = new ConfigurationBuilder().AddInMemoryCollection(values).Build();
         using var provider = new ServiceCollection().AddIngestServiceOptions(configuration).BuildServiceProvider();
         return provider.GetRequiredService<IOptions<HttpOriginOptions>>().Value;

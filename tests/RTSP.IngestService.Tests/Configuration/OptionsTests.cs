@@ -17,8 +17,8 @@ namespace RTSP.IngestService.Tests.Configuration;
 /// </summary>
 public sealed class OptionsTests
 {
-    /// <summary>The only value that has no code default.</summary>
-    private static readonly Dictionary<string, string?> MinimalConfiguration = new() { ["Application:Name"] = "TestService" };
+    /// <summary>An empty configuration: every value has a code default or is optional.</summary>
+    private static readonly Dictionary<string, string?> MinimalConfiguration = [];
 
     /// <summary>
     /// Verifies that the appsettings.json shipped with the application binds and validates, with the documented
@@ -33,7 +33,11 @@ public sealed class OptionsTests
             .Build();
         using var provider = BuildProvider(configuration);
 
-        Assert.Equal("RTSP.IngestService", provider.GetRequiredService<IOptions<ApplicationOptions>>().Value.Name);
+        var deployment = provider.GetRequiredService<IOptions<ApplicationOptions>>().Value;
+        Assert.Null(deployment.InstanceId);
+        Assert.Null(deployment.NodeId);
+        Assert.Null(deployment.Region);
+        Assert.Null(deployment.AvailabilityZone);
 
         var lifetime = provider.GetRequiredService<IOptions<LifetimeOptions>>().Value;
         Assert.Equal(TimeSpan.FromMinutes(1), lifetime.StartupTimeout);
@@ -71,7 +75,7 @@ public sealed class OptionsTests
     {
         using var provider = BuildProvider(new Dictionary<string, string?>
         {
-            ["Application:Name"] = "edge-01.ingest",
+            ["Application:NodeId"] = "edge-01.ingest",
             ["Lifetime:StartupTimeout"] = "00:02:00",
             ["Lifetime:ShutdownTimeout"] = "00:00:45",
             ["FileLogging:Mode"] = "enabled",
@@ -80,7 +84,7 @@ public sealed class OptionsTests
             ["FileLogging:FileSizeLimitMegabytes"] = "10",
         });
 
-        Assert.Equal("edge-01.ingest", provider.GetRequiredService<IOptions<ApplicationOptions>>().Value.Name);
+        Assert.Equal("edge-01.ingest", provider.GetRequiredService<IOptions<ApplicationOptions>>().Value.NodeId);
         Assert.Equal(TimeSpan.FromMinutes(2), provider.GetRequiredService<IOptions<LifetimeOptions>>().Value.StartupTimeout);
         Assert.Equal(TimeSpan.FromSeconds(45), provider.GetRequiredService<IOptions<LifetimeOptions>>().Value.ShutdownTimeout);
         var fileLogging = provider.GetRequiredService<IOptions<FileLoggingOptions>>().Value;
@@ -88,31 +92,6 @@ public sealed class OptionsTests
         Assert.Equal("/var/log/streaming/service-.log", fileLogging.Path);
         Assert.Equal(7, fileLogging.RetainedFileCountLimit);
         Assert.Equal(10, fileLogging.FileSizeLimitMegabytes);
-    }
-
-    /// <summary>Verifies that a missing application name fails validation and the failure names the member.</summary>
-    [Fact]
-    public void MissingApplicationName_FailsValidation()
-    {
-        using var provider = BuildProvider(new Dictionary<string, string?>());
-
-        var ex = Assert.Throws<OptionsValidationException>(() => provider.GetRequiredService<IOptions<ApplicationOptions>>().Value);
-        Assert.Contains(nameof(ApplicationOptions.Name), ex.Message, StringComparison.Ordinal);
-    }
-
-    /// <summary>Verifies that application names violating the documented pattern fail validation.</summary>
-    /// <param name="name">An invalid name.</param>
-    [Theory]
-    [InlineData(" ")]
-    [InlineData("1service")]
-    [InlineData("has space")]
-    [InlineData("slash/name")]
-    [InlineData("a2345678901234567890123456789012345678901234567890123456789012345")]
-    public void InvalidApplicationName_FailsValidation(string name)
-    {
-        using var provider = BuildProvider(new Dictionary<string, string?> { ["Application:Name"] = name });
-
-        Assert.Throws<OptionsValidationException>(() => provider.GetRequiredService<IOptions<ApplicationOptions>>().Value);
     }
 
     /// <summary>

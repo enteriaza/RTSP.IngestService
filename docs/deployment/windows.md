@@ -44,6 +44,16 @@ Production overrides belong in `appsettings.Production.json` next to the executa
 `Production` unless `DOTNET_ENVIRONMENT` is set for the service). Do not put credentials in configuration files that are
 committed to source control.
 
+The service name is always `RTSP.IngestService`; the service registers under that name whatever the configuration,
+so install the service with that name. To tell nodes apart in logs and telemetry, set the optional deployment identity
+per machine in `appsettings.Production.json`. `Application:Name` is not a setting: the service fails to start with
+exit code 78 if it is configured (see
+[Application and deployment identity](../architecture.md#application-and-deployment-identity)).
+
+```json
+{ "Application": { "InstanceId": "i-0a1b2c3d4e5f60718", "NodeId": "ingest-a", "Region": "eu-west-2", "AvailabilityZone": "eu-west-2a" } }
+```
+
 The RTMP listener accepts publishers on TCP 1935 by default (`Rtmp:ListenAddress`, `Rtmp:Port`). Allow it through the
 firewall, ideally only from encoder networks:
 

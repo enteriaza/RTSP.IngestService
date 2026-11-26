@@ -28,7 +28,8 @@ namespace RTSP.IngestService.Rtmp;
 /// cancelled. Each connection ends its publishing sessions with <see cref="PublishEndReason.ServerShutdown"/>,
 /// notifies the <see cref="IPublishSessionHandler"/> and closes its socket. <see cref="BackgroundService.StopAsync"/>
 /// waits for this within the host shutdown timeout; publishers are disconnected rather than drained because a
-/// live publisher never stops on its own.
+/// live publisher never stops on its own. A stop that arrives before the accept loop runs closes the listening socket
+/// in <see cref="StopAsync"/> instead; see its remarks.
 /// </para>
 /// <para>
 /// A failure in one connection never affects the listener or other connections. An unexpected failure of the
@@ -88,6 +89,9 @@ public sealed partial class RtmpListener : BackgroundService
 
     /// <summary>Whether the socket is bound and accepting; see <see cref="IsListening"/>.</summary>
     private volatile bool _listening;
+
+    /// <summary>Set once by <see cref="StopAsync"/> when it closed a listener whose accept loop never ran.</summary>
+    private int _stoppedWithoutLoop;
 
     /// <summary>Initializes a new instance of the <see cref="RtmpListener"/> class.</summary>
     /// <param name="options">The RTMP options.</param>
@@ -198,6 +202,30 @@ public sealed partial class RtmpListener : BackgroundService
     /// itself, clamped to 200 – 65535. Elsewhere a negative value would mean the system maximum, so the backlog is passed as is.
     /// </remarks>
     internal static void Listen(Socket socket, int backlog) => socket.Listen(OperatingSystem.IsWindows() ? -backlog : backlog);
+
+    /// <summary>
+    /// Stops the accept loop and waits for it to close every connection, or closes the listening socket itself if the
+    /// loop never ran.
+    /// </summary>
+    /// <param name="cancellationToken">Ends the wait for the accept loop (the host shutdown timeout).</param>
+    /// <returns>A task that completes when the listener has stopped or the wait has ended.</returns>
+    /// <remarks>
+    /// <c>BackgroundService</c> starts <see cref="ExecuteAsync"/> through <c>Task.Run</c> on the stopping token, so a
+    /// stop requested before the thread pool runs it (a startup timeout or a shutdown during startup, or a stop right
+    /// after start under load) cancels <see cref="BackgroundService.ExecuteTask"/> without running the loop. No
+    /// connection was admitted then, so closing the socket completes the shutdown.
+    /// </remarks>
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        await base.StopAsync(cancellationToken).ConfigureAwait(false);
+        if (ExecuteTask is { IsCanceled: true } && Interlocked.Exchange(ref _stoppedWithoutLoop, 1) == 0)
+        {
+            _listening = false;
+            _socket?.Dispose();
+            LogStopping(0);
+            LogStopped();
+        }
+    }
 
     /// <summary>Closes the listening socket if the accept loop never ran, then disposes the base service.</summary>
     public override void Dispose()

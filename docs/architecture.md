@@ -16,6 +16,7 @@ logging), the RTMP ingest server, media processing, HLS packaging, the HTTP HLS 
 | systemd | `Hosting/SystemdWatchdogService`, `SystemdWatchdogSettings` | Send `WATCHDOG=1` at half of `WATCHDOG_USEC`. |
 | Lifecycle | `Lifecycle/ApplicationLifecycle`, `ApplicationLifecycleCoordinator` | Application state machine and readiness, driven by host events. |
 | Configuration | `Configuration/*Options`, `IngestServiceOptionsExtensions` | Strict binding, source-generated validation, fail fast at startup. |
+| Identity | `Configuration/ApplicationIdentity`, `Logging/ApplicationIdentityEnricher` | Application name from the entry assembly and the configured deployment identity, on logs and the telemetry resource (see [Application and deployment identity](#application-and-deployment-identity)). |
 | Logging | `Logging/SerilogPipeline`, `SystemdConsoleFormatter`, `BoundedAsyncSink`, `BufferedConsoleSink` | Serilog sinks per hosting mode, written asynchronously through a bounded queue; bootstrap logger for pre-host failures. |
 | RTMP ingest | `Rtmp/*` | RTMP publishing server: listener, connections, chunk protocol, AMF0, sessions (see [RTMP ingest](#rtmp-ingest)). |
 | Media processing | `Media/*` | H.264/AAC parsing into typed samples and stream descriptions (see [Media processing](#media-processing)). |
@@ -93,7 +94,8 @@ RTMP settings are listed under [RTMP ingest](#configuration-1).
 
 | Section | Key | Default | Valid range |
 |---------|-----|---------|-------------|
-| `Application` | `Name` | Required (`RTSP.IngestService` in `appsettings.json`) | Letter followed by up to 63 of `A-Z a-z 0-9 . _ -` |
+| `Application` | `InstanceId`, `NodeId` | Optional, unset | Up to 128 of `A-Z a-z 0-9 . _ : -`, starting and ending with a letter or digit ([identity](#application-and-deployment-identity)) |
+| `Application` | `Region`, `AvailabilityZone` | Optional, unset | Up to 64, same characters |
 | `Lifetime` | `StartupTimeout` | `00:01:00` | 1 s – 1 h |
 | `Lifetime` | `ShutdownTimeout` | `00:00:30` | 1 s – 10 min |
 | `FileLogging` | `Mode` | `Auto` | `Auto` (Windows service only), `Enabled`, `Disabled` |
@@ -124,7 +126,10 @@ source-generated (`[OptionsValidator]`), which keeps the Native AOT build free o
 | Systemd | Standard output, one line per event with a `<priority>` prefix for journald. |
 | WindowsService | Rolling JSON file (`FileLogging`). |
 
-All events carry `Application`, `Environment`, `HostingMode`, `MachineName` and `ProcessId`. Log levels come from the
+All events carry `ApplicationName`, `Environment`, `HostingMode`, `MachineName` and `ProcessId`, and, when configured,
+`ApplicationInstanceId`, `ApplicationNodeId`, `ApplicationRegion` and `ApplicationAvailabilityZone`
+([identity](#application-and-deployment-identity)). These are structured properties: they appear in the JSON file sink;
+the console and systemd output templates are unchanged and show the identity once, in event 4008 at startup. Log levels come from the
 `Logging:LogLevel` configuration section. Configuration values are never logged wholesale; only timeouts and the
 hosting environment are logged at startup.
 
@@ -142,7 +147,7 @@ logger writes synchronously.
 |-----------|--------|
 | 1000–1002, 1100 | Application lifecycle |
 | 2000–2003 | systemd watchdog |
-| 4000–4007 | Service runner |
+| 4000–4008 | Service runner (4008: application identity) |
 | 5000–5006 | RTMP listener |
 | 5100–5108 | RTMP connection |
 | 5200–5212 | RTMP session and publishing |
@@ -154,6 +159,67 @@ logger writes synchronously.
 | 9200–9202 | Stream catalog |
 | 9300–9302 | Telemetry export |
 | 9400–9411 | RTP output |
+
+## Application and deployment identity
+
+Four identities are kept apart:
+
+| Identity | Source | Same on every node | Used for |
+|----------|--------|--------------------|----------|
+| Application name | Entry assembly name, `RTSP.IngestService` (`ApplicationIdentity.Name`), from the project's `AssemblyName` | Yes | `service.name`, `ApplicationName`, the executable's file name, SDP `a=tool` |
+| Deployment identity | `Application:InstanceId`, `NodeId`, `Region`, `AvailabilityZone` (all optional) | No | Resource attributes and log properties |
+| Windows Service name | Constant `ApplicationIdentity.WindowsServiceName`, `RTSP.IngestService` | Yes | The SCM registration |
+| RTMP application | The `app` of an RTMP `connect` | Per publish | `{RtmpApplication}` in RTMP events, publisher credentials |
+
+**Application name.** `ApplicationIdentity` takes the name from `Assembly.GetEntryAssembly()`. It cannot be configured:
+`Application:Name` (in a file or as `Application__Name`) is rejected at startup with exit code 78 and a message that
+says to remove it. A process without an entry assembly, or with an unnamed one, fails at startup rather than inventing a
+name. The name is the same under Native AOT. Its one source is `<AssemblyName>` in `RTSP.IngestService.csproj`:
+`ApplicationIdentity.ServiceAssemblyName` reads it from the service assembly's metadata for code that names the
+service outside a host (the `publisher-key` usage text, the SDP `a=tool` attribute, the bootstrap log category), and
+`tools/Publish-Release.ps1` reads it from the project file. `ApplicationIdentityTests` pins it, so an accidental
+rename fails the build's tests.
+
+**Deployment identity.** The four settings describe where this process runs. They are read from configuration only;
+nothing is discovered from cloud metadata, nothing is generated, and nothing is cloud-specific (`Region` is any
+region name, not only an AWS one). Each is optional: an unset value is omitted everywhere, never sent empty. An empty
+or whitespace value, a value longer than its limit, a value not starting and ending with a letter or digit, or a
+character other than `A-Z a-z 0-9 . _ : -` is a configuration error (exit 78). The values are stable across restarts,
+since they come from configuration.
+
+| Setting | OpenTelemetry resource attribute | Log property |
+|---------|----------------------------------|--------------|
+| (entry assembly) | `service.name` | `ApplicationName` |
+| `InstanceId` | `service.instance.id` | `ApplicationInstanceId` |
+| `NodeId` | `application.node.id` | `ApplicationNodeId` |
+| `Region` | `cloud.region` | `ApplicationRegion` |
+| `AvailabilityZone` | `cloud.availability_zone` | `ApplicationAvailabilityZone` |
+
+The resource also carries the SDK's `telemetry.sdk.*` attributes and nothing else. It is built from the identity alone,
+so `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` are ignored. The identity is on the resource only: no metric
+tag carries it. The log properties are added by `ApplicationIdentityEnricher` from values allocated once, and override
+a property of the same name set by a log call or a log scope.
+
+Three nodes behind one load balancer, one per availability zone:
+
+```json
+{ "Application": { "InstanceId": "i-0a1b2c3d4e5f60718", "NodeId": "ingest-a", "Region": "eu-west-2", "AvailabilityZone": "eu-west-2a" } }
+{ "Application": { "InstanceId": "i-0b2c3d4e5f6071829", "NodeId": "ingest-b", "Region": "eu-west-2", "AvailabilityZone": "eu-west-2b" } }
+{ "Application": { "InstanceId": "i-0c3d4e5f607182930", "NodeId": "ingest-c", "Region": "eu-west-2", "AvailabilityZone": "eu-west-2c" } }
+```
+
+All three export `service.name` = `RTSP.IngestService`, so their metrics aggregate as one service; `service.instance.id`
+and `application.node.id` tell them apart and `cloud.availability_zone` groups them by zone. The values are usually set
+per machine through environment variables (`Application__NodeId=ingest-a`) rather than in `appsettings.json`.
+
+**Windows Service name.** The service registers with the SCM as `RTSP.IngestService` on every node, whatever the
+deployment identity; install scripts and monitoring refer to one name. The node is identified by the deployment
+identity, not by the service name. The name is a separate compile-time constant, not derived from the assembly name,
+so renaming the assembly would not rename the installed service.
+
+**RTMP application.** RTMP events 5200, 5204, 5205 and 5206 name the client's RTMP application in the
+`RtmpApplication` property (previously `Application`, which collided with the service-wide property of the same name).
+Event IDs, levels and message text are unchanged.
 
 ## RTMP ingest
 
@@ -1341,8 +1407,10 @@ are exported. There is no distributed tracing, no log export and no Prometheus e
 calls `AddOpenTelemetry().WithMetrics()` from `OpenTelemetry.Extensions.Hosting` and configures the meter provider
 from the validated `Telemetry:Otlp` options when the provider is built. When enabled, it subscribes to every
 application meter by name and adds the SDK's `PeriodicExportingMetricReader` around the `OtlpMetricExporter` from
-`OpenTelemetry.Exporter.OpenTelemetryProtocol` (cumulative temporality, resource `service.name` = `Application:Name`).
-When disabled, the provider has no meter and no reader: no exporter exists and nothing connects.
+`OpenTelemetry.Exporter.OpenTelemetryProtocol` (cumulative temporality). The resource is set whether or not export is
+enabled: `service.name` = the entry assembly name, plus the configured deployment identity
+([identity](#application-and-deployment-identity)). When disabled, the provider has no meter and no reader: no
+exporter exists and nothing connects.
 
 The instruments themselves are unchanged. The existing metrics classes own their instruments, created from the host's
 `IMeterFactory`. The SDK observes them through its own `MeterListener` and exports their names, units, descriptions,
@@ -1352,7 +1420,7 @@ types, values and fixed tag vocabularies as they are. No instrument, meter or ta
 |-------|-------------|
 | `RTSP.IngestService.Rtmp` | 13 ([RTMP metrics](#metrics)) |
 | `RTSP.IngestService.Media` | 7 ([media metrics](#metrics-1)) |
-| `RTSP.IngestService.Hls` | 11 ([HLS metrics](#metrics-2)) |
+| `RTSP.IngestService.Hls` | 15 ([HLS metrics](#metrics-2)) |
 | `RTSP.IngestService.Http` | 7 ([HTTP origin metrics](#metrics-3)) |
 | `RTSP.IngestService.Streams` | 10: four `stream_events.*` and six `stream_catalog.*` ([stream events](#channel-drops-and-metrics), [catalog](#metrics-4)) |
 | `RTSP.IngestService.Rtp` | 8 ([RTP output](#rtp-output)) |
