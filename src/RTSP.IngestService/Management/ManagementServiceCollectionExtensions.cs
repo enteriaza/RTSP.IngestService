@@ -6,6 +6,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using RTSP.IngestService.Http;
 using RTSP.IngestService.Lifecycle;
 using RTSP.IngestService.Rtmp;
+using RTSP.IngestService.Rtp;
 using RTSP.IngestService.Streams;
 
 namespace RTSP.IngestService.Management;
@@ -29,7 +30,8 @@ public static class ManagementServiceCollectionExtensions
             () => sp.GetService<RtmpListener>()?.IsListening == true,
             () => sp.GetService<HlsHttpOrigin>()?.IsListening == true,
             sp.GetRequiredService<ILogger<ManagementEndpoints>>(),
-            sp.GetService<StreamCatalog>()));
+            sp.GetService<StreamCatalog>(),
+            sp.GetService<RtpOutputRegistration>()?.Rtp));
 
         return services;
     }

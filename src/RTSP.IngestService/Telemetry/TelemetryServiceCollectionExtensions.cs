@@ -13,6 +13,7 @@ using RTSP.IngestService.Hls;
 using RTSP.IngestService.Http;
 using RTSP.IngestService.Media;
 using RTSP.IngestService.Rtmp;
+using RTSP.IngestService.Rtp;
 using RTSP.IngestService.Streams;
 
 namespace RTSP.IngestService.Telemetry;
@@ -32,6 +33,7 @@ public static class TelemetryServiceCollectionExtensions
         RtmpMetrics.MeterName,
         MediaMetrics.MeterName,
         HlsMetrics.MeterName,
+        RtpMetrics.MeterName,
         HttpOriginMetrics.MeterName,
         StreamEventMetrics.MeterName,
     ];

@@ -32,6 +32,14 @@ public sealed partial class MediaOptionsValidator : IValidateOptions<MediaOption
 [OptionsValidator]
 public sealed partial class HlsOptionsValidator : IValidateOptions<HlsOptions>;
 
+/// <summary>
+/// Validates <see cref="RtpOptions"/>, including each <see cref="RtpOutputOptions"/> and the <see cref="RtpQosOptions"/> of
+/// <see cref="RtpTransportOptions"/> and of each output, against their data annotations and
+/// <see cref="System.ComponentModel.DataAnnotations.IValidatableObject"/> rules.
+/// </summary>
+[OptionsValidator]
+public sealed partial class RtpOptionsValidator : IValidateOptions<RtpOptions>;
+
 /// <summary>Validates <see cref="HttpOriginOptions"/> against its data annotations.</summary>
 [OptionsValidator]
 public sealed partial class HttpOriginOptionsValidator : IValidateOptions<HttpOriginOptions>;

@@ -2,7 +2,7 @@
 
 RTSP.IngestService is a .NET 10 Generic Host worker that runs unchanged as a console application, a Windows service and a
 systemd service. This document describes the hosting foundation (lifecycle, failure handling, configuration and
-logging), the RTMP ingest server, media processing, HLS packaging and the HTTP HLS origin. Deployment is covered in [deployment/windows.md](deployment/windows.md) and
+logging), the RTMP ingest server, media processing, HLS packaging, the HTTP HLS origin and RTP output. Deployment is covered in [deployment/windows.md](deployment/windows.md) and
 [deployment/linux.md](deployment/linux.md).
 
 ## Components
@@ -21,6 +21,7 @@ logging), the RTMP ingest server, media processing, HLS packaging and the HTTP H
 | Media processing | `Media/*` | H.264/AAC parsing into typed samples and stream descriptions (see [Media processing](#media-processing)). |
 | HLS packaging | `Hls/*` | fMP4 segments and live playlists in a bounded in-memory store (see [HLS packaging](#hls-packaging)). |
 | HTTP HLS origin | `Http/*` | Kestrel-based HTTP/1.1 server for playlists and segments (see [HTTP HLS origin](#http-hls-origin)). |
+| RTP output | `Rtp/*` | Optional RTP/UDP unicast and multicast output of H.264/AAC, decorating the HLS stage; off unless outputs are configured (see [RTP output](#rtp-output)). |
 | Management | `Management/*` | Loopback-only liveness and readiness routes on the same HTTP listener (see [Management endpoints](#management-endpoints)). |
 | Stream events | `Streams/*` | Versioned, best-effort stream lifecycle notifications over one bounded in-process channel (see [Stream lifecycle events](#stream-lifecycle-events)). |
 | Stream catalog | `Streams/StreamCatalog*` | Reconciled, read-only in-memory inventory of stream incarnations, served at `/health/streams` (see [Stream catalog](#stream-catalog)). |
@@ -106,6 +107,8 @@ RTMP settings are listed under [RTMP ingest](#configuration-1).
 | `Telemetry:Otlp` | `Endpoint` | Unset | Required when enabled; absolute `http`/`https` URI without user information, query or fragment |
 | `Telemetry:Otlp` | `Protocol` | `grpc` | `grpc` or `http/protobuf` |
 | `Telemetry:Otlp` | `ExportInterval` | `00:00:15` | 1 s – 5 min |
+| `Rtp` | `Outputs` | Empty (RTP output off) | At most 64; per-output settings in [rtp-output.md](rtp-output.md#configuration) |
+| `Rtp:Transport:Qos` | `Enabled`, `Dscp`, `Ecn` | Off; DSCP 0; ECN 0 | DSCP 0–63, ECN 0–3; overridable per output in `Rtp:Outputs:N:Qos`; see [rtp-output.md](rtp-output.md#qos-marking-dscp-and-ecn) |
 
 Sources, in increasing precedence: `appsettings.json`, `appsettings.{Environment}.json`, environment variables,
 command-line arguments. Binding is strict: unknown keys and unconvertible values are configuration errors. Validators are
@@ -138,6 +141,7 @@ hosting environment are logged at startup.
 | 9100–9102 | Stream event dispatcher |
 | 9200–9202 | Stream catalog |
 | 9300–9302 | Telemetry export |
+| 9400–9411 | RTP output |
 
 ## RTMP ingest
 
@@ -547,7 +551,7 @@ bytes are copied verbatim into `mdat`. The store is served by the [HTTP HLS orig
 
 | Type | Role |
 |------|------|
-| `HlsPackagingHandler` | The host's `IMediaSessionHandler`: one `HlsPackager` per media session, opened in the store at session start |
+| `HlsPackagingHandler` | The host's `IMediaSessionHandler` (decorated by [RTP output](#rtp-output) when outputs are configured): one `HlsPackager` per media session, opened in the store at session start |
 | `HlsPackager` | Per-stream state machine: periods, segment boundaries, timestamp mapping, ownership of pending samples |
 | `Mp4Segments`, `Mp4Writer` | Exact-size initialization (`ftyp`+`moov`) and media (`moof`+`mdat`) segment writers with checked sizes |
 | `AvcSequenceParameterSet` | Minimal SPS reader for the cropped coded dimensions (VUI is not read) |
@@ -845,6 +849,64 @@ audio only.
   then lists the new generation. Cached pre-restart segments are only ever served for their own URLs.
 - No byte ranges, no master playlist, HTTP/1.1 only.
 
+## RTP output
+
+`Rtp/` sends the H.264 and AAC samples of selected published streams as RTP over UDP (RFC 3550; H.264 per RFC 6184,
+AAC per RFC 3640) to unicast receivers or IPv4/IPv6 multicast groups. The full description is in
+[rtp-output.md](rtp-output.md).
+
+- **Composition.** `AddRtpOutput()` runs after `AddHlsPackaging()` and before `AddMediaProcessing()`. When outputs are
+  configured, `RtpOutputHandler` becomes the `IMediaSessionHandler`. It decorates `HlsPackagingHandler`: it packetises
+  each sample and then forwards the same sample to HLS packaging, which disposes it.
+- **No outputs.** With no outputs configured (the default), HLS packaging is the `IMediaSessionHandler` exactly as
+  before, and the RTP management routes are 404.
+- **Per output and publication.** Each output has its own `RtpOutputSession`: a bounded packet ring, one UDP socket
+  and one sender task.
+- **Isolation.** The media path never waits for the network. A full queue drops whole access units, and video then
+  resumes at the next IDR. A failed output stops only itself for that publication.
+- **Configuration.** The `Rtp` section is strictly bound, validated at startup and read once.
+- **QoS marking.** `RtpQosPolicy.Resolve` merges `Rtp:Transport:Qos` with each output's `Qos`, field by field, once
+  at startup.
+  - `RtpUdpSocket`, the one socket type for unicast and multicast, applies the policy through `RtpSocketQos`:
+    `IP_TOS` for IPv4, `IPV6_TCLASS` for IPv6. It does so in its constructor, before any other option or send, and
+    reads the value back.
+  - A rejected or mismatched value throws `RtpQosException`, which fails that session (9402). It never results in
+    unmarked sending reported as marked.
+  - Each session has its own socket, so policies cannot leak between outputs or publications. Disabled marking
+    never touches the option.
+  - At startup, every enabled policy is checked on a probe socket (9409, 9410, 9411).
+  - Nothing happens per packet.
+- **Management.** The output inventory and SDP are served at `/health/rtp` (see
+  [Management endpoints](#management-endpoints)).
+- **Metrics.** Meter `RTSP.IngestService.Rtp`:
+  - `rtp.sessions.active` (`mode`)
+  - `rtp.packets.sent` (`track`, `mode`)
+  - `rtp.bytes.sent` (`track`, `mode`)
+  - `rtp.packets.dropped` (`track`, `reason`)
+  - `rtp.send.errors` (`kind`)
+  - `rtp.rtcp.sent`
+  - `rtp.bitrate`
+  - `rtp.packet_rate`
+
+  Output names, streams, addresses, ports and SSRCs are never tags.
+
+### Events
+
+| ID | Level | Event |
+|----|-------|-------|
+| 9400 | Information | Output session started (mode, destination and family, ports, video SSRC, packet size limit, QoS policy and socket value) |
+| 9401 | Information | Output session ended (final state, packets and bytes sent, packets dropped, send errors) |
+| 9402 | Error | Output session could not start (including QoS marking that cannot be applied); it sends nothing for this publication |
+| 9403 | Error | Output session failed (terminal send error); it sends nothing more for this publication |
+| 9404 | Warning | First transient send error of a session; further errors are counted, not logged |
+| 9405 | Warning | First dropped media of a reason and track in a session; further drops are counted, not logged |
+| 9406 | Warning | Stop drain timed out; queued packets are discarded |
+| 9407 | Information | RTP output enabled at startup (outputs, of which multicast, of which with QoS marking) |
+| 9408 | Error | Packetisation failed; the output sends nothing more for this publication |
+| 9409 | Information | QoS marking of an output applied and verified on a startup probe socket |
+| 9410 | Error | QoS marking of an output cannot be applied on this system; its sessions will fail to start |
+| 9411 | Warning | An output is configured to send ECN CE |
+
 ## Management endpoints
 
 `Management/ManagementEndpoints` adds liveness and readiness routes to the HTTP origin's request pipeline. There is
@@ -860,6 +922,8 @@ affecting HLS, the lifecycle or the service-manager integration.
 | `GET`/`HEAD /health/ready` | The lifecycle is `Running`, the RTMP listener is bound and the HTTP listener is bound | 503 |
 | `GET`/`HEAD /health/streams` | The stream catalog has completed its first reconciliation | 503 `{"status":"initializing"}` |
 | `GET`/`HEAD /health/streams/{application}/{stream}` | As above, and the stream is in the catalog (its current incarnation is returned) | 503 as above; 404 (empty) if unknown |
+| `GET`/`HEAD /health/rtp` | RTP outputs are configured (the output inventory with each output's QoS policy, and active sessions with their socket's traffic class, are returned) | 404 (empty) without outputs |
+| `GET`/`HEAD /health/rtp/{name}.sdp` | The output's stream is published and described (`application/sdp`) | 503 `{"status":"not_publishing"}` or `{"status":"not_described"}`; 404 (empty) for an unknown output |
 
 Bodies are small source-generated JSON documents, for example
 `{"status":"not_ready","state":"Starting","rtmpListener":false,"httpListener":true}` or
@@ -1198,11 +1262,12 @@ types, values and fixed tag vocabularies as they are. No instrument, meter or ta
 
 | Meter | Instruments |
 |-------|-------------|
-| `RTSP.IngestService.Rtmp` | 11 ([RTMP metrics](#metrics)) |
+| `RTSP.IngestService.Rtmp` | 13 ([RTMP metrics](#metrics)) |
 | `RTSP.IngestService.Media` | 7 ([media metrics](#metrics-1)) |
 | `RTSP.IngestService.Hls` | 11 ([HLS metrics](#metrics-2)) |
 | `RTSP.IngestService.Http` | 7 ([HTTP origin metrics](#metrics-3)) |
 | `RTSP.IngestService.Streams` | 10: four `stream_events.*` and six `stream_catalog.*` ([stream events](#channel-drops-and-metrics), [catalog](#metrics-4)) |
+| `RTSP.IngestService.Rtp` | 8 ([RTP output](#rtp-output)) |
 
 ### Configuration
 
@@ -1263,7 +1328,7 @@ diagnostic (warning), 9302 final export incomplete (warning).
 `TelemetryOptionsTests` cover the defaults, every endpoint, protocol and interval rule, unknown keys, exit 78 through
 the service runner and the metrics URI. `TelemetryExportTests` cover export disabled by default (no exporter, no
 connection over the whole host lifetime even with an endpoint configured, and in-process instruments still recording),
-OTLP/HTTP delivery of all five meters to a loopback collector, and every one of the 46 instruments exported through an
+OTLP/HTTP delivery of all six meters to a loopback collector, and every one of the 56 instruments exported through an
 in-memory exporter. That check covers meter, name, unit, description, type, values and tag vocabulary. A real FFmpeg
 publish and HTTP playback must export no identifying tag. `TelemetryHostTests` cover a refusing collector over both
 protocols (listeners bound, ready, lifecycle unaffected, failure logged without the endpoint) and an unresponsive

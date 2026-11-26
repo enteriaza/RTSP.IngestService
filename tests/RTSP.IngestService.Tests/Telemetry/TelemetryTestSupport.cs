@@ -192,6 +192,7 @@ internal static class TelemetryTestSupport
     private static Dictionary<string, IReadOnlyDictionary<string, string[]>> Build()
     {
         string[] track = ["video", "audio"];
+        string[] mode = ["unicast", "multicast"];
         string[] resource = ["playlist", "initialization", "segment", "other"];
         string[] eventType = ["published", "media_described", "ended", "playlist_withdrawn", "drained"];
         static IReadOnlyDictionary<string, string[]> None() => new Dictionary<string, string[]>();
@@ -230,6 +231,14 @@ internal static class TelemetryTestSupport
             ["hls.errors"] = Tags(("kind", ["unsupported_track", "invalid_track", "segment_too_large", "storage_full", "playlist_full"])),
             ["hls.discontinuities"] = Tags(("reason", ["timestamp", "configuration", "timeline_overlap", "dropped_media"])),
             ["hls.samples.dropped"] = Tags(("track", track), ("reason", ["before_sync_sample", "untracked", "too_large", "storage_full", "playlist_full", "timeline_overlap", "aborted"])),
+            ["rtp.sessions.active"] = Tags(("mode", mode)),
+            ["rtp.packets.sent"] = Tags(("track", track), ("mode", mode)),
+            ["rtp.bytes.sent"] = Tags(("track", track), ("mode", mode)),
+            ["rtp.packets.dropped"] = Tags(("track", track), ("reason", ["queue_full", "awaiting_keyframe", "too_large", "send_failed", "output_unavailable"])),
+            ["rtp.send.errors"] = Tags(("kind", ["transient", "terminal"])),
+            ["rtp.rtcp.sent"] = None(),
+            ["rtp.bitrate"] = None(),
+            ["rtp.packet_rate"] = None(),
             ["http.origin.requests"] = Tags(("resource", resource), ("status_class", ["1xx", "2xx", "3xx", "4xx", "5xx"])),
             ["http.origin.requests.active"] = None(),
             ["http.origin.request.duration"] = Tags(("resource", resource)),

@@ -50,7 +50,7 @@ public sealed class ManagementEndpointsTests : IAsyncDisposable
     private bool? _httpListening;
 
     /// <summary>Gets every management path, including unknown ones, for policy tests.</summary>
-    public static TheoryData<string> ManagementPaths => ["/health/live", "/health/ready", "/health/streams", "/health/streams/live/cam", "/health/streams/live/missing", "/health/unknown", "/health/", "/health"];
+    public static TheoryData<string> ManagementPaths => ["/health/live", "/health/ready", "/health/streams", "/health/streams/live/cam", "/health/streams/live/missing", "/health/rtp", "/health/rtp/out.sdp", "/health/unknown", "/health/", "/health"];
 
     /// <summary>Gets the test cancellation token.</summary>
     private static CancellationToken Token => TestContext.Current.CancellationToken;

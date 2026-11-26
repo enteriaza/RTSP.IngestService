@@ -12,6 +12,7 @@ using RTSP.IngestService.Logging;
 using RTSP.IngestService.Management;
 using RTSP.IngestService.Media;
 using RTSP.IngestService.Rtmp;
+using RTSP.IngestService.Rtp;
 using RTSP.IngestService.Streams;
 using RTSP.IngestService.Telemetry;
 
@@ -54,6 +55,7 @@ public static class IngestServiceHost
         builder.Services.AddStreamEvents();
         builder.Services.AddStreamCatalog();
         builder.Services.AddHlsPackaging();
+        builder.Services.AddRtpOutput();
         builder.Services.AddMediaProcessing();
         builder.Services.AddManagementEndpoints();
         builder.Services.AddHlsHttpOrigin();

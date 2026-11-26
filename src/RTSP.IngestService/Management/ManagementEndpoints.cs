@@ -5,7 +5,9 @@
 using System.Net;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http;
+using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Lifecycle;
+using RTSP.IngestService.Rtp;
 using RTSP.IngestService.Streams;
 
 namespace RTSP.IngestService.Management;
@@ -49,6 +51,9 @@ internal sealed partial class ManagementEndpoints
     /// <summary>Stream inventory path; <c>{StreamsPath}/{application}/{stream}</c> is one stream's current incarnation.</summary>
     public const string StreamsPath = "/health/streams";
 
+    /// <summary>RTP output inventory path; <c>{RtpPath}/{output}.sdp</c> is an output's session description.</summary>
+    public const string RtpPath = "/health/rtp";
+
     /// <summary>Cache policy of every management response.</summary>
     public const string CacheControl = "no-store";
 
@@ -73,15 +78,20 @@ internal sealed partial class ManagementEndpoints
     /// <summary>The stream catalog, if the stream inventory is served.</summary>
     private readonly StreamCatalog? _catalog;
 
+    /// <summary>The RTP output stage, if RTP outputs are configured.</summary>
+    private readonly RtpOutputHandler? _rtp;
+
     /// <summary>Initializes a new instance of the <see cref="ManagementEndpoints"/> class.</summary>
     /// <param name="lifecycle">The application lifecycle.</param>
     /// <param name="rtmpListening">Reports whether the RTMP listener is bound; called on every readiness request.</param>
     /// <param name="httpListening">Reports whether the HTTP listener is bound; called on every readiness request.</param>
     /// <param name="logger">Logger.</param>
     /// <param name="catalog">The stream catalog; <see langword="null"/> to not serve the stream inventory (its paths are then 404).</param>
-    public ManagementEndpoints(IApplicationLifecycle lifecycle, Func<bool> rtmpListening, Func<bool> httpListening, ILogger<ManagementEndpoints> logger, StreamCatalog? catalog = null)
+    /// <param name="rtp">The RTP output stage; <see langword="null"/> to not serve the RTP paths (they are then 404).</param>
+    public ManagementEndpoints(IApplicationLifecycle lifecycle, Func<bool> rtmpListening, Func<bool> httpListening, ILogger<ManagementEndpoints> logger, StreamCatalog? catalog = null, RtpOutputHandler? rtp = null)
     {
         _catalog = catalog;
+        _rtp = rtp;
         ArgumentNullException.ThrowIfNull(lifecycle);
         ArgumentNullException.ThrowIfNull(rtmpListening);
         ArgumentNullException.ThrowIfNull(httpListening);
@@ -125,7 +135,9 @@ internal sealed partial class ManagementEndpoints
 
             var path = context.Request.Path.Value;
             (string Application, string Stream)? detail = null;
-            if (path is not (LivePath or ReadyPath) && !(_catalog is not null && IsStreamsPath(path, out detail)))
+            string? sdpOutput = null;
+            var rtp = _rtp is not null && IsRtpPath(path, out sdpOutput);
+            if (path is not (LivePath or ReadyPath) && !rtp && !(_catalog is not null && IsStreamsPath(path, out detail)))
             {
                 response.StatusCode = StatusCodes.Status404NotFound;
                 response.ContentLength = 0;
@@ -144,7 +156,19 @@ internal sealed partial class ManagementEndpoints
 
             int status;
             byte[] bytes;
-            if (path is LivePath or ReadyPath)
+            var contentType = JsonContentType;
+            if (rtp)
+            {
+                if (Rtp(sdpOutput) is not { } answer)
+                {
+                    response.StatusCode = StatusCodes.Status404NotFound;
+                    response.ContentLength = 0;
+                    return;
+                }
+
+                (status, bytes, contentType) = answer;
+            }
+            else if (path is LivePath or ReadyPath)
             {
                 (status, var body) = path == LivePath ? Live() : Ready();
                 bytes = JsonSerializer.SerializeToUtf8Bytes(body, ManagementJsonContext.Default.HealthReport);
@@ -161,7 +185,7 @@ internal sealed partial class ManagementEndpoints
             }
 
             response.StatusCode = status;
-            response.ContentType = JsonContentType;
+            response.ContentType = contentType;
             response.ContentLength = bytes.Length;
             if (!head)
             {
@@ -229,6 +253,90 @@ internal sealed partial class ManagementEndpoints
             ? (StatusCodes.Status200OK, JsonSerializer.SerializeToUtf8Bytes(
                 new StreamDetailReport(snapshot.Version, snapshot.ReconciledAt, entry), ManagementJsonContext.Default.StreamDetailReport))
             : null;
+    }
+
+    /// <summary>Serializes the RTP output inventory, or renders one output's session description.</summary>
+    /// <param name="sdpOutput">The output whose SDP is requested, or <see langword="null"/> for the inventory.</param>
+    /// <returns>The status code, body and content type, or <see langword="null"/> if the output is unknown.</returns>
+    internal (int Status, byte[] Body, string ContentType)? Rtp(string? sdpOutput)
+    {
+        var rtp = _rtp!;
+        if (sdpOutput is null)
+        {
+            var outputs = rtp.GetOutputs().Select(static s => new RtpOutputReport(
+                s.Output.Name,
+                s.Output.Application,
+                s.Output.Stream,
+                s.Output.Mode == RtpOutputMode.Multicast ? "multicast" : "unicast",
+                s.Output.Destination,
+                s.Output.VideoPort,
+                s.Output.AudioPort,
+                s.Qos.Enabled ? new RtpQosReport(true, s.Qos.Dscp, s.Qos.Ecn, s.Qos.TrafficClass) : new RtpQosReport(false, null, null, null),
+                s.Session is { } session ? Report(session) : null)).ToList();
+            return (StatusCodes.Status200OK, JsonSerializer.SerializeToUtf8Bytes(new RtpOutputsReport(outputs), ManagementJsonContext.Default.RtpOutputsReport), JsonContentType);
+        }
+
+        if (rtp.GetOutput(sdpOutput) is not { } status)
+        {
+            return null;
+        }
+
+        if (status.Session is not { } current || status.StreamInfo is not { } info)
+        {
+            return (StatusCodes.Status503ServiceUnavailable, JsonSerializer.SerializeToUtf8Bytes(new RtpStatus("not_publishing"), ManagementJsonContext.Default.RtpStatus), JsonContentType);
+        }
+
+        return RtpSdp.Render(current, info) is { } sdp
+            ? (StatusCodes.Status200OK, System.Text.Encoding.UTF8.GetBytes(sdp), RtpSdp.ContentType)
+            : (StatusCodes.Status503ServiceUnavailable, JsonSerializer.SerializeToUtf8Bytes(new RtpStatus("not_described"), ManagementJsonContext.Default.RtpStatus), JsonContentType);
+    }
+
+    /// <summary>Builds the report of an output session.</summary>
+    /// <param name="session">The session.</param>
+    /// <returns>The report.</returns>
+    private static RtpSessionReport Report(RtpOutputSession session)
+    {
+        var stats = session.Statistics.Snapshot();
+        return new RtpSessionReport(
+            session.State.ToString().ToLowerInvariant(),
+            session.StartedAt,
+            RtpOutputSession.Ssrc(session.Video?.Stream),
+            RtpOutputSession.Ssrc(session.AudioStream),
+            stats.PacketsSent,
+            stats.BytesSent,
+            stats.PacketsDropped,
+            stats.SendErrors,
+            stats.RtcpPacketsSent,
+            Math.Round(stats.Bitrate),
+            Math.Round(stats.PacketRate, 1),
+            session.TrafficClass);
+    }
+
+    /// <summary>Recognizes <see cref="RtpPath"/> and <c>/health/rtp/{output}.sdp</c>.</summary>
+    /// <param name="path">The request path.</param>
+    /// <param name="sdpOutput">The output whose SDP is requested, or <see langword="null"/> for the inventory.</param>
+    /// <returns><see langword="true"/> if the path is an RTP path.</returns>
+    private static bool IsRtpPath(string? path, out string? sdpOutput)
+    {
+        sdpOutput = null;
+        if (path == RtpPath)
+        {
+            return true;
+        }
+
+        if (path is null || !path.StartsWith(RtpPath + "/", StringComparison.Ordinal) || !path.EndsWith(".sdp", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var name = path[(RtpPath.Length + 1)..^4];
+        if (name.Length == 0 || name.Contains('/', StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        sdpOutput = name;
+        return true;
     }
 
     /// <summary>Recognizes <see cref="StreamsPath"/> and <c>/health/streams/{application}/{stream}</c>.</summary>

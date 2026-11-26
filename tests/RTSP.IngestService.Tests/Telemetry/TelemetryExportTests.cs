@@ -14,6 +14,7 @@ using Microsoft.Extensions.Diagnostics.Metrics.Testing;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Testing;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Time.Testing;
 using OpenTelemetry.Metrics;
 using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Hls;
@@ -21,10 +22,12 @@ using RTSP.IngestService.Http;
 using RTSP.IngestService.Media;
 using RTSP.IngestService.Rtmp;
 using RTSP.IngestService.Rtmp.Publishing;
+using RTSP.IngestService.Rtp;
 using RTSP.IngestService.Streams;
 using RTSP.IngestService.Telemetry;
 using RTSP.IngestService.Tests.Hls;
 using RTSP.IngestService.Tests.Infrastructure;
+using RTSP.IngestService.Tests.Rtp;
 
 namespace RTSP.IngestService.Tests.Telemetry;
 
@@ -69,6 +72,14 @@ public sealed class TelemetryExportTests
         ["hls.errors"] = new() { ["kind=storage_full"] = 1 },
         ["hls.discontinuities"] = new() { ["reason=timestamp"] = 1 },
         ["hls.samples.dropped"] = new() { ["reason=before_sync_sample;track=video"] = 3 },
+        ["rtp.sessions.active"] = new() { ["mode=unicast"] = 1 },
+        ["rtp.packets.sent"] = new() { ["mode=unicast;track=video"] = 10 },
+        ["rtp.bytes.sent"] = new() { ["mode=unicast;track=video"] = 8000 },
+        ["rtp.packets.dropped"] = new() { ["reason=queue_full;track=video"] = 3 },
+        ["rtp.send.errors"] = new() { ["kind=transient"] = 1 },
+        ["rtp.rtcp.sent"] = new() { [""] = 1 },
+        ["rtp.bitrate"] = new() { [""] = 64000 },
+        ["rtp.packet_rate"] = new() { [""] = 10 },
         ["http.origin.requests"] = new() { ["resource=playlist;status_class=2xx"] = 1 },
         ["http.origin.requests.active"] = new() { [""] = 1 },
         ["http.origin.request.duration"] = new() { ["resource=playlist"] = 0.5 },
@@ -92,7 +103,7 @@ public sealed class TelemetryExportTests
     private static readonly string[] OnTheWire = ["rtmp.connections.accepted", "hls.storage.bytes", "hls.segment.duration", "stream_catalog.streams"];
 
     /// <summary>Instruments a real publish, playback and missing-stream request must have recorded.</summary>
-    private static readonly string[] FromTraffic = ["rtmp.bytes_received", "media.samples", "hls.segments", "http.origin.requests", "http.origin.missing", "stream_events.published", "stream_catalog.reconciliations"];
+    private static readonly string[] FromTraffic = ["rtmp.bytes_received", "media.samples", "hls.segments", "rtp.packets.sent", "http.origin.requests", "http.origin.missing", "stream_events.published", "stream_catalog.reconciliations"];
 
     /// <summary>Captured host logs.</summary>
     private readonly FakeLogCollector _logs = new();
@@ -162,7 +173,7 @@ public sealed class TelemetryExportTests
 
     /// <summary>
     /// Verifies the enabled OTLP/HTTP exporter delivers every application meter over the wire: the final export at
-    /// stop is a protobuf POST to <c>/v1/metrics</c> whose scopes name all five meters, and enabling is logged
+    /// stop is a protobuf POST to <c>/v1/metrics</c> whose scopes name all six meters, and enabling is logged
     /// without the endpoint.
     /// </summary>
     /// <returns>A task that completes when the test is finished.</returns>
@@ -220,7 +231,7 @@ public sealed class TelemetryExportTests
         provider.ForceFlush(10_000);
         var latest = Latest(exported);
 
-        Assert.Equal(48, instruments.Count);
+        Assert.Equal(56, instruments.Count);
         Assert.Equal(TelemetryTestSupport.Vocabulary.Keys.Order(StringComparer.Ordinal), instruments.Select(static i => i.Name).Order(StringComparer.Ordinal));
         Assert.Equal(TelemetryServiceCollectionExtensions.MeterNames.Order(StringComparer.Ordinal), instruments.Select(static i => i.Meter.Name).Distinct().Order(StringComparer.Ordinal));
         Assert.Equal(instruments.Select(static i => i.Name).Order(StringComparer.Ordinal), latest.Keys.Order(StringComparer.Ordinal));
@@ -239,7 +250,7 @@ public sealed class TelemetryExportTests
     }
 
     /// <summary>
-    /// Test D: a real FFmpeg publish with a stream key, HLS playback over HTTP and a request for an unknown stream
+    /// Test D: a real FFmpeg publish with a stream key and an RTP output, HLS playback over HTTP and a request for an unknown stream
     /// produce exported measurements on every meter, and no exported tag carries the stream key, the publisher or
     /// application name, a session or incarnation identifier, a client address or a port; every tag is in the fixed
     /// vocabulary.
@@ -257,9 +268,16 @@ public sealed class TelemetryExportTests
         overrides["Rtmp:Authentication:Publishers:0:KeyHash"] = PublisherKeyHash.Create(StreamKey);
         overrides["Hls:TargetSegmentDuration"] = "00:00:01";
         overrides["Hls:MaxSegmentDuration"] = "00:00:04";
+        using var rtpReceiver = UdpReceiver.Bind(IPAddress.Loopback);
+        var rtpPort = rtpReceiver.Port.ToString(CultureInfo.InvariantCulture);
+        overrides["Rtp:Outputs:0:Name"] = "telemetry-rtp";
+        overrides["Rtp:Outputs:0:Application"] = "live";
+        overrides["Rtp:Outputs:0:Stream"] = "camera";
+        overrides["Rtp:Outputs:0:Destination"] = "127.0.0.1";
+        overrides["Rtp:Outputs:0:VideoPort"] = rtpPort;
         using var host = BuildWithInMemoryExporter(overrides, exported);
         using var client = new HttpClient();
-        var forbidden = new List<string> { StreamKey, "camera", "live", "127.0.0.1", "::1" };
+        var forbidden = new List<string> { StreamKey, "camera", "live", "127.0.0.1", "::1", "telemetry-rtp", rtpPort };
 
         await host.StartAsync(Token).WithinSafetyTimeout();
         try
@@ -368,6 +386,18 @@ public sealed class TelemetryExportTests
         hls.Error(HlsErrorKind.StorageFull);
         hls.Discontinuity("timestamp");
         hls.SamplesDropped(video: true, "before_sync_sample", 3);
+
+        var rtp = services.GetRequiredService<RtpMetrics>();
+        var clock = new FakeTimeProvider();
+        var statistics = new RtpOutputStatistics(clock);
+        rtp.SessionStarted(RtpOutputMode.Unicast, statistics);
+        rtp.Sent(video: true, multicast: false, 10, 8000);
+        statistics.Sent(10, 8000);
+        clock.Advance(TimeSpan.FromSeconds(1));
+        statistics.UpdateRates();
+        rtp.Dropped(video: true, RtpDropReason.QueueFull, 3);
+        rtp.SendError(transient: true);
+        rtp.RtcpSent();
 
         var http = services.GetRequiredService<HttpOriginMetrics>();
         http.RequestStarted();
