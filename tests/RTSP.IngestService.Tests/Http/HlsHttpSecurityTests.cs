@@ -727,6 +727,16 @@ public sealed class HlsHttpSecurityTests : IAsyncDisposable
         public HlsSegment? GetSegment(string application, string streamIdentity, string name) => Fail<HlsSegment?>();
 
         /// <inheritdoc />
+        public HlsSegmentLease? AcquireSegment(string application, string streamIdentity, string name) => Fail<HlsSegmentLease?>();
+
+        /// <inheritdoc />
+        public HlsSegmentAccess TryAcquireSegment(string application, string streamIdentity, string name, out HlsSegmentLease? lease)
+        {
+            lease = null;
+            return Fail<HlsSegmentAccess>();
+        }
+
+        /// <inheritdoc />
         public bool ContainsStream(string application, string streamIdentity) => Fail<bool>();
 
         /// <summary>Counts a call and fails it.</summary>
