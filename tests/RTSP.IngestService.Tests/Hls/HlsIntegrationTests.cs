@@ -70,7 +70,7 @@ public sealed class HlsIntegrationTests : IDisposable
         var playlist = _store.GetPlaylist("live", RtmpTestServer.StreamIdentity)!;
         Assert.True(playlist.Ended);
         Assert.Equal(4, playlist.Segments.Count);
-        var init = Mp4Parser.Parse(_store.GetSegment("live", RtmpTestServer.StreamIdentity, "init-0.mp4")!.Data.Span);
+        var init = Mp4Parser.Parse(_store.ReadSegment("live", RtmpTestServer.StreamIdentity, "init-0.mp4")!);
         Assert.Equal(HlsFixture.AvcRecord, init.One("moov/trak/mdia/minf/stbl/stsd/avc1/avcC").Body);
         var videoBytes = HlsFixture.Tags.Where(static t => t.Type == 9 && t.Body[1] == 1).Select(static t => t.Body[5..]).ToList();
         var audioBytes = HlsFixture.Tags.Where(static t => t.Type == 8 && t.Body[1] == 1).Select(static t => t.Body[2..]).ToList();
@@ -78,7 +78,7 @@ public sealed class HlsIntegrationTests : IDisposable
         var packagedAudio = new List<byte[]>();
         foreach (var entry in playlist.Segments)
         {
-            var bytes = _store.GetSegment("live", RtmpTestServer.StreamIdentity, entry.Name)!.Data.ToArray();
+            var bytes = _store.ReadSegment("live", RtmpTestServer.StreamIdentity, entry.Name)!;
             foreach (var trackRun in Mp4Fragments.Read(bytes).Runs)
             {
                 var offset = trackRun.DataOffset;

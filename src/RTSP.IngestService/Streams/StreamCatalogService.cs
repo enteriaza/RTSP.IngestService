@@ -3,7 +3,10 @@
 // catalog could not apply, detected event loss, and a short settle timer while a snapshot showed an HLS stream still
 // live after its RTMP session ended, or live before its first playlist was published (neither the HLS close nor the
 // first playlist has an event). Requests are coalesced into at most one pending
-// request, so no queue or storm of reconciliations can build up.
+// request, so no queue or storm of reconciliations can build up, and the loop starts reconciliations at least
+// CoalescingWindow apart: a request arriving sooner after the previous one waits out the rest of the window and is
+// served, with any requests made meanwhile, by one reconciliation. Under lifecycle churn this bounds the full-snapshot
+// work to one reconciliation per window instead of one per event; an isolated request is served at once.
 
 using Microsoft.Extensions.Options;
 using RTSP.IngestService.Configuration;
@@ -15,6 +18,9 @@ public sealed class StreamCatalogService : BackgroundService
 {
     /// <summary>How long after an unsettled reconciliation the next one is requested.</summary>
     public static readonly TimeSpan SettleDelay = TimeSpan.FromSeconds(1);
+
+    /// <summary>The minimum time between the starts of two reconciliations run by the loop.</summary>
+    public static readonly TimeSpan CoalescingWindow = TimeSpan.FromMilliseconds(100);
 
     /// <summary>The catalog.</summary>
     private readonly StreamCatalog _catalog;
@@ -101,9 +107,17 @@ public sealed class StreamCatalogService : BackgroundService
         await Task.CompletedTask.ConfigureAwait(ConfigureAwaitOptions.ForceYielding);
         try
         {
+            long? lastStarted = null;
             while (true)
             {
                 await _catalog.WaitForRequestAsync(stoppingToken).ConfigureAwait(false);
+                if (lastStarted is { } last && CoalescingWindow - _time.GetElapsedTime(last) is { Ticks: > 0 } wait)
+                {
+                    await Task.Delay(wait, _time, stoppingToken).ConfigureAwait(false);
+                    _catalog.TryTakeRequest();
+                }
+
+                lastStarted = _time.GetTimestamp();
                 _catalog.Reconcile();
                 ArmSettle();
             }

@@ -1,6 +1,7 @@
 // Tests of the stream catalog's reconciliation service with fake time: the startup reconciliation completes before
 // StartAsync returns, a failed one is retried, the periodic timer requests reconciliations, a request arriving during
-// a reconciliation causes exactly one more, and stopping ends the loop promptly. Gates synchronise; nothing sleeps.
+// a reconciliation causes exactly one more, requests within the coalescing window share one reconciliation, and
+// stopping ends the loop promptly. Gates synchronise; nothing sleeps.
 
 using Microsoft.Extensions.Options;
 using RTSP.IngestService.Configuration;
@@ -111,9 +112,55 @@ public sealed class StreamCatalogServiceTests : IAsyncDisposable
         }
 
         release.Set();
-        await Eventually.WaitUntilAsync(() => _f.Catalog.Current.Streams.Count == 1, "the follow-up reconciliation sees the new stream");
+        await Eventually.WaitUntilAsync(
+            () =>
+            {
+                // The follow-up waits out the coalescing window, which only advancing fake time ends.
+                _f.Time.Advance(TimeSpan.FromMilliseconds(10));
+                return _f.Catalog.Current.Streams.Count == 1;
+            },
+            "the follow-up reconciliation sees the new stream");
         Assert.Equal(3, _f.Source.Acquisitions);
         Assert.Equal(9, _f.Coalesced.GetMeasurementSnapshot().Sum(static m => m.Value));
+    }
+
+    /// <summary>
+    /// Verifies the coalescing window: a request soon after a reconciliation waits until the window since that
+    /// reconciliation's start has elapsed, requests made meanwhile are served by the same reconciliation, and an
+    /// isolated request after the window is served without waiting.
+    /// </summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task RequestsWithinWindow_AreServedTogetherWhenItEnds()
+    {
+        await _service.StartAsync(Token);
+        DateTimeOffset? first = null;
+        _f.Source.DuringAcquire = () => first = _f.Time.GetUtcNow();
+        _f.Catalog.RequestReconciliation(StreamCatalogTrigger.Event);
+        await Eventually.WaitUntilAsync(() => _f.Source.Acquisitions == 2, "the first loop reconciliation runs at once");
+
+        DateTimeOffset? second = null;
+        _f.Source.DuringAcquire = () => second = _f.Time.GetUtcNow();
+        _f.Source.Publish("0123456789abcdef0123456789abcdef", 1);
+        for (var i = 0; i < 10; i++)
+        {
+            _f.Catalog.RequestReconciliation(StreamCatalogTrigger.Event);
+        }
+
+        await Eventually.WaitUntilAsync(
+            () =>
+            {
+                _f.Time.Advance(TimeSpan.FromMilliseconds(10));
+                return _f.Source.Acquisitions == 3;
+            },
+            "the coalesced reconciliation runs once the window ends");
+        Assert.True(second - first >= StreamCatalogService.CoalescingWindow, $"waited {second - first}");
+        await Eventually.WaitUntilAsync(() => _f.Catalog.Current.Streams.Count == 1, "the coalesced reconciliation publishes the new stream");
+        _f.Time.Advance(StreamCatalogService.CoalescingWindow * 3);
+        Assert.Equal(3, _f.Source.Acquisitions);
+
+        _f.Catalog.RequestReconciliation(StreamCatalogTrigger.Event);
+        await Eventually.WaitUntilAsync(() => _f.Source.Acquisitions == 4, "an isolated request after the window is served at once");
     }
 
     /// <summary>

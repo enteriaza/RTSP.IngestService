@@ -84,6 +84,18 @@ internal sealed class HlsMetrics
     /// <summary>Samples not packaged by track and reason.</summary>
     private readonly Counter<long> _droppedSamples;
 
+    /// <summary>Sample bytes held for segments being built.</summary>
+    private readonly UpDownCounter<long> _pendingBytes;
+
+    /// <summary>Segment requests refused by the reader memory budget.</summary>
+    private readonly Counter<long> _readerRefusals;
+
+    /// <summary>Bytes of distinct segments held by readers.</summary>
+    private readonly UpDownCounter<long> _readerBytes;
+
+    /// <summary>Bytes of pooled segment chunks by state.</summary>
+    private readonly UpDownCounter<long> _poolBytes;
+
     /// <summary>Initializes a new instance of the <see cref="HlsMetrics"/> class.</summary>
     /// <param name="meterFactory">Factory owning the meter's lifetime.</param>
     public HlsMetrics(IMeterFactory meterFactory)
@@ -101,7 +113,34 @@ internal sealed class HlsMetrics
         _errors = meter.CreateCounter<long>("hls.errors", "{error}", "Packaging errors; tag kind.");
         _discontinuities = meter.CreateCounter<long>("hls.discontinuities", "{discontinuity}", "Playlist discontinuities; tag reason.");
         _droppedSamples = meter.CreateCounter<long>("hls.samples.dropped", "{sample}", "Samples not packaged; tags track and reason.");
+        _pendingBytes = meter.CreateUpDownCounter<long>("hls.pending.bytes", "By", "Sample bytes held for segments being built.");
+        _readerRefusals = meter.CreateCounter<long>("hls.readers.refused", "{request}", "Segment requests refused because the reader memory budget was exhausted.");
+        _readerBytes = meter.CreateUpDownCounter<long>("hls.readers.bytes", "By", "Bytes of distinct segments held by readers, stored or already evicted.");
+        _poolBytes = meter.CreateUpDownCounter<long>("hls.segment_pool.bytes", "By", "Bytes of pooled segment chunks; tag state (in_use or free).");
     }
+
+    /// <summary>Records a change in the bytes of distinct segments held by readers.</summary>
+    /// <param name="delta">Bytes reserved (positive) or returned (negative).</param>
+    public void ReaderMemoryChanged(long delta) => _readerBytes.Add(delta);
+
+    /// <summary>Records a change in pooled segment chunks.</summary>
+    /// <param name="inUse">Change in bytes of chunks held by segments.</param>
+    /// <param name="free">Change in bytes of free chunks kept for reuse.</param>
+    public void PoolChanged(long inUse, long free)
+    {
+        _poolBytes.Add(inUse, new KeyValuePair<string, object?>("state", "in_use"));
+        if (free != 0)
+        {
+            _poolBytes.Add(free, new KeyValuePair<string, object?>("state", "free"));
+        }
+    }
+
+    /// <summary>Records a change in sample bytes held for segments being built.</summary>
+    /// <param name="delta">Bytes added (positive) or released (negative).</param>
+    public void PendingChanged(long delta) => _pendingBytes.Add(delta);
+
+    /// <summary>Records a segment request refused by the reader memory budget.</summary>
+    public void ReaderRefused() => _readerRefusals.Add(1);
 
     /// <summary>Records a stream whose packaging started.</summary>
     public void SessionStarted() => _sessions.Add(1);

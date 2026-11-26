@@ -110,14 +110,14 @@ public sealed class HlsHttpOriginTests : IAsyncDisposable
         using var init = await _client.GetAsync(new Uri(baseUri, $"{SegmentBase}/init-0.mp4"), Token);
         Assert.Equal(HttpStatusCode.OK, init.StatusCode);
         Assert.Equal(HlsHttpApplication.InitializationContentType, init.Content.Headers.ContentType!.MediaType);
-        Assert.Equal(_store.GetSegment("live", "cam", "init-0.mp4")!.Data.ToArray(), await init.Content.ReadAsByteArrayAsync(Token));
+        Assert.Equal(_store.ReadSegment("live", "cam", "init-0.mp4")!, await init.Content.ReadAsByteArrayAsync(Token));
 
         using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(baseUri, $"{SegmentBase}/segment-0.m4s"));
         request.Headers.Range = new RangeHeaderValue(10, 19);
         using var segment = await _client.SendAsync(request, Token);
         Assert.Equal(HttpStatusCode.OK, segment.StatusCode);
         Assert.Equal(HlsHttpApplication.SegmentContentType, segment.Content.Headers.ContentType!.MediaType);
-        Assert.Equal(_store.GetSegment("live", "cam", "segment-0.m4s")!.Data.ToArray(), await segment.Content.ReadAsByteArrayAsync(Token));
+        Assert.Equal(_store.ReadSegment("live", "cam", "segment-0.m4s")!, await segment.Content.ReadAsByteArrayAsync(Token));
         Assert.Equal(["none"], segment.Headers.GetValues("Accept-Ranges"));
         Assert.True(segment.Headers.CacheControl!.Public);
         Assert.Equal(HlsHttpApplication.SegmentCacheLifetime(_hlsOptions), segment.Headers.CacheControl.MaxAge);
@@ -410,7 +410,7 @@ public sealed class HlsHttpOriginTests : IAsyncDisposable
         {
             using var current = await secondClient.GetAsync(uri, Token);
             var body = await current.Content.ReadAsByteArrayAsync(Token);
-            Assert.Equal(secondStore.GetSegment("live", "cam", uri.Segments[^1])!.Data.ToArray(), body);
+            Assert.Equal(secondStore.ReadSegment("live", "cam", uri.Segments[^1])!, body);
             Assert.NotEqual(cache.Single(c => c.Key.Segments[^1] == uri.Segments[^1]).Value.Body, body);
             Assert.True(current.Headers.CacheControl!.Public);
             Assert.Equal(HlsHttpApplication.SegmentCacheLifetime(_hlsOptions), current.Headers.CacheControl.MaxAge);
@@ -426,7 +426,7 @@ public sealed class HlsHttpOriginTests : IAsyncDisposable
         var baseUri = await StartAsync();
         var session = Open();
         Append(session, 0, Large);
-        var expected = _store.GetSegment("live", "cam", "segment-0.m4s")!.Data.ToArray();
+        var expected = _store.ReadSegment("live", "cam", "segment-0.m4s")!;
 
         using var response = await _client.GetAsync(new Uri(baseUri, $"{SegmentBase}/segment-0.m4s"), HttpCompletionOption.ResponseHeadersRead, Token);
         await using var body = await response.Content.ReadAsStreamAsync(Token);
@@ -441,6 +441,119 @@ public sealed class HlsHttpOriginTests : IAsyncDisposable
         using var rest = new MemoryStream();
         await body.CopyToAsync(rest, Token);
         Assert.Equal(expected, prefix.Concat(rest.ToArray()).ToArray());
+    }
+
+    /// <summary>
+    /// Verifies a pooled segment stays leased for the whole of a stalled response that outlives the segment's expiry,
+    /// while released chunks are reused by new segments, and that its chunks return to the pool once every response
+    /// has completed or its viewer has disconnected.
+    /// </summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task PooledSegment_IsLeasedUntilEveryResponseEnds()
+    {
+        var pool = new HlsSegmentBufferPool(1024);
+        var baseUri = await StartAsync();
+        var session = Open();
+        _store.AddInitialization(session, new HlsSegment(HlsSegmentKind.Initialization, "init-0.mp4", [1, 2, 3, 4, 5]));
+        var expected = new byte[Large];
+        Random.Shared.NextBytes(expected);
+        Assert.Equal(HlsAppendResult.Published, _store.AppendSegment(session, HlsSegmentStoreTestExtensions.Pooled(pool, HlsSegmentKind.Media, "segment-0.m4s", expected), HlsPlaylistTests.Entry(0, 1.0)));
+        var segmentUri = new Uri(baseUri, $"{SegmentBase}/segment-0.m4s");
+        using var stalled = await StartUnreadRequestAsync(segmentUri);
+        var leaving = await StartUnreadRequestAsync(segmentUri);
+
+        _store.CloseStream(session, completed: false);
+        _time.Advance(TimeSpan.FromMinutes(1));
+        Assert.Null(_store.GetSegment("live", "cam", "segment-0.m4s"));
+        Assert.Equal(HlsSegmentBufferPool.ChunksFor(Large), pool.OutstandingChunks);
+
+        var other = Guid.NewGuid();
+        Assert.True(_store.TryOpenStream(other, "live", "other", 1, out _));
+        _store.AddInitialization(other, new HlsSegment(HlsSegmentKind.Initialization, "init-0.mp4", [1]));
+        var filler = new byte[4 * 1024 * 1024];
+        filler.AsSpan().Fill(0xEE);
+        for (var sequence = 0; sequence < 8; sequence++)
+        {
+            Assert.Equal(HlsAppendResult.Published, _store.AppendSegment(other, HlsSegmentStoreTestExtensions.Pooled(pool, HlsSegmentKind.Media, $"segment-{sequence}.m4s", filler), HlsPlaylistTests.Entry(sequence, 1.0)));
+            _time.Advance(TimeSpan.FromSeconds(10));
+        }
+
+        Assert.True(pool.RetainedChunks > 0);
+        leaving.Dispose();
+        using var received = new MemoryStream();
+        var buffer = new byte[64 * 1024];
+        var headerEnd = -1;
+        while (headerEnd < 0 || received.Length < headerEnd + Large)
+        {
+            var count = await stalled.ReceiveAsync(buffer, Token);
+            Assert.NotEqual(0, count);
+            received.Write(buffer, 0, count);
+            if (headerEnd < 0 && received.GetBuffer().AsSpan(0, (int)received.Length).IndexOf("\r\n\r\n"u8) is var end and >= 0)
+            {
+                headerEnd = end + 4;
+            }
+        }
+
+        Assert.Equal(expected, received.ToArray()[headerEnd..]);
+        _store.CloseStream(other, completed: false);
+        _time.Advance(TimeSpan.FromMinutes(1));
+        await Eventually.WaitUntilAsync(() => _store.TotalBytes == 0 && pool.OutstandingChunks == 0, "every leased chunk is returned");
+    }
+
+    /// <summary>
+    /// Verifies the reader memory budget: a segment already being sent is served to more viewers at no cost, an evicted
+    /// segment still being sent keeps its budget, a segment that does not fit is 503 with <c>Retry-After</c> and is
+    /// not cached, and it is served once the responses holding the budget end.
+    /// </summary>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Fact]
+    public async Task ReaderMemoryBudget_RefusesUntilResponsesEnd()
+    {
+        using var refused = new MetricCollector<long>(MeterFactory, HlsMetrics.MeterName, "hls.readers.refused");
+        using var store = new InMemoryHlsSegmentStore(MsOptions.Create(new HlsOptions { MaxSessionStorageMegabytes = 32, MaxTotalStorageMegabytes = 32 }), _time, new HlsMetrics(MeterFactory));
+        var origin = CreateOrigin(store: store);
+        await origin.StartAsync(Token);
+        _origins.Add(origin);
+        var baseUri = new Uri($"http://127.0.0.1:{origin.LocalEndPoint!.Port}/");
+
+        var session = Guid.NewGuid();
+        Assert.True(store.TryOpenStream(session, "live", "cam", 1, out _));
+        store.AddInitialization(session, new HlsSegment(HlsSegmentKind.Initialization, "init-0.mp4", [1]));
+        Assert.Equal(HlsAppendResult.Published, store.AppendSegment(session, new HlsSegment(HlsSegmentKind.Media, "segment-0.m4s", new byte[Large]), HlsPlaylistTests.Entry(0, 1.0)));
+        var heldUri = new Uri(baseUri, $"hls/live/cam/{store.Generation}/segment-0.m4s");
+        using var first = await StartUnreadRequestAsync(heldUri);
+        using var second = await StartUnreadRequestAsync(heldUri);
+        Assert.Equal(Large, store.ReaderBudget.Held);
+
+        store.CloseStream(session, completed: false);
+        _time.Advance(TimeSpan.FromMinutes(1));
+        Assert.False(store.ContainsStream("live", "cam"));
+        Assert.Equal(Large, store.ReaderBudget.Held);
+
+        var other = Guid.NewGuid();
+        Assert.True(store.TryOpenStream(other, "live", "other", 1, out _));
+        store.AddInitialization(other, new HlsSegment(HlsSegmentKind.Initialization, "init-0.mp4", [1]));
+        var expected = new byte[16 * 1024 * 1024];
+        Random.Shared.NextBytes(expected);
+        Assert.Equal(HlsAppendResult.Published, store.AppendSegment(other, new HlsSegment(HlsSegmentKind.Media, "segment-0.m4s", expected), HlsPlaylistTests.Entry(0, 1.0)));
+        var otherUri = new Uri(baseUri, $"hls/live/other/{store.Generation}/segment-0.m4s");
+
+        using (var response = await _client.GetAsync(otherUri, Token))
+        {
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+            Assert.Equal(TimeSpan.FromSeconds(1), response.Headers.RetryAfter!.Delta);
+            Assert.True(response.Headers.CacheControl!.NoStore);
+        }
+
+        Assert.Equal(1, refused.GetMeasurementSnapshot().Sum(static m => m.Value));
+        Assert.Equal([1], await _client.GetByteArrayAsync(new Uri(baseUri, $"hls/live/other/{store.Generation}/init-0.mp4"), Token));
+
+        first.Dispose();
+        second.Dispose();
+        await Eventually.WaitUntilAsync(() => store.ReaderBudget.Held == 0, "the evicted segment's responses end");
+        Assert.Equal(expected, await _client.GetByteArrayAsync(otherUri, Token));
+        await Eventually.WaitUntilAsync(() => store.ReaderBudget.Held == 0, "the served segment's response ends");
     }
 
     /// <summary>
@@ -531,7 +644,7 @@ public sealed class HlsHttpOriginTests : IAsyncDisposable
         var baseUri = await StartAsync();
         var origin = _origins[^1];
         Append(Open(), 0, Large);
-        var expected = _store.GetSegment("live", "cam", "segment-0.m4s")!.Data.ToArray();
+        var expected = _store.ReadSegment("live", "cam", "segment-0.m4s")!;
 
         using var socket = await StartUnreadRequestAsync(new Uri(baseUri, $"{SegmentBase}/segment-0.m4s"));
         var stopping = origin.StopAsync(Token);

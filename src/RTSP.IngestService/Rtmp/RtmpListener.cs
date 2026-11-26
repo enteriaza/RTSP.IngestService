@@ -21,7 +21,7 @@ namespace RTSP.IngestService.Rtmp;
 /// <para>
 /// Connections run as asynchronous tasks on the thread pool; there is no thread per connection. Connections beyond
 /// <see cref="RtmpOptions.MaxConnections"/> are closed as soon as they are accepted, and the operating system's
-/// listen backlog is capped at <see cref="ListenBacklog"/>, so no connection queue grows without bound.
+/// listen backlog is bounded by <see cref="GetListenBacklog"/>, so no connection queue grows without bound.
 /// </para>
 /// <para>
 /// Shutdown policy: when the host stops, the listening socket is closed first, then every active connection is
@@ -38,8 +38,8 @@ namespace RTSP.IngestService.Rtmp;
 /// </remarks>
 public sealed partial class RtmpListener : BackgroundService
 {
-    /// <summary>Maximum length of the operating system's pending-connection queue.</summary>
-    public const int ListenBacklog = 128;
+    /// <summary>Smallest pending-connection queue length the listener requests.</summary>
+    public const int MinimumListenBacklog = 128;
 
     /// <summary>Pause after an accept failure that is not a per-connection error, to avoid a tight failure loop.</summary>
     private static readonly TimeSpan AcceptRetryDelay = TimeSpan.FromSeconds(1);
@@ -162,7 +162,7 @@ public sealed partial class RtmpListener : BackgroundService
             }
 
             socket.Bind(endPoint);
-            socket.Listen(ListenBacklog);
+            Listen(socket, GetListenBacklog(options));
         }
         catch (Exception ex) when (ex is SocketException or NotSupportedException)
         {
@@ -179,6 +179,25 @@ public sealed partial class RtmpListener : BackgroundService
 
         await base.StartAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Returns the pending-connection queue length requested from the operating system: room for a burst of
+    /// <see cref="RtmpOptions.MaxConnections"/> connections, and at least <see cref="MinimumListenBacklog"/>. The
+    /// validated range of <see cref="RtmpOptions.MaxConnections"/> bounds it; the operating system may cap it lower
+    /// (on Linux at <c>net.core.somaxconn</c>).
+    /// </summary>
+    /// <param name="options">The RTMP options.</param>
+    /// <returns>The backlog.</returns>
+    internal static int GetListenBacklog(RtmpOptions options) => Math.Max(MinimumListenBacklog, options.MaxConnections);
+
+    /// <summary>Starts listening on <paramref name="socket"/> with a pending-connection queue of <paramref name="backlog"/>.</summary>
+    /// <param name="socket">The bound socket.</param>
+    /// <param name="backlog">The backlog, at most 65535.</param>
+    /// <remarks>
+    /// Windows caps a positive backlog at 200; the negative value <c>SOMAXCONN_HINT(backlog)</c> requests the backlog
+    /// itself, clamped to 200 – 65535. Elsewhere a negative value would mean the system maximum, so the backlog is passed as is.
+    /// </remarks>
+    internal static void Listen(Socket socket, int backlog) => socket.Listen(OperatingSystem.IsWindows() ? -backlog : backlog);
 
     /// <summary>Closes the listening socket if the accept loop never ran, then disposes the base service.</summary>
     public override void Dispose()

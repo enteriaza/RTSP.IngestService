@@ -2,6 +2,9 @@
 // reloads. A reload is bound and validated through the same strict options pipeline as startup; one that fails keeps
 // the last known-good snapshot. Sessions that are already publishing are never affected by a reload.
 
+using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Primitives;
 using RTSP.IngestService.Configuration;
@@ -165,10 +168,29 @@ internal sealed partial class PublisherCredentialStore : IDisposable
 }
 
 /// <summary>
-/// An immutable set of publisher credentials.
+/// An immutable set of publisher credentials, with a bounded memo of the keys it has verified.
 /// </summary>
+/// <remarks>
+/// The memo maps a tag of a presented key, the HMAC-SHA256 of the key under a random pepper that exists only in this
+/// snapshot's memory, to the credential the key authenticated as: an unambiguous match of an enabled credential. It
+/// holds neither keys nor configured hashes, is never persisted or logged, and holds at most one entry per credential,
+/// because only an attempt that matched exactly one credential is recorded. A reload creates a new snapshot with an
+/// empty memo, so revoked, disabled and changed credentials are never served from it.
+/// </remarks>
 internal sealed class PublisherCredentialSnapshot
 {
+    /// <summary>The length of the tag pepper in bytes.</summary>
+    private const int PepperLength = 32;
+
+    /// <summary>The random key of <see cref="Tag"/>; never leaves this instance.</summary>
+    private readonly byte[] _pepper = RandomNumberGenerator.GetBytes(PepperLength);
+
+    /// <summary>Credential indexes by key tag, of keys verified as an unambiguous match of an enabled credential.</summary>
+    private readonly ConcurrentDictionary<UInt128, int> _verified = new();
+
+    /// <summary>The number of entries reserved in <see cref="_verified"/>; at most the number of credentials.</summary>
+    private int _verifiedCount;
+
     /// <summary>Initializes a new instance of the <see cref="PublisherCredentialSnapshot"/> class.</summary>
     /// <param name="credentials">The credentials.</param>
     private PublisherCredentialSnapshot(PublisherCredential[] credentials)
@@ -202,6 +224,35 @@ internal sealed class PublisherCredentialSnapshot
         }
 
         return new PublisherCredentialSnapshot([.. credentials]);
+    }
+
+    /// <summary>Computes the memo tag of a presented key.</summary>
+    /// <param name="keyBytes">The ASCII bytes of the presented key.</param>
+    /// <returns>The tag.</returns>
+    public UInt128 Tag(ReadOnlySpan<byte> keyBytes)
+    {
+        Span<byte> mac = stackalloc byte[HMACSHA256.HashSizeInBytes];
+        HMACSHA256.HashData(_pepper, keyBytes, mac);
+        var tag = BinaryPrimitives.ReadUInt128LittleEndian(mac);
+        CryptographicOperations.ZeroMemory(mac);
+        return tag;
+    }
+
+    /// <summary>Returns the index of the credential a key with this tag was verified as, if any.</summary>
+    /// <param name="tag">The tag.</param>
+    /// <param name="index">The credential index.</param>
+    /// <returns><see langword="true"/> if the tag is memoized.</returns>
+    public bool TryGetVerified(UInt128 tag, out int index) => _verified.TryGetValue(tag, out index);
+
+    /// <summary>Memoizes that a key with this tag matched exactly one credential, which is enabled.</summary>
+    /// <param name="tag">The tag.</param>
+    /// <param name="index">The credential index.</param>
+    public void AddVerified(UInt128 tag, int index)
+    {
+        if (Interlocked.Increment(ref _verifiedCount) > Credentials.Length || !_verified.TryAdd(tag, index))
+        {
+            Interlocked.Decrement(ref _verifiedCount);
+        }
     }
 }
 

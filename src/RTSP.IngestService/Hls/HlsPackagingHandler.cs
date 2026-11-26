@@ -41,19 +41,27 @@ public sealed partial class HlsPackagingHandler : IMediaSessionHandler
     /// <summary>Packagers by session.</summary>
     private readonly ConcurrentDictionary<Guid, HlsPackager> _packagers = new();
 
+    /// <summary>The chunk pool for media segment bytes.</summary>
+    private readonly HlsSegmentBufferPool _pool;
+
     /// <summary>Initializes a new instance of the <see cref="HlsPackagingHandler"/> class.</summary>
     /// <param name="options">The settings.</param>
     /// <param name="store">The segment store.</param>
     /// <param name="metrics">Metrics.</param>
     /// <param name="logger">Logger.</param>
-    internal HlsPackagingHandler(IOptions<HlsOptions> options, IHlsSegmentStore store, HlsMetrics metrics, ILogger<HlsPackagingHandler> logger)
+    /// <param name="pool">The chunk pool for media segment bytes, or <see langword="null"/> for one sized by <paramref name="options"/>.</param>
+    internal HlsPackagingHandler(IOptions<HlsOptions> options, IHlsSegmentStore store, HlsMetrics metrics, ILogger<HlsPackagingHandler> logger, HlsSegmentBufferPool? pool = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         _options = options.Value;
         _store = store;
         _metrics = metrics;
         _logger = logger;
+        _pool = pool ?? HlsSegmentBufferPool.Create(_options, metrics);
     }
+
+    /// <summary>Gets the chunk pool for media segment bytes; for diagnostics and tests.</summary>
+    internal HlsSegmentBufferPool Pool => _pool;
 
     /// <summary>Gets the number of streams being packaged; for diagnostics and tests.</summary>
     internal int ActiveSessionCount => _packagers.Count;
@@ -71,7 +79,7 @@ public sealed partial class HlsPackagingHandler : IMediaSessionHandler
 
         publisher.MarkHlsStreamOpened();
 
-        var packager = new HlsPackager(session.SessionId, _options, _store, numbering, _metrics, _logger);
+        var packager = new HlsPackager(session.SessionId, _options, _store, numbering, _pool, _metrics, _logger);
         if (!_packagers.TryAdd(session.SessionId, packager))
         {
             _store.CloseStream(session.SessionId, completed: false);

@@ -69,6 +69,10 @@ public sealed class TelemetryExportTests
         ["hls.errors"] = new() { ["kind=storage_full"] = 1 },
         ["hls.discontinuities"] = new() { ["reason=timestamp"] = 1 },
         ["hls.samples.dropped"] = new() { ["reason=before_sync_sample;track=video"] = 3 },
+        ["hls.pending.bytes"] = new() { [""] = 1200 },
+        ["hls.readers.bytes"] = new() { [""] = 65536 },
+        ["hls.readers.refused"] = new() { [""] = 1 },
+        ["hls.segment_pool.bytes"] = new() { ["state=in_use"] = 131072, ["state=free"] = -65536 },
         ["http.origin.requests"] = new() { ["resource=playlist;status_class=2xx"] = 1 },
         ["http.origin.requests.active"] = new() { [""] = 1 },
         ["http.origin.request.duration"] = new() { ["resource=playlist"] = 0.5 },
@@ -220,7 +224,7 @@ public sealed class TelemetryExportTests
         provider.ForceFlush(10_000);
         var latest = Latest(exported);
 
-        Assert.Equal(48, instruments.Count);
+        Assert.Equal(52, instruments.Count);
         Assert.Equal(TelemetryTestSupport.Vocabulary.Keys.Order(StringComparer.Ordinal), instruments.Select(static i => i.Name).Order(StringComparer.Ordinal));
         Assert.Equal(TelemetryServiceCollectionExtensions.MeterNames.Order(StringComparer.Ordinal), instruments.Select(static i => i.Meter.Name).Distinct().Order(StringComparer.Ordinal));
         Assert.Equal(instruments.Select(static i => i.Name).Order(StringComparer.Ordinal), latest.Keys.Order(StringComparer.Ordinal));
@@ -368,6 +372,10 @@ public sealed class TelemetryExportTests
         hls.Error(HlsErrorKind.StorageFull);
         hls.Discontinuity("timestamp");
         hls.SamplesDropped(video: true, "before_sync_sample", 3);
+        hls.PendingChanged(1200);
+        hls.ReaderMemoryChanged(65536);
+        hls.ReaderRefused();
+        hls.PoolChanged(131072, -65536);
 
         var http = services.GetRequiredService<HttpOriginMetrics>();
         http.RequestStarted();

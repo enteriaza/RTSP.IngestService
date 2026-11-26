@@ -1,6 +1,9 @@
 // Limits failed publish authentication attempts per remote IP address with a token bucket. A token is reserved before
 // the key is verified and returned when the attempt succeeds, so concurrent attempts cannot exceed the allowance and
-// successful publishers are never charged. State is bounded and reclaimed lazily, without timers.
+// successful publishers are never charged. An attempt that finds every token reserved by attempts still in flight
+// waits, in a bounded queue and for a bounded time, for one of them to finish instead of being rejected: a returned
+// token passes directly to the next waiter, and waiters are rejected once nothing is in flight and no token is left.
+// State is bounded and reclaimed lazily, without timers.
 
 using System.Net;
 
@@ -18,6 +21,15 @@ namespace RTSP.IngestService.Rtmp.Publishing;
 /// per window, and when the table reaches its capacity.
 /// </para>
 /// <para>
+/// <see cref="AcquireAsync"/> also counts the attempts in flight per address. When fewer than one token remains but
+/// attempts are in flight, their outcomes are not known yet, so the attempt joins the address's FIFO queue (at most
+/// <see cref="MaxWaitersPerAddress"/>) for at most <see cref="MaxContendedWait"/>. <see cref="Release"/> passes the
+/// returned token to the first waiter; <see cref="RecordFailure"/> keeps the token spent and, once no attempt is in
+/// flight and no token is left, rejects the waiters. Concurrency of verification per address therefore never exceeds
+/// the tokens available, exactly as without waiting, and a burst of valid publishers is no longer rejected merely
+/// because it is concurrent.
+/// </para>
+/// <para>
 /// At most <c>maxTrackedAddresses</c> addresses are tracked. When the table is full and a sweep cannot make room, a new
 /// address is limited (fail closed) until existing buckets refill; addresses already tracked are unaffected.
 /// </para>
@@ -31,6 +43,12 @@ internal sealed class PublisherAuthenticationRateLimiter
 {
     /// <summary>The default capacity of the address table.</summary>
     public const int DefaultMaxTrackedAddresses = 10_000;
+
+    /// <summary>The most attempts from one address that wait for in-flight attempts at a time.</summary>
+    public const int MaxWaitersPerAddress = 1024;
+
+    /// <summary>The longest an attempt waits for in-flight attempts from its address before it is rejected.</summary>
+    public static readonly TimeSpan MaxContendedWait = TimeSpan.FromSeconds(2);
 
     /// <summary>The key used for connections without an IP peer address.</summary>
     private static readonly IPAddress UnknownAddress = IPAddress.None;
@@ -102,46 +120,72 @@ internal sealed class PublisherAuthenticationRateLimiter
     public bool TryAcquire(EndPoint? remoteEndPoint, out IPAddress address)
     {
         address = Normalize(remoteEndPoint);
-        var now = _timeProvider.GetTimestamp();
         lock (_gate)
         {
-            if (_timeProvider.GetElapsedTime(_lastSweep, now) >= _window)
-            {
-                Sweep(now);
-            }
-
-            if (_buckets.TryGetValue(address, out var bucket))
-            {
-                Refill(bucket, now);
-                if (bucket.Tokens < 1)
-                {
-                    return false;
-                }
-
-                bucket.Tokens -= 1;
-                return true;
-            }
-
-            if (_buckets.Count >= _maxTrackedAddresses)
-            {
-                if (_timeProvider.GetElapsedTime(_lastSweep, now) >= _tokenInterval)
-                {
-                    Sweep(now);
-                }
-
-                if (_buckets.Count >= _maxTrackedAddresses)
-                {
-                    return false;
-                }
-            }
-
-            _buckets.Add(address, new Bucket { Tokens = _capacity - 1, Updated = now });
-            return true;
+            return Reserve(address, _timeProvider.GetTimestamp(), out _) == Reservation.Acquired;
         }
     }
 
+    /// <summary>
+    /// Reserves one failure token for <paramref name="remoteEndPoint"/>, waiting for in-flight attempts from the same
+    /// address when they hold every remaining token. Complete a successful reservation with <see cref="Release"/> or
+    /// <see cref="RecordFailure"/>.
+    /// </summary>
+    /// <param name="remoteEndPoint">The TCP peer of the connection.</param>
+    /// <param name="cancellationToken">Cancels the wait; no token is held afterwards.</param>
+    /// <returns>The normalised address holding the reservation, or <see langword="null"/> if the address is limited.</returns>
+    public async ValueTask<IPAddress?> AcquireAsync(EndPoint? remoteEndPoint, CancellationToken cancellationToken)
+    {
+        var address = Normalize(remoteEndPoint);
+        var started = _timeProvider.GetTimestamp();
+        TaskCompletionSource<bool> turn;
+        lock (_gate)
+        {
+            switch (Reserve(address, started, out var bucket))
+            {
+                case Reservation.Acquired:
+                    return address;
+                case Reservation.Limited:
+                    return null;
+            }
+
+            turn = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            bucket!.Waiters.Enqueue(turn);
+        }
+
+        try
+        {
+            if (await turn.Task.WaitAsync(MaxContendedWait, _timeProvider, cancellationToken).ConfigureAwait(false))
+            {
+                return address;
+            }
+        }
+        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
+        {
+            if (turn.TrySetResult(false))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            else if (turn.Task.Result)
+            {
+                // The token was passed on just as the wait ended.
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    Release(address);
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
+                return address;
+            }
+        }
+
+        // Rejected or timed out: tokens may have refilled meanwhile.
+        cancellationToken.ThrowIfCancellationRequested();
+        return TryAcquire(remoteEndPoint, out _) ? address : null;
+    }
+
     /// <summary>Returns the token reserved by a successful attempt.</summary>
-    /// <param name="address">The address returned by <see cref="TryAcquire"/>.</param>
+    /// <param name="address">The address returned by <see cref="TryAcquire"/> or <see cref="AcquireAsync"/>.</param>
     public void Release(IPAddress address)
     {
         ArgumentNullException.ThrowIfNull(address);
@@ -155,9 +199,28 @@ internal sealed class PublisherAuthenticationRateLimiter
 
             Refill(bucket, now);
             bucket.Tokens = Math.Min(_capacity, bucket.Tokens + 1);
-            if (bucket.Tokens >= _capacity)
+            bucket.InFlight = Math.Max(0, bucket.InFlight - 1);
+            Dispatch(bucket);
+            if (bucket.Tokens >= _capacity && bucket.Waiters.Count == 0)
             {
                 _buckets.Remove(address);
+            }
+        }
+    }
+
+    /// <summary>Completes a failed attempt: its token stays spent.</summary>
+    /// <param name="address">The address returned by <see cref="AcquireAsync"/>.</param>
+    public void RecordFailure(IPAddress address)
+    {
+        ArgumentNullException.ThrowIfNull(address);
+        var now = _timeProvider.GetTimestamp();
+        lock (_gate)
+        {
+            if (_buckets.TryGetValue(address, out var bucket))
+            {
+                Refill(bucket, now);
+                bucket.InFlight = Math.Max(0, bucket.InFlight - 1);
+                Dispatch(bucket);
             }
         }
     }
@@ -171,6 +234,88 @@ internal sealed class PublisherAuthenticationRateLimiter
         IPEndPoint { Address: var ip } => ip,
         _ => UnknownAddress,
     };
+
+    /// <summary>Takes a token for <paramref name="address"/> if one is free. Called with the lock held.</summary>
+    /// <param name="address">The normalised address.</param>
+    /// <param name="now">The current timestamp.</param>
+    /// <param name="bucket">The address's bucket when the result is <see cref="Reservation.Busy"/>.</param>
+    /// <returns>The outcome.</returns>
+    private Reservation Reserve(IPAddress address, long now, out Bucket? bucket)
+    {
+        if (_timeProvider.GetElapsedTime(_lastSweep, now) >= _window)
+        {
+            Sweep(now);
+        }
+
+        if (_buckets.TryGetValue(address, out bucket))
+        {
+            Refill(bucket, now);
+            Dispatch(bucket);
+            if (bucket.Tokens >= 1 && bucket.Waiters.Count == 0)
+            {
+                bucket.Tokens -= 1;
+                bucket.InFlight++;
+                return Reservation.Acquired;
+            }
+
+            if (bucket.InFlight == 0)
+            {
+                return Reservation.Limited;
+            }
+
+            if (bucket.Waiters.Count >= MaxWaitersPerAddress)
+            {
+                bucket.Waiters = new Queue<TaskCompletionSource<bool>>(bucket.Waiters.Where(static w => !w.Task.IsCompleted));
+                if (bucket.Waiters.Count >= MaxWaitersPerAddress)
+                {
+                    return Reservation.Limited;
+                }
+            }
+
+            return Reservation.Busy;
+        }
+
+        if (_buckets.Count >= _maxTrackedAddresses)
+        {
+            if (_timeProvider.GetElapsedTime(_lastSweep, now) >= _tokenInterval)
+            {
+                Sweep(now);
+            }
+
+            if (_buckets.Count >= _maxTrackedAddresses)
+            {
+                return Reservation.Limited;
+            }
+        }
+
+        _buckets.Add(address, new Bucket { Tokens = _capacity - 1, Updated = now, InFlight = 1 });
+        return Reservation.Acquired;
+    }
+
+    /// <summary>
+    /// Passes free tokens to waiters in arrival order, then rejects the remaining waiters if no attempt is in flight to
+    /// return one. Called with the lock held, after <see cref="Refill"/>.
+    /// </summary>
+    /// <param name="bucket">The bucket.</param>
+    private static void Dispatch(Bucket bucket)
+    {
+        while (bucket.Tokens >= 1 && bucket.Waiters.TryDequeue(out var waiter))
+        {
+            if (waiter.TrySetResult(true))
+            {
+                bucket.Tokens -= 1;
+                bucket.InFlight++;
+            }
+        }
+
+        if (bucket.InFlight == 0)
+        {
+            while (bucket.Waiters.TryDequeue(out var waiter))
+            {
+                waiter.TrySetResult(false);
+            }
+        }
+    }
 
     /// <summary>Adds the tokens accrued since the bucket was last updated.</summary>
     /// <param name="bucket">The bucket.</param>
@@ -194,7 +339,8 @@ internal sealed class PublisherAuthenticationRateLimiter
         foreach (var (address, bucket) in _buckets)
         {
             Refill(bucket, now);
-            if (bucket.Tokens >= _capacity)
+            Dispatch(bucket);
+            if (bucket.Tokens >= _capacity && bucket.Waiters.Count == 0)
             {
                 (full ??= []).Add(address);
             }
@@ -217,5 +363,24 @@ internal sealed class PublisherAuthenticationRateLimiter
 
         /// <summary>Gets or sets the timestamp of the last refill.</summary>
         public long Updated { get; set; }
+
+        /// <summary>Gets or sets the number of reserved attempts not yet completed.</summary>
+        public int InFlight { get; set; }
+
+        /// <summary>Gets or sets the attempts waiting for a token, in arrival order; at most <see cref="MaxWaitersPerAddress"/>.</summary>
+        public Queue<TaskCompletionSource<bool>> Waiters { get; set; } = new();
+    }
+
+    /// <summary>The outcome of a reservation.</summary>
+    private enum Reservation
+    {
+        /// <summary>A token was reserved.</summary>
+        Acquired,
+
+        /// <summary>No token is left and none can be returned; reject.</summary>
+        Limited,
+
+        /// <summary>No token is free, but attempts in flight may return one.</summary>
+        Busy,
     }
 }

@@ -31,7 +31,8 @@ namespace RTSP.IngestService.Hls;
 /// </para>
 /// <para>
 /// Ownership: the packager owns every sample it is given. Samples are held, without copying, until their segment is
-/// written (one copy into the immutable segment) and then disposed; every other path disposes them immediately.
+/// written (one copy into the immutable segment) and then disposed; every other path disposes them immediately. A new
+/// segment's creator reference passes to the store when it is published and is released on every other path.
 /// </para>
 /// <para>Not thread-safe; calls for one stream must be sequential.</para>
 /// </remarks>
@@ -49,6 +50,9 @@ internal sealed partial class HlsPackager : IDisposable
 
     /// <summary>The store.</summary>
     private readonly IHlsSegmentStore _store;
+
+    /// <summary>The chunk pool for media segment bytes.</summary>
+    private readonly HlsSegmentBufferPool _pool;
 
     /// <summary>Metrics.</summary>
     private readonly HlsMetrics _metrics;
@@ -124,13 +128,15 @@ internal sealed partial class HlsPackager : IDisposable
     /// <param name="options">The settings.</param>
     /// <param name="store">The store; the stream must already be open.</param>
     /// <param name="numbering">The numbering the store assigned to the stream.</param>
+    /// <param name="pool">The chunk pool for media segment bytes.</param>
     /// <param name="metrics">Metrics.</param>
     /// <param name="logger">Logger.</param>
-    public HlsPackager(Guid sessionId, HlsOptions options, IHlsSegmentStore store, HlsStreamNumbering numbering, HlsMetrics metrics, ILogger logger)
+    public HlsPackager(Guid sessionId, HlsOptions options, IHlsSegmentStore store, HlsStreamNumbering numbering, HlsSegmentBufferPool pool, HlsMetrics metrics, ILogger logger)
     {
         SessionId = sessionId;
         _options = options;
         _store = store;
+        _pool = pool;
         _metrics = metrics;
         _logger = logger;
         _nextSequence = numbering.FirstSequence;
@@ -497,6 +503,7 @@ internal sealed partial class HlsPackager : IDisposable
         }
 
         _pendingBytes += length;
+        _metrics.PendingChanged(length);
         return true;
     }
 
@@ -541,7 +548,7 @@ internal sealed partial class HlsPackager : IDisposable
             }
 
             name = $"init-{_initializationCount}.mp4";
-            var result = _store.AddInitialization(SessionId, new HlsSegment(HlsSegmentKind.Initialization, name, bytes));
+            var result = Store(new HlsSegment(HlsSegmentKind.Initialization, name, bytes), s => _store.AddInitialization(SessionId, s));
             if (result == HlsAppendResult.StreamLimitExceeded)
             {
                 _metrics.Error(HlsErrorKind.StorageFull);
@@ -655,10 +662,11 @@ internal sealed partial class HlsPackager : IDisposable
             var duration = TimeSpan.FromTicks((segmentEnd * 1000 / 9) - (segmentStart * 1000 / 9));
 
             var sequence = _nextSequence;
-            byte[] bytes;
+            var name = $"segment-{sequence}.m4s";
+            HlsSegment segment;
             try
             {
-                bytes = Mp4Segments.WriteFragment(checked((uint)(sequence + 1)), tracks, _options.MaxSegmentSize);
+                segment = Mp4Segments.WriteFragment(checked((uint)(sequence + 1)), tracks, _options.MaxSegmentSize, _pool, name);
             }
             catch (Mp4SizeException ex)
             {
@@ -669,9 +677,9 @@ internal sealed partial class HlsPackager : IDisposable
                 return;
             }
 
-            var name = $"segment-{sequence}.m4s";
             var entry = new HlsSegmentEntry(sequence, name, duration, period.InitializationName, _discontinuityNext);
-            var result = _store.AppendSegment(SessionId, new HlsSegment(HlsSegmentKind.Media, name, bytes), entry);
+            var length = segment.Length;
+            var result = Store(segment, s => _store.AppendSegment(SessionId, s, entry));
             if (result is HlsAppendResult.StreamLimitExceeded or HlsAppendResult.PlaylistFull)
             {
                 if (result == HlsAppendResult.PlaylistFull)
@@ -706,14 +714,35 @@ internal sealed partial class HlsPackager : IDisposable
             _segmentStart = segmentEnd;
             _videoWrittenEnd = videoEnd ?? _videoWrittenEnd;
             SegmentCount++;
-            SegmentBytes += bytes.Length;
+            SegmentBytes += length;
             var wait = boundary == HlsSegmentBoundary.Keyframe && _video.Count > 0 ? duration - _options.TargetSegmentDuration : TimeSpan.Zero;
-            _metrics.Segment(bytes.Length, duration, boundary, wait);
-            LogSegment(SessionId, sequence, duration, bytes.Length, boundary);
+            _metrics.Segment(length, duration, boundary, wait);
+            LogSegment(SessionId, sequence, duration, length, boundary);
         }
         finally
         {
             ReleasePending();
+        }
+    }
+
+    /// <summary>Hands a new segment to the store; unless the store publishes it, the creator's reference is released.</summary>
+    /// <param name="segment">The segment.</param>
+    /// <param name="store">The store call.</param>
+    /// <returns>The store's result.</returns>
+    private static HlsAppendResult Store(HlsSegment segment, Func<HlsSegment, HlsAppendResult> store)
+    {
+        var result = HlsAppendResult.StorageFull;
+        try
+        {
+            result = store(segment);
+            return result;
+        }
+        finally
+        {
+            if (result != HlsAppendResult.Published)
+            {
+                segment.Release();
+            }
         }
     }
 
@@ -773,6 +802,7 @@ internal sealed partial class HlsPackager : IDisposable
 
         _video.Clear();
         _audio.Clear();
+        _metrics.PendingChanged(-_pendingBytes);
         _pendingBytes = 0;
     }
 

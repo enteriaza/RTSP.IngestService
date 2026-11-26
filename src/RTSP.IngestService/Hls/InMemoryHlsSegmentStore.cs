@@ -3,6 +3,7 @@
 // reference. Limits are enforced by rejecting new segments; a stored segment is only ever released after its
 // availability deadline. Expiry is evaluated lazily on each call, so no background worker is needed.
 
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Options;
 using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Streams;
@@ -22,7 +23,8 @@ namespace RTSP.IngestService.Hls;
 /// stream's next segment, needs them.
 /// </para>
 /// <para>
-/// Limits: a segment that would exceed the stream's or the global byte limit is rejected with
+/// Limits: a segment whose footprint (<see cref="HlsSegment.Footprint"/>) would exceed the stream's or the global
+/// byte limit is rejected with
 /// <see cref="HlsAppendResult.StorageFull"/> and nothing changes for that stream; no listed or still-available
 /// segment is ever released early, and other streams' playlists are never shrunk. Under global pressure, ended
 /// streams' playlists are withdrawn early (their segments then drain on their availability deadlines). Space returns
@@ -44,9 +46,14 @@ namespace RTSP.IngestService.Hls;
 /// They are raised under the lock and published by the same call after the lock is released; like every other
 /// transition here, retention expiry and drain are evaluated lazily, so they are observed on the next store call.
 /// </para>
-/// <para>Thread-safe; all state is guarded by one lock and every operation is short and bounded.</para>
+/// <para>
+/// Thread-safe. All state is guarded by one lock; writer operations are short and bounded and only visit the stream
+/// they change plus the streams with a due deadline (an expiry index), or, under global storage pressure, the ended
+/// streams. Readers use immutable per-key views republished under the lock whenever a key changes, so they take the
+/// lock only when a deadline is due, to run the lazy expiry first.
+/// </para>
 /// </remarks>
-public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInventory
+public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInventory, IDisposable
 {
     /// <summary>Guards all state.</summary>
     private readonly Lock _gate = new();
@@ -76,7 +83,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
     /// <summary>Metrics.</summary>
     private readonly HlsMetrics _metrics;
 
-    /// <summary>Bytes held across all streams.</summary>
+    /// <summary>Footprint (<see cref="HlsSegment.Footprint"/>) of the segments held across all streams.</summary>
     private long _totalBytes;
 
     /// <summary>The <see cref="Generation"/> path segment that prefixes every URI in published playlists.</summary>
@@ -87,6 +94,33 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
 
     /// <summary>Lifecycle events raised under <see cref="_gate"/>, published by the same call after it is released.</summary>
     private readonly List<StreamEvent> _pendingEvents = [];
+
+    /// <summary>Whether <see cref="Dispose"/> has released everything.</summary>
+    private bool _disposed;
+
+    /// <summary>
+    /// The streams with a pending deadline (a retired segment's availability or an ended playlist's retention), by
+    /// deadline. An entry may be stale; handling one is idempotent. One entry per retired segment and ended playlist.
+    /// </summary>
+    private readonly PriorityQueue<StreamState, DateTimeOffset> _deadlines = new();
+
+    /// <summary>The earliest deadline in <see cref="_deadlines"/>, in UTC ticks, for readers; <see cref="long.MaxValue"/> if none.</summary>
+    private long _nextDeadline = long.MaxValue;
+
+    /// <summary>Keys whose current stream has an ended playlist, withdrawn early under global storage pressure.</summary>
+    private readonly HashSet<KeyState> _ended = [];
+
+    /// <summary>Keys changed while <see cref="_gate"/> is held; their read views are replaced before it is released.</summary>
+    private readonly HashSet<KeyState> _changed = [];
+
+    /// <summary>
+    /// Read views by key: a projection of the guarded state, replaced under <see cref="_gate"/>, that readers use without
+    /// the lock. A key has a view exactly while it is in <see cref="_keys"/>.
+    /// </summary>
+    private readonly ConcurrentDictionary<(string Application, string Identity), KeyView> _views = new();
+
+    /// <summary>Bounds the segments held by readers of <see cref="TryAcquireSegment"/>, stored or already evicted.</summary>
+    private readonly HlsReaderMemoryBudget _readers;
 
     /// <summary>Initializes a new instance of the <see cref="InMemoryHlsSegmentStore"/> class.</summary>
     /// <param name="options">The limits.</param>
@@ -103,6 +137,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
         _time = time;
         _metrics = metrics;
         _events = events;
+        _readers = new HlsReaderMemoryBudget(_options.MaxTotalStorageBytes, metrics);
         Generation = Convert.ToHexStringLower(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
         _uriPrefix = Generation + "/";
     }
@@ -111,7 +146,10 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
     /// <remarks>32 lowercase hexadecimal digits (128 random bits), fixed for the store's lifetime.</remarks>
     public string Generation { get; }
 
-    /// <summary>Gets the bytes held across all streams, including withdrawn streams' remaining segments.</summary>
+    /// <summary>
+    /// Gets the footprint (<see cref="HlsSegment.Footprint"/>) of the segments held across all streams, including
+    /// withdrawn streams' remaining segments.
+    /// </summary>
     public long TotalBytes
     {
         get
@@ -155,6 +193,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
     {
         using (EnterGate())
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             PurgeExpired();
             numbering = default;
             var key = (application, streamIdentity);
@@ -166,7 +205,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
 
             if (keyState is null)
             {
-                keyState = new KeyState();
+                keyState = new KeyState(key);
                 if (_numbering.Remove(key, out var continued))
                 {
                     (keyState.NextSequence, keyState.NextInitialization) = (continued.FirstSequence, continued.FirstInitialization);
@@ -179,8 +218,9 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
                 Withdraw(keyState, ended, StreamEventReasons.Replaced);
             }
 
-            var state = new StreamState(key, sessionId, new HlsPlaylist(targetDurationSeconds, _options.PlaylistWindowSize), incarnationId, generation);
+            var state = new StreamState(keyState, sessionId, new HlsPlaylist(targetDurationSeconds, _options.PlaylistWindowSize), incarnationId, generation);
             keyState.Current = state;
+            _changed.Add(keyState);
             _bySession[sessionId] = state;
             numbering = new HlsStreamNumbering(keyState.NextSequence, keyState.NextInitialization);
             return true;
@@ -193,11 +233,12 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
         ArgumentNullException.ThrowIfNull(segment);
         using (EnterGate())
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             PurgeExpired();
             var state = Writer(sessionId);
             var keyState = _keys[state.Key];
             EnsureUnique(keyState, segment.Name);
-            if (HasRoom(state, segment.Length) is var room and not HlsAppendResult.Published)
+            if (HasRoom(state, segment.Footprint) is var room and not HlsAppendResult.Published)
             {
                 return room;
             }
@@ -222,6 +263,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
         ArgumentNullException.ThrowIfNull(entry);
         using (EnterGate())
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             PurgeExpired();
             var state = Writer(sessionId);
             var keyState = _keys[state.Key];
@@ -242,7 +284,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
                 return HlsAppendResult.PlaylistFull;
             }
 
-            if (HasRoom(state, segment.Length) is var room and not HlsAppendResult.Published)
+            if (HasRoom(state, segment.Footprint) is var room and not HlsAppendResult.Published)
             {
                 return room;
             }
@@ -280,12 +322,15 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
             if (withdrawal is not null)
             {
                 Withdraw(keyState, state, withdrawal);
+                TryRemoveKey(keyState);
                 return;
             }
 
             state.Playlist.End();
             state.Ended = true;
             state.ExpiresAt = _time.GetUtcNow() + _options.EndedStreamRetention;
+            _deadlines.Enqueue(state, state.ExpiresAt);
+            _ended.Add(keyState);
             Publish(state);
         }
     }
@@ -293,44 +338,110 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
     /// <inheritdoc />
     public HlsPlaylistSnapshot? GetPlaylist(string application, string streamIdentity)
     {
-        using (EnterGate())
-        {
-            PurgeExpired();
-            return _keys.TryGetValue((application, streamIdentity), out var keyState) ? keyState.Current?.Snapshot : null;
-        }
+        PurgeIfDue();
+        return _views.TryGetValue((application, streamIdentity), out var view) ? view.Playlist : null;
     }
 
     /// <inheritdoc />
     public HlsSegment? GetSegment(string application, string streamIdentity, string name)
     {
+        PurgeIfDue();
+        return Find(application, streamIdentity, name);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>A segment the store releases concurrently may be reported as not stored; a leased one stays valid.</remarks>
+    public HlsSegmentLease? AcquireSegment(string application, string streamIdentity, string name)
+    {
+        PurgeIfDue();
+        return Find(application, streamIdentity, name)?.TryAcquire();
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// The budget is <see cref="HlsOptions.MaxTotalStorageMegabytes"/>, so segment memory stays within twice the
+    /// storage limit: stored segments plus evicted ones still being read.
+    /// </remarks>
+    public HlsSegmentAccess TryAcquireSegment(string application, string streamIdentity, string name, out HlsSegmentLease? lease)
+    {
+        PurgeIfDue();
+        lease = null;
+        var access = Find(application, streamIdentity, name)?.TryAcquire(_readers, out lease) ?? HlsSegmentAccess.NotStored;
+        if (access == HlsSegmentAccess.ReaderMemoryExhausted)
+        {
+            _metrics.ReaderRefused();
+        }
+
+        return access;
+    }
+
+    /// <summary>Gets the reader memory budget.</summary>
+    internal HlsReaderMemoryBudget ReaderBudget => _readers;
+
+    /// <summary>
+    /// Releases every stored segment. Leases already taken stay valid until disposed; afterwards nothing is stored,
+    /// readers find nothing and writers are refused.
+    /// </summary>
+    public void Dispose()
+    {
         using (EnterGate())
         {
-            PurgeExpired();
-            if (!_keys.TryGetValue((application, streamIdentity), out var keyState))
+            if (_disposed)
             {
-                return null;
+                return;
             }
 
-            foreach (var state in keyState.Instances())
+            _disposed = true;
+            foreach (var keyState in _keys.Values)
             {
-                if (state.Segments.TryGetValue(name, out var segment))
+                foreach (var state in keyState.Instances())
                 {
-                    return segment;
+                    foreach (var segment in state.Segments.Values)
+                    {
+                        segment.Release();
+                    }
+
+                    _metrics.StorageChanged(-state.Bytes);
+                    state.Segments.Clear();
+                    state.Bytes = 0;
                 }
             }
 
-            return null;
+            _keys.Clear();
+            _views.Clear();
+            _bySession.Clear();
+            _deadlines.Clear();
+            _ended.Clear();
+            _changed.Clear();
+            _totalBytes = 0;
+        }
+    }
+
+    /// <summary>Returns a stored segment from the read views.</summary>
+    /// <param name="application">The application.</param>
+    /// <param name="streamIdentity">The stream identity.</param>
+    /// <param name="name">The segment URI.</param>
+    /// <returns>The segment, or <see langword="null"/>.</returns>
+    private HlsSegment? Find(string application, string streamIdentity, string name) =>
+        _views.TryGetValue((application, streamIdentity), out var view) && view.Segments.TryGetValue(name, out var segment) ? segment : null;
+
+    /// <summary>Runs the lazy expiry under the lock, but only when a deadline is due; readers otherwise need no lock.</summary>
+    private void PurgeIfDue()
+    {
+        if (_time.GetUtcNow().UtcTicks >= Volatile.Read(ref _nextDeadline))
+        {
+            using (EnterGate())
+            {
+                PurgeExpired();
+            }
         }
     }
 
     /// <inheritdoc />
     public bool ContainsStream(string application, string streamIdentity)
     {
-        using (EnterGate())
-        {
-            PurgeExpired();
-            return _keys.ContainsKey((application, streamIdentity));
-        }
+        PurgeIfDue();
+        return _views.ContainsKey((application, streamIdentity));
     }
 
     /// <inheritdoc />
@@ -389,6 +500,7 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
     /// <param name="state">The stream.</param>
     private void Publish(StreamState state)
     {
+        _changed.Add(state.Owner);
         var playlist = state.Playlist;
         if (playlist.Entries.Count == 0)
         {
@@ -417,9 +529,9 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
     /// pressure ended streams' playlists are withdrawn early so their segments start draining.
     /// </summary>
     /// <param name="state">The stream receiving the bytes.</param>
-    /// <param name="bytes">The size of the new segment.</param>
+    /// <param name="bytes">The footprint of the new segment.</param>
     /// <returns><see cref="HlsAppendResult.Published"/> if the segment fits; otherwise why not.</returns>
-    private HlsAppendResult HasRoom(StreamState state, int bytes)
+    private HlsAppendResult HasRoom(StreamState state, long bytes)
     {
         if (state.Bytes + bytes > _options.MaxSessionStorageBytes)
         {
@@ -431,15 +543,15 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
             return HlsAppendResult.Published;
         }
 
-        foreach (var keyState in _keys.Values)
+        if (_ended.Count > 0)
         {
-            if (keyState.Current is { Ended: true } ended)
+            foreach (var keyState in _ended.ToArray())
             {
-                Withdraw(keyState, ended, StreamEventReasons.StoragePressure);
+                Withdraw(keyState, keyState.Current!, StreamEventReasons.StoragePressure);
+                TryRemoveKey(keyState);
             }
         }
 
-        RemoveEmptyKeys();
         return _totalBytes + bytes <= _options.MaxTotalStorageBytes ? HlsAppendResult.Published : HlsAppendResult.StorageFull;
     }
 
@@ -448,10 +560,12 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
     /// <param name="entry">The removed segment.</param>
     /// <param name="now">The removal time.</param>
     /// <param name="reason">The eviction reason tag used when it expires.</param>
-    private static void Retire(StreamState state, HlsSegmentEntry entry, DateTimeOffset now, string reason)
+    private void Retire(StreamState state, HlsSegmentEntry entry, DateTimeOffset now, string reason)
     {
         state.LongestPlaylist.Remove(entry.Name, out var longest);
-        state.Retired.Add(new RetiredSegment(entry, AvailabilityDeadline(entry.Duration, longest, now), reason));
+        var deadline = AvailabilityDeadline(entry.Duration, longest, now);
+        state.Retired.Add(new RetiredSegment(entry, deadline, reason));
+        _deadlines.Enqueue(state, deadline);
     }
 
     /// <summary>
@@ -468,7 +582,10 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
         if (ReferenceEquals(keyState.Current, state))
         {
             keyState.Current = null;
+            _ended.Remove(keyState);
         }
+
+        _changed.Add(keyState);
 
         var now = _time.GetUtcNow();
         foreach (var entry in state.Playlist.Entries)
@@ -491,37 +608,56 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
         }
     }
 
-    /// <summary>Releases segments past their availability deadline and withdraws ended playlists past their retention.</summary>
+    /// <summary>
+    /// Releases segments past their availability deadline and withdraws ended playlists past their retention. Only
+    /// streams with a due deadline are visited.
+    /// </summary>
     private void PurgeExpired()
     {
         var now = _time.GetUtcNow();
-        foreach (var keyState in _keys.Values)
+        while (_deadlines.TryPeek(out var state, out var deadline) && deadline <= now)
         {
-            if (keyState.Current is { Ended: true } ended && ended.ExpiresAt <= now)
-            {
-                Withdraw(keyState, ended, StreamEventReasons.RetentionExpired);
-            }
+            _deadlines.Dequeue();
+            Expire(state, now);
+        }
+    }
 
-            foreach (var state in keyState.Instances())
-            {
-                if (state.Retired.Count == 0 || !state.Retired.Exists(r => r.ExpiresAt <= now))
-                {
-                    continue;
-                }
-
-                foreach (var expired in state.Retired.FindAll(r => r.ExpiresAt <= now))
-                {
-                    Release(state, expired.Entry.Name, expired.Reason);
-                }
-
-                state.Retired.RemoveAll(r => r.ExpiresAt <= now);
-                ReleaseUnreferencedInitializations(state);
-            }
-
-            RemoveDrained(keyState);
+    /// <summary>Handles a due deadline of one stream instance; a stale one changes nothing.</summary>
+    /// <param name="state">The stream.</param>
+    /// <param name="now">The current time.</param>
+    private void Expire(StreamState state, DateTimeOffset now)
+    {
+        var keyState = state.Owner;
+        if (keyState.Removed)
+        {
+            return;
         }
 
-        RemoveEmptyKeys();
+        if (ReferenceEquals(keyState.Current, state))
+        {
+            if (state.Ended && state.ExpiresAt <= now)
+            {
+                Withdraw(keyState, state, StreamEventReasons.RetentionExpired);
+            }
+        }
+        else if (!keyState.Withdrawn.Contains(state))
+        {
+            return;
+        }
+
+        if (state.Retired.Count > 0 && state.Retired.Exists(r => r.ExpiresAt <= now))
+        {
+            foreach (var expired in state.Retired.FindAll(r => r.ExpiresAt <= now))
+            {
+                Release(state, expired.Entry.Name, expired.Reason);
+            }
+
+            state.Retired.RemoveAll(r => r.ExpiresAt <= now);
+            ReleaseUnreferencedInitializations(state);
+        }
+
+        RemoveDrained(keyState);
+        TryRemoveKey(keyState);
     }
 
     /// <summary>Forgets withdrawn streams with no remaining segments, raising <see cref="StreamEventType.Drained"/> for each.</summary>
@@ -567,35 +703,57 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
         return new GateScope(this);
     }
 
-    /// <summary>Forgets keys with no stream and no remaining segments.</summary>
-    private void RemoveEmptyKeys()
+    /// <summary>Forgets a key with no stream and no remaining segments, keeping its numbering.</summary>
+    /// <param name="keyState">The key.</param>
+    private void TryRemoveKey(KeyState keyState)
     {
-        List<(string, string)>? empty = null;
-        foreach (var (key, keyState) in _keys)
+        if (keyState.Removed || keyState.Current is not null || keyState.Withdrawn.Count > 0)
         {
-            RemoveDrained(keyState);
-            if (keyState.Current is null && keyState.Withdrawn.Count == 0)
-            {
-                (empty ??= []).Add(key);
-            }
+            return;
         }
 
-        foreach (var key in empty ?? [])
-        {
-            _numbering[key] = new HlsStreamNumbering(_keys[key].NextSequence, _keys[key].NextInitialization);
-            _keys.Remove(key);
-        }
+        _numbering[keyState.Key] = new HlsStreamNumbering(keyState.NextSequence, keyState.NextInitialization);
+        _keys.Remove(keyState.Key);
+        _views.TryRemove(keyState.Key, out _);
+        keyState.Removed = true;
     }
 
-    /// <summary>Stores a segment and accounts for it.</summary>
+    /// <summary>Replaces the read views of the keys changed under the lock and publishes the next deadline.</summary>
+    private void PublishViews()
+    {
+        foreach (var keyState in _changed)
+        {
+            if (keyState.Removed)
+            {
+                continue;
+            }
+
+            var segments = new Dictionary<string, HlsSegment>(StringComparer.Ordinal);
+            foreach (var state in keyState.Instances())
+            {
+                foreach (var (name, segment) in state.Segments)
+                {
+                    segments.TryAdd(name, segment);
+                }
+            }
+
+            _views[keyState.Key] = new KeyView(keyState.Current?.Snapshot, segments);
+        }
+
+        _changed.Clear();
+        Volatile.Write(ref _nextDeadline, _deadlines.TryPeek(out _, out var deadline) ? deadline.UtcTicks : long.MaxValue);
+    }
+
+    /// <summary>Stores a segment and accounts for its footprint, so the limits bound the memory it holds.</summary>
     /// <param name="state">The stream.</param>
     /// <param name="segment">The segment.</param>
     private void Store(StreamState state, HlsSegment segment)
     {
+        _changed.Add(state.Owner);
         state.Segments.Add(segment.Name, segment);
-        state.Bytes += segment.Length;
-        _totalBytes += segment.Length;
-        _metrics.StorageChanged(segment.Length);
+        state.Bytes += segment.Footprint;
+        _totalBytes += segment.Footprint;
+        _metrics.StorageChanged(segment.Footprint);
     }
 
     /// <summary>Releases a stored segment.</summary>
@@ -606,10 +764,12 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
     {
         if (state.Segments.Remove(name, out var segment))
         {
-            state.Bytes -= segment.Length;
-            _totalBytes -= segment.Length;
-            _metrics.StorageChanged(-segment.Length);
+            _changed.Add(state.Owner);
+            state.Bytes -= segment.Footprint;
+            _totalBytes -= segment.Footprint;
+            _metrics.StorageChanged(-segment.Footprint);
             _metrics.Evicted(reason);
+            segment.Release();
         }
     }
 
@@ -632,9 +792,21 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
     /// <param name="Reason">The eviction reason tag: retired or withdrawn.</param>
     private readonly record struct RetiredSegment(HlsSegmentEntry Entry, DateTimeOffset ExpiresAt, string Reason);
 
+    /// <summary>What readers see of one key: replaced, never modified, whenever the key changes.</summary>
+    /// <param name="Playlist">The published playlist of the current stream, if any.</param>
+    /// <param name="Segments">Every stored segment of every instance of the key, by name.</param>
+    private sealed record KeyView(HlsPlaylistSnapshot? Playlist, Dictionary<string, HlsSegment> Segments);
+
     /// <summary>All instances of one stream key.</summary>
-    private sealed class KeyState
+    /// <param name="key">The key.</param>
+    private sealed class KeyState((string Application, string Identity) key)
     {
+        /// <summary>Gets the key.</summary>
+        public (string Application, string Identity) Key { get; } = key;
+
+        /// <summary>Gets or sets a value indicating whether the key has been forgotten; its stream instances are inert.</summary>
+        public bool Removed { get; set; }
+
         /// <summary>Gets or sets the stream whose playlist is published (active or ended), if any.</summary>
         public StreamState? Current { get; set; }
 
@@ -670,17 +842,24 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
     /// <param name="store">The store.</param>
     private readonly ref struct GateScope(InMemoryHlsSegmentStore store)
     {
-        /// <summary>Releases the lock and publishes the events raised while it was held.</summary>
+        /// <summary>Replaces changed read views, releases the lock and publishes the events raised while it was held.</summary>
         public void Dispose()
         {
             StreamEvent[]? events = null;
-            if (store._pendingEvents.Count > 0)
+            try
             {
-                events = [.. store._pendingEvents];
-                store._pendingEvents.Clear();
+                store.PublishViews();
+                if (store._pendingEvents.Count > 0)
+                {
+                    events = [.. store._pendingEvents];
+                    store._pendingEvents.Clear();
+                }
+            }
+            finally
+            {
+                store._gate.Exit();
             }
 
-            store._gate.Exit();
             foreach (var streamEvent in events ?? [])
             {
                 store._events!.Publish(streamEvent);
@@ -689,18 +868,21 @@ public sealed class InMemoryHlsSegmentStore : IHlsSegmentStore, IHlsStreamInvent
     }
 
     /// <summary>State of one stream instance.</summary>
-    /// <param name="key">The stream key.</param>
+    /// <param name="owner">The key it belongs to.</param>
     /// <param name="sessionId">The writer session.</param>
     /// <param name="playlist">The playlist.</param>
     /// <param name="incarnationId">The publication's incarnation identifier, if lifecycle events are reported for it.</param>
     /// <param name="generation">The publication's registration generation.</param>
-    private sealed class StreamState((string Application, string Identity) key, Guid sessionId, HlsPlaylist playlist, string? incarnationId, long generation)
+    private sealed class StreamState(KeyState owner, Guid sessionId, HlsPlaylist playlist, string? incarnationId, long generation)
     {
         /// <summary>Gets the publication's registration generation.</summary>
         public long Generation { get; } = generation;
 
+        /// <summary>Gets the key it belongs to.</summary>
+        public KeyState Owner { get; } = owner;
+
         /// <summary>Gets the stream key.</summary>
-        public (string Application, string Identity) Key { get; } = key;
+        public (string Application, string Identity) Key => Owner.Key;
 
         /// <summary>Gets the writer session.</summary>
         public Guid SessionId { get; } = sessionId;

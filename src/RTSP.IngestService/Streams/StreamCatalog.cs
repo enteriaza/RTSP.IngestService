@@ -1,7 +1,9 @@
 // The stream catalog: an in-memory, reconciled read model of active stream incarnations. Its authority is the RTMP
 // registry and the HLS store, read through IStreamInventorySource; lifecycle events only accelerate updates of
-// incarnations a snapshot already established, and request reconciliation for anything else. Every change builds a
-// complete new immutable StreamCatalogSnapshot and publishes it with one reference write, so readers never lock.
+// incarnations a snapshot already established, and request reconciliation for anything else. Every change derives a
+// new immutable StreamCatalogSnapshot from the published one, replacing only the entries that changed (a
+// reconciliation still merges every incarnation of its snapshot), and publishes it with one reference write, so
+// readers never lock.
 //
 // Incarnation safety: entries are keyed by incarnation identifier, never by name, so an event or snapshot about one
 // incarnation cannot touch another. Within an incarnation, publishing and HLS states only move forward (merges take
@@ -150,6 +152,19 @@ public sealed partial class StreamCatalog : IStreamEventConsumer, IDisposable
         Interlocked.Exchange(ref _pending, 0);
     }
 
+    /// <summary>Takes a pending reconciliation request, if there is one, without waiting.</summary>
+    /// <returns><see langword="true"/> if a request was taken.</returns>
+    internal bool TryTakeRequest()
+    {
+        if (!_requested.Wait(0))
+        {
+            return false;
+        }
+
+        Interlocked.Exchange(ref _pending, 0);
+        return true;
+    }
+
     /// <summary>Records a request and reconciles immediately on the calling thread.</summary>
     /// <param name="trigger">Why.</param>
     /// <returns><see langword="true"/> if a new state was published.</returns>
@@ -262,20 +277,18 @@ public sealed partial class StreamCatalog : IStreamEventConsumer, IDisposable
             }
 
             var epoch = ++_epoch;
-            IEnumerable<StreamCatalogEntry> entries;
             if (next is null)
             {
                 _tombstones[incarnation] = epoch;
                 _eventEpochs.Remove(incarnation);
-                entries = current.Streams.Where(e => !ReferenceEquals(e, entry));
+                _current = current.With(current.Version + 1, current.IsInitialized, current.ReconciledAt, [], [incarnation]);
             }
             else
             {
                 _eventEpochs[incarnation] = epoch;
-                entries = current.Streams.Select(e => ReferenceEquals(e, entry) ? next : e);
+                _current = current.With(current.Version + 1, current.IsInitialized, current.ReconciledAt, [next], []);
             }
 
-            _current = new StreamCatalogSnapshot(current.Version + 1, current.IsInitialized, current.ReconciledAt, entries);
             return reconcile;
         }
     }
@@ -308,18 +321,55 @@ public sealed partial class StreamCatalog : IStreamEventConsumer, IDisposable
             registered.TryAdd(status.IncarnationId, status);
         }
 
-        var entries = new List<StreamCatalogEntry>(hls.Count + registered.Count);
-        var unsettled = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var incarnation in registered.Keys.Union(hls.Keys))
+        var changes = new List<StreamCatalogEntry>();
+        var removals = new List<string>();
+        var unsettled = 0;
+        foreach (var session in registered.Values)
         {
+            Merge(session.IncarnationId, session, hls.GetValueOrDefault(session.IncarnationId));
+        }
+
+        foreach (var stream in hls.Values)
+        {
+            if (!registered.ContainsKey(stream.IncarnationId))
+            {
+                Merge(stream.IncarnationId, null, stream);
+            }
+        }
+
+        foreach (var entry in previous.Streams)
+        {
+            if (!registered.ContainsKey(entry.IncarnationId) && !hls.ContainsKey(entry.IncarnationId))
+            {
+                removals.Add(entry.IncarnationId);
+            }
+        }
+
+        var next = previous.With(previous.Version + 1, true, _time.GetUtcNow(), changes, removals);
+        Volatile.Write(ref _unsettled, unsettled);
+        _eventEpochs.Clear();
+        foreach (var drained in _tombstones.Where(t => t.Value <= epoch).Select(t => t.Key).ToArray())
+        {
+            _tombstones.Remove(drained);
+        }
+
+        _current = next;
+
+        // Adds the incarnation's merged entry to changes unless it equals its prior entry, or to removals if it
+        // should not be listed.
+        void Merge(string incarnation, PublishingStatus? session, HlsStreamStatus? stream)
+        {
+            var prior = previous.FindIncarnation(incarnation);
             if (_tombstones.TryGetValue(incarnation, out var drainedAt) && drainedAt > epoch)
             {
-                continue;
+                if (prior is not null)
+                {
+                    removals.Add(incarnation);
+                }
+
+                return;
             }
 
-            registered.TryGetValue(incarnation, out var session);
-            hls.TryGetValue(incarnation, out var stream);
-            var prior = previous.FindIncarnation(incarnation);
             var isPublishing = session is { Publishing: true } && prior?.Publishing.State != StreamPublishingState.Ended;
 
             StreamHlsState hlsState;
@@ -336,7 +386,12 @@ public sealed partial class StreamCatalog : IStreamEventConsumer, IDisposable
             }
             else
             {
-                continue;
+                if (prior is not null)
+                {
+                    removals.Add(incarnation);
+                }
+
+                return;
             }
 
             if (prior is not null && prior.Hls.State > hlsState)
@@ -348,40 +403,46 @@ public sealed partial class StreamCatalog : IStreamEventConsumer, IDisposable
             // The HLS close after an RTMP end and the first published playlist both happen without an event.
             if (hlsState == StreamHlsState.Live && (!isPublishing || !playlistAvailable))
             {
-                unsettled.Add(incarnation);
+                unsettled++;
             }
 
             var eventNewer = _eventEpochs.TryGetValue(incarnation, out var changedAt) && changedAt > epoch;
             var media = eventNewer && prior?.Media is not null ? prior.Media
                 : session is { Publishing: true } ? session.Media
                 : session?.Media ?? prior?.Media;
-            entries.Add(new StreamCatalogEntry
+            var application = session?.Application ?? stream!.Application;
+            var name = session?.Stream ?? stream!.Stream;
+            var generation = session?.Generation ?? (stream!.Generation != 0 ? stream.Generation : prior?.Generation ?? 0);
+            var state = isPublishing ? StreamPublishingState.Publishing : StreamPublishingState.Ended;
+            var startedAt = session?.StartedAt ?? prior?.Publishing.StartedAt;
+            var endedAt = session?.EndedAt ?? prior?.Publishing.EndedAt;
+            var endReason = session?.EndReason ?? prior?.Publishing.EndReason;
+            if (prior is not null
+                && string.Equals(prior.Application, application, StringComparison.Ordinal)
+                && string.Equals(prior.Stream, name, StringComparison.Ordinal)
+                && prior.Generation == generation
+                && prior.Publishing.State == state
+                && prior.Publishing.StartedAt == startedAt
+                && prior.Publishing.EndedAt == endedAt
+                && string.Equals(prior.Publishing.EndReason, endReason, StringComparison.Ordinal)
+                && prior.Hls.State == hlsState
+                && prior.Hls.PlaylistAvailable == playlistAvailable
+                && Equals(prior.Media, media))
             {
-                Application = session?.Application ?? stream!.Application,
-                Stream = session?.Stream ?? stream!.Stream,
+                return;
+            }
+
+            changes.Add(new StreamCatalogEntry
+            {
+                Application = application,
+                Stream = name,
                 IncarnationId = incarnation,
-                Generation = session?.Generation ?? (stream!.Generation != 0 ? stream.Generation : prior?.Generation ?? 0),
-                Publishing = new StreamPublishingInfo
-                {
-                    State = isPublishing ? StreamPublishingState.Publishing : StreamPublishingState.Ended,
-                    StartedAt = session?.StartedAt ?? prior?.Publishing.StartedAt,
-                    EndedAt = session?.EndedAt ?? prior?.Publishing.EndedAt,
-                    EndReason = session?.EndReason ?? prior?.Publishing.EndReason,
-                },
+                Generation = generation,
+                Publishing = new StreamPublishingInfo { State = state, StartedAt = startedAt, EndedAt = endedAt, EndReason = endReason },
                 Hls = new StreamHlsInfo { State = hlsState, PlaylistAvailable = playlistAvailable },
                 Media = media,
             });
         }
-
-        var next = new StreamCatalogSnapshot(previous.Version + 1, true, _time.GetUtcNow(), entries);
-        Volatile.Write(ref _unsettled, unsettled.Count);
-        _eventEpochs.Clear();
-        foreach (var drained in _tombstones.Where(t => t.Value <= epoch).Select(t => t.Key).ToArray())
-        {
-            _tombstones.Remove(drained);
-        }
-
-        _current = next;
     }
 
     /// <summary>Logs a failed reconciliation.</summary>

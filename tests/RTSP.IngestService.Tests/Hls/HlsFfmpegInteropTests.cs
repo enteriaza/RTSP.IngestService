@@ -171,7 +171,7 @@ public sealed class HlsFfmpegInteropTests
         var audio = new List<(long Start, long Duration)>();
         foreach (var segment in playlist.Segments)
         {
-            foreach (var run in Mp4Fragments.Read(store.GetSegment("live", identity, segment.Name)!.Data.ToArray()).Runs)
+            foreach (var run in Mp4Fragments.Read(store.ReadSegment("live", identity, segment.Name)!).Runs)
             {
                 var time = (long)run.BaseDecodeTime;
                 foreach (var sample in run.Samples)
@@ -354,7 +354,7 @@ public sealed class HlsFfmpegInteropTests
             var generation = Directory.CreateDirectory(Path.Combine(_path, store.Generation)).FullName;
             foreach (var name in playlist.Segments.SelectMany(static s => new[] { s.InitializationName, s.Name }).Distinct())
             {
-                File.WriteAllBytes(Path.Combine(generation, name), store.GetSegment(application, identity, name)!.Data.ToArray());
+                File.WriteAllBytes(Path.Combine(generation, name), store.ReadSegment(application, identity, name)!);
             }
 
             var path = Path.Combine(_path, "index.m3u8");

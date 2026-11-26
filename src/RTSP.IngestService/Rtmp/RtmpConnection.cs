@@ -119,28 +119,28 @@ internal sealed partial class RtmpConnection : IDisposable
         Exception? failure = null;
 
         LogAccepted(Id, RemoteEndPoint);
-        using var timeoutSource = new CancellationTokenSource(Timeout.InfiniteTimeSpan, time);
-        using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
+        using var deadline = new ConnectionDeadline(time);
+        using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token);
         var token = linkedSource.Token;
         try
         {
             TransitionTo(RtmpConnectionState.Handshaking);
-            timeoutSource.CancelAfter(options.HandshakeTimeout);
+            deadline.Arm(options.HandshakeTimeout);
             await RtmpHandshake.PerformAsync(_transport, 0, token).ConfigureAwait(false);
-            timeoutSource.CancelAfter(Timeout.InfiniteTimeSpan);
+            deadline.Disarm();
             handshakeCompleted = true;
             AddReceived(RtmpHandshake.ClientBytes);
             _context.Metrics.Handshake(succeeded: true);
             LogHandshakeCompleted(Id);
 
             TransitionTo(RtmpConnectionState.Connected);
-            reason = await ReceiveAsync(timeoutSource, token).ConfigureAwait(false);
+            reason = await ReceiveAsync(deadline, token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             reason = RtmpCloseReason.ServerShutdown;
         }
-        catch (OperationCanceledException) when (timeoutSource.IsCancellationRequested)
+        catch (OperationCanceledException) when (deadline.HasExpired)
         {
             reason = handshakeCompleted ? RtmpCloseReason.IdleTimeout : RtmpCloseReason.HandshakeTimeout;
         }
@@ -219,19 +219,19 @@ internal sealed partial class RtmpConnection : IDisposable
     };
 
     /// <summary>The receive loop.</summary>
-    /// <param name="timeoutSource">Armed with the connection timeout while waiting for data or a flush.</param>
+    /// <param name="deadline">Armed with the connection timeout while waiting for data or a flush.</param>
     /// <param name="token">Cancelled at shutdown or by the timeout.</param>
     /// <returns>Why the loop ended normally.</returns>
-    private async Task<RtmpCloseReason> ReceiveAsync(CancellationTokenSource timeoutSource, CancellationToken token)
+    private async Task<RtmpCloseReason> ReceiveAsync(ConnectionDeadline deadline, CancellationToken token)
     {
         var reader = _transport.Input;
         var timeout = _context.Options.ConnectionTimeout;
         long retained = 0;
         while (true)
         {
-            timeoutSource.CancelAfter(timeout);
+            deadline.Arm(timeout);
             var result = await reader.ReadAsync(token).ConfigureAwait(false);
-            timeoutSource.CancelAfter(Timeout.InfiniteTimeSpan);
+            deadline.Disarm();
 
             var buffer = result.Buffer;
             AddReceived(buffer.Length - retained);
@@ -255,9 +255,9 @@ internal sealed partial class RtmpConnection : IDisposable
             retained = buffer.Length;
             AcknowledgeIfDue();
 
-            timeoutSource.CancelAfter(timeout);
+            deadline.Arm(timeout);
             await _writer.FlushAsync(token).ConfigureAwait(false);
-            timeoutSource.CancelAfter(Timeout.InfiniteTimeSpan);
+            deadline.Disarm();
 
             if (Session.CloseRequest is { } closeReason)
             {
