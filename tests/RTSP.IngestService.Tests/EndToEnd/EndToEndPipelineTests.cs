@@ -21,6 +21,7 @@ using RTSP.IngestService.Streams;
 using RTSP.IngestService.Tests.Hls;
 using RTSP.IngestService.Tests.Infrastructure;
 using RTSP.IngestService.Tests.Telemetry;
+using RTSP.IngestService.Transcoding;
 
 namespace RTSP.IngestService.Tests.EndToEnd;
 
@@ -29,10 +30,10 @@ namespace RTSP.IngestService.Tests.EndToEnd;
 public sealed class EndToEndPipelineTests : IDisposable
 {
     /// <summary>Meters that must appear in the OTLP payload.</summary>
-    private static readonly string[] Meters = [RtmpMetrics.MeterName, MediaMetrics.MeterName, HlsMetrics.MeterName, HttpOriginMetrics.MeterName, StreamEventMetrics.MeterName];
+    private static readonly string[] Meters = [RtmpMetrics.MeterName, MediaMetrics.MeterName, TranscodingMetrics.MeterName, HlsMetrics.MeterName, HttpOriginMetrics.MeterName, StreamEventMetrics.MeterName];
 
     /// <summary>Instruments whose totals must grow with the workload.</summary>
-    private static readonly string[] Growing = ["rtmp.connections.accepted", "rtmp.bytes_received", "media.samples", "hls.segments", "http.origin.requests", "stream_events.published", "stream_catalog.reconciliations"];
+    private static readonly string[] Growing = ["rtmp.connections.accepted", "rtmp.bytes_received", "transcoding.frames.decoded", "transcoding.frames.encoded", "media.samples", "hls.segments", "http.origin.requests", "stream_events.published", "stream_catalog.reconciliations"];
 
     /// <summary>Captured host logs.</summary>
     private readonly FakeLogCollector _logs = new();
@@ -205,7 +206,7 @@ public sealed class EndToEndPipelineTests : IDisposable
         await Eventually.WaitUntilAsync(() => collector.Requests.Any(r => Meters.All(m => Contains(r.Body, m))), "an OTLP export carries every application meter");
         Assert.All(collector.Requests, r => Assert.Equal("POST /v1/metrics HTTP/1.1", r.RequestLine));
         Assert.All(collector.Requests, r => Assert.All(new[] { EndToEndHost.Key(1), incarnation, "camera1" }, f => Assert.False(Contains(r.Body, f), $"OTLP payload contains {f}")));
-        evidence.Add($"OTLP: {collector.Requests.Count} POST /v1/metrics requests, application/x-protobuf; a payload carries all five meters; no key, stream or incarnation in any payload");
+        evidence.Add($"OTLP: {collector.Requests.Count} POST /v1/metrics requests, application/x-protobuf; a payload carries all six meters; no key, stream or incarnation in any payload");
 
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         await host.StopAsync(CancellationToken.None).WithinSafetyTimeout();

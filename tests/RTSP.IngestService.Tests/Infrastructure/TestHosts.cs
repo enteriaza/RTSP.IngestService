@@ -1,6 +1,7 @@
 // Factory for real service hosts used by integration-style tests. Hosts are built through the production composition
 // root and then adjusted for testing: the environment is fixed to "Testing", configuration overrides are layered on
-// top of the shipped appsettings.json, and logging is redirected to an in-memory FakeLogCollector.
+// top of the shipped appsettings.json, and logging is redirected to an in-memory FakeLogCollector. Transcoding uses
+// the FFmpeg found by FfmpegTool; without one it is disabled, so hosts still start and tests that publish skip.
 
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
@@ -48,6 +49,14 @@ internal static class TestHosts
             ["Rtmp:Port"] = "0",
             ["Http:Port"] = "0",
         };
+        if (FfmpegTool.Path is { } ffmpeg)
+        {
+            values["Transcoding:FfmpegPath"] = ffmpeg;
+        }
+        else
+        {
+            values["Transcoding:Enabled"] = "false";
+        }
 
         foreach (var (key, value) in overrides ?? new Dictionary<string, string?>())
         {

@@ -29,6 +29,7 @@ using RTSP.IngestService.Telemetry;
 using RTSP.IngestService.Tests.Hls;
 using RTSP.IngestService.Tests.Infrastructure;
 using RTSP.IngestService.Tests.Rtp;
+using RTSP.IngestService.Transcoding;
 
 namespace RTSP.IngestService.Tests.Telemetry;
 
@@ -62,6 +63,19 @@ public sealed class TelemetryExportTests
         ["media.errors"] = new() { ["kind=malformed_packet;track=audio"] = 1 },
         ["media.timestamp_discontinuities"] = new() { ["kind=jump;track=video"] = 1 },
         ["media.sessions.active"] = new() { [""] = 1 },
+        ["transcoding.sessions.active"] = new() { [""] = 1 },
+        ["transcoding.process.starts"] = new() { ["reason=initial"] = 1 },
+        ["transcoding.initialization.failures"] = new() { ["stage=decoder"] = 1 },
+        ["transcoding.failures"] = new() { ["stage=encoder"] = 1 },
+        ["transcoding.rejections"] = new() { ["reason=capacity"] = 1 },
+        ["transcoding.frames.decoded"] = new() { ["codec=hevc;track=video"] = 1 },
+        ["transcoding.frames.encoded"] = new() { ["track=audio"] = 1 },
+        ["transcoding.audio.samples"] = new() { [""] = 1024 },
+        ["transcoding.frames.dropped"] = new() { ["reason=awaiting_keyframe;track=video"] = 1 },
+        ["transcoding.errors"] = new() { ["kind=malformed_packet;track=video"] = 1 },
+        ["transcoding.queue.saturations"] = new() { ["track=video"] = 1 },
+        ["transcoding.queue.bytes"] = new() { [""] = 4096 },
+        ["transcoding.latency"] = new() { [""] = 0.2 },
         ["hls.sessions.active"] = new() { [""] = 1 },
         ["hls.initialization_segments"] = new() { [""] = 1 },
         ["hls.segments"] = new() { ["boundary=keyframe"] = 1 },
@@ -239,7 +253,7 @@ public sealed class TelemetryExportTests
         provider.ForceFlush(10_000);
         var latest = Latest(exported);
 
-        Assert.Equal(60, instruments.Count);
+        Assert.Equal(73, instruments.Count);
         Assert.Equal(instruments.Count, instruments.Select(static i => i.Name).Distinct(StringComparer.Ordinal).Count());
         Assert.Equal(TelemetryTestSupport.Vocabulary.Keys.Order(StringComparer.Ordinal), instruments.Select(static i => i.Name).Order(StringComparer.Ordinal));
         Assert.Equal(TelemetryTestSupport.Vocabulary.Keys.Order(StringComparer.Ordinal), Expected.Keys.Order(StringComparer.Ordinal));
@@ -396,6 +410,20 @@ public sealed class TelemetryExportTests
         media.Configuration(MediaTrack.Video);
         media.Error(MediaTrack.Audio, MediaErrorKind.MalformedPacket);
         media.Discontinuity(MediaTrack.Video, TimestampDiscontinuity.Jump);
+
+        var transcoding = services.GetRequiredService<TranscodingMetrics>();
+        transcoding.SessionStarted();
+        transcoding.ProcessStarted(TranscoderStartReason.Initial);
+        transcoding.Failure(TranscodingStage.Decoder, initialization: true);
+        transcoding.Failure(TranscodingStage.Encoder, initialization: false);
+        transcoding.Rejection(TranscodingRejectionReason.Capacity);
+        transcoding.InputFrame(MediaTrack.Video, TranscodingMetrics.CodecName(SourceVideoCodec.Hevc));
+        transcoding.OutputFrame(MediaTrack.Audio);
+        transcoding.Dropped(MediaTrack.Video, TranscodingDropReason.AwaitingKeyframe);
+        transcoding.SourceError(MediaTrack.Video, MediaErrorKind.MalformedPacket);
+        transcoding.Saturated(MediaTrack.Video);
+        transcoding.Buffered(4096);
+        transcoding.Latency(0.2);
 
         var hls = services.GetRequiredService<HlsMetrics>();
         hls.SessionStarted();

@@ -55,14 +55,15 @@ public static partial class ServiceRunner
     }
 
     /// <summary>
-    /// Runs the <see cref="PublisherKeyCommand"/> when it is requested; otherwise detects the hosting mode and runs the
-    /// service until it stops.
+    /// Runs the <see cref="PublisherKeyCommand"/> or <see cref="CodecSmokeCommand"/> when one is requested; otherwise
+    /// detects the hosting mode and runs the service until it stops.
     /// </summary>
     /// <param name="args">Command-line arguments.</param>
     /// <param name="cancellationToken">Requests a graceful shutdown when cancelled.</param>
     /// <returns>The process exit code.</returns>
     public static Task<int> RunAsync(string[] args, CancellationToken cancellationToken = default) =>
         PublisherKeyCommand.TryRun(args, Console.In, Console.Out, Console.Error, out var exitCode)
+        || CodecSmokeCommand.TryRun(args, Console.Out, Console.Error, out exitCode)
             ? Task.FromResult(exitCode)
             : RunAsync(args, HostingModeDetector.Detect(), configure: null, cancellationToken);
 

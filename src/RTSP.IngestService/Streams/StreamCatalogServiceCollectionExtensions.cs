@@ -8,6 +8,7 @@ using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Hls;
 using RTSP.IngestService.Media;
 using RTSP.IngestService.Rtmp.Publishing;
+using RTSP.IngestService.Transcoding;
 
 namespace RTSP.IngestService.Streams;
 
@@ -35,7 +36,12 @@ public static class StreamCatalogServiceCollectionExtensions
         services.TryAddSingleton<StreamCatalogMetrics>();
         services.TryAddSingleton<IStreamInventorySource>(static sp => new RuntimeStreamInventorySource(
             sp.GetService<PublishedStreamRegistry>(),
-            sp.GetService<IPublishSessionHandler>() as MediaPublishSessionHandler,
+            sp.GetService<IPublishSessionHandler>() switch
+            {
+                MediaPublishSessionHandler media => media,
+                TranscodingPublishSessionHandler transcoding => transcoding.MediaStage,
+                _ => null,
+            },
             sp.GetService<IHlsSegmentStore>() as IHlsStreamInventory));
         services.TryAddSingleton(static sp =>
         {

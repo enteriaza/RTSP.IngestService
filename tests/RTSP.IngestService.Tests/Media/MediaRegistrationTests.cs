@@ -1,5 +1,5 @@
-// Tests of media processing registration in the service host: MediaPublishSessionHandler is the default publish
-// session handler, the discarding media handler is the default downstream, and a host-registered consumer replaces
+// Tests of media processing registration in the service host: the transcoding stage is the publish session handler,
+// MediaPublishSessionHandler receives its canonical output, the discarding media handler is the default downstream, and a host-registered consumer replaces
 // it without touching the RTMP registration.
 
 using Microsoft.Extensions.DependencyInjection;
@@ -13,13 +13,14 @@ namespace RTSP.IngestService.Tests.Media;
 /// <summary>Tests for <see cref="MediaServiceCollectionExtensions"/>.</summary>
 public sealed class MediaRegistrationTests
 {
-    /// <summary>The host registers media processing in front of HLS packaging and the in-memory segment store.</summary>
+    /// <summary>The host registers transcoding in front of media processing, HLS packaging and the in-memory segment store.</summary>
     [Fact]
     public void Host_UsesMediaProcessing()
     {
         using var host = TestHosts.CreateBuilder(new FakeLogCollector()).Build();
 
-        Assert.IsType<MediaPublishSessionHandler>(host.Services.GetRequiredService<IPublishSessionHandler>());
+        var transcoding = Assert.IsType<RTSP.IngestService.Transcoding.TranscodingPublishSessionHandler>(host.Services.GetRequiredService<IPublishSessionHandler>());
+        Assert.Same(host.Services.GetRequiredService<MediaPublishSessionHandler>(), transcoding.MediaStage);
         Assert.IsType<RTSP.IngestService.Hls.HlsPackagingHandler>(host.Services.GetRequiredService<IMediaSessionHandler>());
         Assert.IsType<RTSP.IngestService.Hls.InMemoryHlsSegmentStore>(host.Services.GetRequiredService<RTSP.IngestService.Hls.IHlsSegmentStore>());
     }
@@ -47,6 +48,7 @@ public sealed class MediaRegistrationTests
         using var host = builder.Build();
 
         Assert.Same(consumer, host.Services.GetRequiredService<IMediaSessionHandler>());
-        Assert.IsType<MediaPublishSessionHandler>(host.Services.GetRequiredService<IPublishSessionHandler>());
+        Assert.IsType<RTSP.IngestService.Transcoding.TranscodingPublishSessionHandler>(host.Services.GetRequiredService<IPublishSessionHandler>());
+        Assert.NotNull(host.Services.GetRequiredService<MediaPublishSessionHandler>());
     }
 }

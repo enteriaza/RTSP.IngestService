@@ -31,6 +31,13 @@ public sealed partial class RtmpOptionsValidator : IValidateOptions<RtmpOptions>
 [OptionsValidator]
 public sealed partial class MediaOptionsValidator : IValidateOptions<MediaOptions>;
 
+/// <summary>
+/// Validates <see cref="TranscodingOptions"/>, including the nested <see cref="TranscodingVideoOptions"/> and
+/// <see cref="TranscodingAudioOptions"/>, against their data annotations and cross-property rules.
+/// </summary>
+[OptionsValidator]
+public sealed partial class TranscodingOptionsValidator : IValidateOptions<TranscodingOptions>;
+
 /// <summary>Validates <see cref="HlsOptions"/> against its data annotations and cross-property rules.</summary>
 [OptionsValidator]
 public sealed partial class HlsOptionsValidator : IValidateOptions<HlsOptions>;

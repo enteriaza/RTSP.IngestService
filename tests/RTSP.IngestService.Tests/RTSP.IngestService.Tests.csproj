@@ -27,6 +27,7 @@
 
     <ItemGroup>
         <None Include="Media\Fixtures\*.flv" CopyToOutputDirectory="PreserveNewest" />
+        <None Include="Media\Codecs\Fixtures\*" CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 
 </Project>

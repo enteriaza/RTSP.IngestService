@@ -33,13 +33,14 @@ public static class MediaServiceCollectionExtensions
         services.AddMetrics();
         services.TryAddSingleton<MediaMetrics>();
         services.TryAddSingleton<IMediaSessionHandler, DiscardingMediaSessionHandler>();
-        services.TryAddSingleton<IPublishSessionHandler>(static sp => new MediaPublishSessionHandler(
+        services.TryAddSingleton(static sp => new MediaPublishSessionHandler(
             sp.GetRequiredService<IOptions<MediaOptions>>(),
             sp.GetRequiredService<IMediaSessionHandler>(),
             sp.GetRequiredService<MediaMetrics>(),
             sp.GetRequiredService<ILogger<MediaPublishSessionHandler>>(),
             sp.GetService<IStreamEventPublisher>(),
             sp.GetService<TimeProvider>()));
+        services.TryAddSingleton<IPublishSessionHandler>(static sp => sp.GetRequiredService<MediaPublishSessionHandler>());
 
         return services;
     }

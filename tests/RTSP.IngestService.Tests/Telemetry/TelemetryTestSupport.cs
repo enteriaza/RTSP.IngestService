@@ -193,6 +193,7 @@ internal static class TelemetryTestSupport
     {
         string[] track = ["video", "audio"];
         string[] mode = ["unicast", "multicast"];
+        string[] stage = ["decoder", "encoder", "process"];
         string[] resource = ["playlist", "initialization", "segment", "other"];
         string[] eventType = ["published", "media_described", "ended", "playlist_withdrawn", "drained"];
         static IReadOnlyDictionary<string, string[]> None() => new Dictionary<string, string[]>();
@@ -220,6 +221,19 @@ internal static class TelemetryTestSupport
             ["media.errors"] = Tags(("track", track), ("kind", ["unsupported_codec", "malformed_packet", "invalid_configuration", "missing_configuration", "sample_too_large", "too_many_nal_units"])),
             ["media.timestamp_discontinuities"] = Tags(("track", track), ("kind", ["regression", "jump"])),
             ["media.sessions.active"] = None(),
+            ["transcoding.sessions.active"] = None(),
+            ["transcoding.process.starts"] = Tags(("reason", ["initial", "configuration", "discontinuity", "timeline"])),
+            ["transcoding.initialization.failures"] = Tags(("stage", stage)),
+            ["transcoding.failures"] = Tags(("stage", stage)),
+            ["transcoding.rejections"] = Tags(("reason", ["capacity", "disabled", "unsupported_codec", "codec_not_accepted", "resolution_limit", "frame_rate_limit"])),
+            ["transcoding.frames.decoded"] = Tags(("track", track), ("codec", ["h264", "hevc", "av1", "vp9", "aac", "mp3", "opus", "flac", "ac3", "eac3"])),
+            ["transcoding.frames.encoded"] = Tags(("track", track)),
+            ["transcoding.audio.samples"] = None(),
+            ["transcoding.frames.dropped"] = Tags(("track", track), ("reason", ["queue_full", "budget_exhausted", "awaiting_keyframe", "timestamp", "overlap"])),
+            ["transcoding.errors"] = Tags(("track", track), ("kind", ["unsupported_codec", "malformed_packet", "invalid_configuration", "missing_configuration", "sample_too_large", "too_many_nal_units"])),
+            ["transcoding.queue.saturations"] = Tags(("track", track)),
+            ["transcoding.queue.bytes"] = None(),
+            ["transcoding.latency"] = None(),
             ["hls.sessions.active"] = None(),
             ["hls.initialization_segments"] = None(),
             ["hls.segments"] = Tags(("boundary", ["keyframe", "forced", "configuration", "discontinuity", "final"])),

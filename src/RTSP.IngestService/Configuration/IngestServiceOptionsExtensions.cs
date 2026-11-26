@@ -22,7 +22,7 @@ public static class IngestServiceOptionsExtensions
 
     /// <summary>
     /// Registers <see cref="ApplicationOptions"/>, <see cref="LifetimeOptions"/>,
-    /// <see cref="FileLoggingOptions"/>, <see cref="RtmpOptions"/>, <see cref="MediaOptions"/>, <see cref="HlsOptions"/>, <see cref="RtpOptions"/>, <see cref="HttpOriginOptions"/>, <see cref="ManagementOptions"/>, <see cref="StreamEventOptions"/>, <see cref="StreamCatalogOptions"/> and <see cref="TelemetryOptions"/>, each bound from its configuration section,
+    /// <see cref="FileLoggingOptions"/>, <see cref="RtmpOptions"/>, <see cref="MediaOptions"/>, <see cref="TranscodingOptions"/>, <see cref="HlsOptions"/>, <see cref="RtpOptions"/>, <see cref="HttpOriginOptions"/>, <see cref="ManagementOptions"/>, <see cref="StreamEventOptions"/>, <see cref="StreamCatalogOptions"/> and <see cref="TelemetryOptions"/>, each bound from its configuration section,
     /// validated when first resolved and validated eagerly when the host starts, and the <see cref="ApplicationIdentity"/>
     /// built from the entry assembly and the validated <see cref="ApplicationOptions"/>.
     /// </summary>
@@ -55,6 +55,8 @@ public static class IngestServiceOptionsExtensions
             services, configuration, RtmpOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
         AddValidatedOptions<MediaOptions, MediaOptionsValidator>(
             services, configuration, MediaOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
+        AddValidatedOptions<TranscodingOptions, TranscodingOptionsValidator>(
+            services, configuration, TranscodingOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
         AddValidatedOptions<HlsOptions, HlsOptionsValidator>(
             services, configuration, HlsOptions.SectionName, static (section, options) => section.Bind(options, StrictBinding));
         AddValidatedOptions<RtpOptions, RtpOptionsValidator>(

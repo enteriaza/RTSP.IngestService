@@ -119,7 +119,7 @@ public sealed class HlsHttpPlaybackTests
             Assert.Equal(("h264", 320, 240), (videoStream.CodecName, videoStream.Width, videoStream.Height));
             Assert.Equal(("aac", "48000", 2), (audioStream.CodecName, audioStream.SampleRate, audioStream.Channels));
             Assert.Equal(150, videoStream.Frames);
-            Assert.InRange(audioStream.Frames, 279, 283);
+            Assert.InRange(audioStream.Frames, 279, MaxCanonicalAudioFrames);
             Assert.Equal(Duration(ended), probe.Duration, 0.0015);
             await HlsFfmpegInteropTests.DecodeAsync(tools.Ffmpeg, playlistUri.AbsoluteUri);
         }
@@ -149,7 +149,7 @@ public sealed class HlsHttpPlaybackTests
             var probe = await HlsFfmpegInteropTests.ProbeAsync(tools.Probe, playlistUri.AbsoluteUri);
             var audioStream = Assert.Single(probe.Streams);
             Assert.Equal(("audio", "aac", "48000", 2), (audioStream.CodecType, audioStream.CodecName, audioStream.SampleRate, audioStream.Channels));
-            Assert.InRange(audioStream.Frames, 279, 283);
+            Assert.InRange(audioStream.Frames, 279, MaxCanonicalAudioFrames);
             Assert.Equal(Duration(ended), probe.Duration, 0.0015);
             await HlsFfmpegInteropTests.DecodeAsync(tools.Ffmpeg, playlistUri.AbsoluteUri);
         }
@@ -158,6 +158,12 @@ public sealed class HlsHttpPlaybackTests
             await host.StopAsync(CancellationToken.None);
         }
     }
+
+    /// <summary>
+    /// The most AAC frames 6 s of audio may yield after canonical re-encoding: 281 frames of media plus the encoder's
+    /// priming frame and flush padding.
+    /// </summary>
+    private const int MaxCanonicalAudioFrames = 285;
 
     /// <summary>Gets the test cancellation token.</summary>
     private static CancellationToken Token => TestContext.Current.CancellationToken;
