@@ -146,6 +146,7 @@ public sealed class TranscodingSessionTests
         harness.Factory.Behavior = FakeTranscoderBehavior.Stall;
         var session = await harness.StartAsync();
         await harness.SendTagsAsync(session, FlvFile.ReadFixture("h264-aac-4s.flv")).WithinSafetyTimeout();
+        await Eventually.WaitUntilAsync(() => harness.Factory.Starts == 1, "the transcoder has started");
 
         Assert.True(harness.Handler.FindSession(session.SessionId)!.QueuedBytes <= harness.Options.MaxSessionBufferBytes);
         var drops = DropLogs(harness);
@@ -348,6 +349,7 @@ public sealed class TranscodingSessionTests
         var tags = FlvFile.ReadFixture("h264-aac.flv");
         var session = await harness.StartAsync();
         await harness.SendTagsAsync(session, tags);
+        await Eventually.WaitUntilAsync(() => harness.Factory.Starts == 1, "the transcoder has started");
         await harness.EndAsync(session, Enum.Parse<PublishEndReason>(reasonName));
 
         var process = Assert.Single(harness.Factory.Started);
@@ -358,6 +360,67 @@ public sealed class TranscodingSessionTests
         }
 
         Assert.Equal("ended", harness.Downstream.Events.Last().Kind);
+        AssertReleased(harness);
+    }
+
+    /// <summary>
+    /// A kill reason kills the transcoder even when the writer has already written everything and is idle, so ending
+    /// the queue cannot be mistaken for a drain: the input is never closed for a flush and no drain timeout is logged.
+    /// </summary>
+    /// <param name="reasonName">A kill end reason (a <see cref="PublishEndReason"/>).</param>
+    /// <returns>A task.</returns>
+    [Theory]
+    [InlineData(nameof(PublishEndReason.ConnectionTimeout))]
+    [InlineData(nameof(PublishEndReason.ProtocolError))]
+    [InlineData(nameof(PublishEndReason.ConnectionError))]
+    [InlineData(nameof(PublishEndReason.ServerShutdown))]
+    [InlineData(nameof(PublishEndReason.HandlerFailed))]
+    public async Task KillReason_WithAnIdleWriter_KillsWithoutDraining(string reasonName)
+    {
+        using var harness = new TranscodingHarness();
+        var tags = FlvFile.ReadFixture("h264-aac.flv");
+        var session = await harness.StartAsync();
+        await harness.SendTagsAsync(session, tags);
+        var pipeline = harness.Handler.FindSession(session.SessionId)!;
+        var coded = tags.Count(static t => t.Type is 8 or 9 && t.Body.Length > 1 && t.Body[1] == 1);
+        await Eventually.WaitUntilAsync(
+            () => pipeline.QueuedBytes == 0 && harness.Downstream.Events.Count(e => e.Kind == "message" && ReferenceEquals(e.Session, session) && e.Payload is { Length: > 1 } p && p[1] == 1) == coded,
+            "the writer has written every sample and the transcoder output was delivered");
+
+        await harness.EndAsync(session, Enum.Parse<PublishEndReason>(reasonName));
+
+        var process = Assert.Single(harness.Factory.Started);
+        Assert.False(process.InputCompleted, "A kill reason must not close the transcoder input for a flush.");
+        Assert.True(process.Killed);
+        Assert.True(process.Disposed);
+        Assert.DoesNotContain(10002, harness.EventIds());
+        Assert.Equal("ended", harness.Downstream.Events.Last().Kind);
+        AssertReleased(harness);
+    }
+
+    /// <summary>
+    /// A session ended while its new transcoder is still being given the stream header kills and disposes that
+    /// transcoder instead of leaving the process running.
+    /// </summary>
+    /// <returns>A task.</returns>
+    [Fact]
+    public async Task EndDuringTranscoderStart_KillsAndDisposesTheProcess()
+    {
+        using var harness = new TranscodingHarness();
+        harness.Factory.Behavior = FakeTranscoderBehavior.RefuseInput;
+        var tags = FlvFile.ReadFixture("h264-aac.flv");
+        var session = await harness.StartAsync();
+        await harness.SendTagsAsync(session, tags);
+        await Eventually.WaitUntilAsync(() => harness.Factory.Starts == 1, "the transcoder was started");
+
+        await harness.EndAsync(session, PublishEndReason.ConnectionError);
+
+        var process = Assert.Single(harness.Factory.Started);
+        Assert.Equal(0, process.BytesRead);
+        Assert.True(process.Killed);
+        Assert.True(process.Disposed);
+        Assert.True(process.Exited.IsCompleted);
+        Assert.DoesNotContain(10001, harness.EventIds());
         AssertReleased(harness);
     }
 

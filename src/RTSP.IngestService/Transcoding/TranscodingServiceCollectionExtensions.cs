@@ -42,7 +42,8 @@ public static class TranscodingServiceCollectionExtensions
             sp.GetRequiredService<MediaPublishSessionHandler>(),
             sp.GetRequiredService<ITranscoderProcessFactory>(),
             sp.GetRequiredService<TranscodingMetrics>(),
-            sp.GetRequiredService<ILogger<TranscodingPublishSessionHandler>>()));
+            sp.GetRequiredService<ILogger<TranscodingPublishSessionHandler>>(),
+            sp.GetService<TimeProvider>()));
         services.TryAddSingleton<IPublishSessionHandler>(static sp => sp.GetRequiredService<TranscodingPublishSessionHandler>());
         services.AddHostedService<FfmpegCapabilityCheck>();
         services.AddHostedService(static sp => new TranscodingShutdownService(sp.GetRequiredService<TranscodingPublishSessionHandler>()));

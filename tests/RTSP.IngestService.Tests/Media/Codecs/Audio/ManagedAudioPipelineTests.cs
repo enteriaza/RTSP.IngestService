@@ -109,6 +109,8 @@ public sealed class ManagedAudioPipelineTests
             Assert.Equal(ExitCodes.Success, exitCode);
             Assert.Contains("Input: AAC-LC 44100 Hz, 1 channel(s)", stdout.ToString(), StringComparison.Ordinal);
             Assert.Contains("Output: AAC-LC 48000 Hz, 2 channels", stdout.ToString(), StringComparison.Ordinal);
+            Assert.Contains("Digest: output ", stdout.ToString(), StringComparison.Ordinal);
+            Assert.Equal(string.Empty, stderr.ToString());
             var units = AdtsFraming.Read(File.ReadAllBytes(output), out var configuration);
             Assert.Equal(AacEncoder.AudioSpecificConfig.ToArray(), configuration);
             Assert.NotEmpty(units);

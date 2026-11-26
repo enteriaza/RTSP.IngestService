@@ -55,7 +55,7 @@ public static partial class ServiceRunner
     }
 
     /// <summary>
-    /// Runs the <see cref="PublisherKeyCommand"/> or <see cref="CodecSmokeCommand"/> when one is requested; otherwise
+    /// Runs the <see cref="PublisherKeyCommand"/>, <see cref="CodecSmokeCommand"/> or <see cref="AudioIntegrationSmokeCommand"/> when one is requested; otherwise
     /// detects the hosting mode and runs the service until it stops.
     /// </summary>
     /// <param name="args">Command-line arguments.</param>
@@ -64,6 +64,7 @@ public static partial class ServiceRunner
     public static Task<int> RunAsync(string[] args, CancellationToken cancellationToken = default) =>
         PublisherKeyCommand.TryRun(args, Console.In, Console.Out, Console.Error, out var exitCode)
         || CodecSmokeCommand.TryRun(args, Console.Out, Console.Error, out exitCode)
+        || AudioIntegrationSmokeCommand.TryRun(args, Console.Out, Console.Error, out exitCode)
             ? Task.FromResult(exitCode)
             : RunAsync(args, HostingModeDetector.Detect(), configure: null, cancellationToken);
 

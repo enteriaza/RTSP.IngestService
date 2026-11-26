@@ -20,6 +20,9 @@ internal sealed class ManagedAudioTranscoder : IDisposable
     /// <summary>The encoder.</summary>
     private readonly AacEncoder _encoder;
 
+    /// <summary>The sum of squared canonical samples, per channel.</summary>
+    private readonly double[] _canonicalEnergy = new double[2];
+
     /// <summary>Initializes a new instance of the <see cref="ManagedAudioTranscoder"/> class.</summary>
     /// <param name="audioSpecificConfig">The source AudioSpecificConfig.</param>
     /// <param name="bitrate">The output bitrate in bits per second.</param>
@@ -47,6 +50,11 @@ internal sealed class ManagedAudioTranscoder : IDisposable
 
     /// <summary>Gets the encoder statistics.</summary>
     public AacEncoderStatistics EncoderStatistics => _encoder.Statistics;
+
+    /// <summary>The RMS of the canonical samples passed to the encoder.</summary>
+    /// <param name="channel">0 (left) or 1 (right).</param>
+    /// <returns>The RMS, 0 before any samples.</returns>
+    public double CanonicalRms(int channel) => CanonicalSamples == 0 ? 0 : Math.Sqrt(_canonicalEnergy[channel] / CanonicalSamples);
 
     /// <summary>Transcodes one source access unit.</summary>
     /// <param name="packet">The source access unit.</param>
@@ -86,6 +94,14 @@ internal sealed class ManagedAudioTranscoder : IDisposable
         using (frame)
         {
             CanonicalSamples += frame.SampleCount;
+            for (var c = 0; c < 2; c++)
+            {
+                foreach (var sample in frame.GetChannel(c))
+                {
+                    _canonicalEnergy[c] += sample * (double)sample;
+                }
+            }
+
             _encoder.Encode(frame, output);
         }
     }

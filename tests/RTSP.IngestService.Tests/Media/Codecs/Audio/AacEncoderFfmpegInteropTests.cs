@@ -22,6 +22,9 @@ public sealed class AacEncoderFfmpegInteropTests
         { "impulses", 160000 },
         { "noise", 96000 },
         { "silence", 160000 },
+        { "speech", 64000 },
+        { "speech", 160000 },
+        { "transients", 160000 },
     };
 
     /// <summary>FFmpeg decodes the output identically to the managed decoder and recognises AAC LC 48 kHz stereo.</summary>
@@ -36,6 +39,11 @@ public sealed class AacEncoderFfmpegInteropTests
         var (left, right) = Signal(signal);
         using var encoder = new AacEncoder(bitrate);
         var units = AudioTestSupport.Encode(encoder, left, right, 1000);
+        if (signal is "speech" or "transients")
+        {
+            Assert.True(encoder.Statistics.TnsChannels > 0, "The stream exercises TNS.");
+        }
+
         var reference = await DecodeWithFfmpegAsync(ffmpeg, AudioTestSupport.ToAdts(units));
 
         var stream = AacTestSupport.ParseAdts(AudioTestSupport.ToAdts(units));
@@ -157,6 +165,9 @@ public sealed class AacEncoderFfmpegInteropTests
                 return (clicks, clicks.Select(x => -x).ToArray());
             case "noise":
                 return (AudioTestSupport.Noise(length, 0.3, 1), AudioTestSupport.Noise(length, 0.3, 2));
+            case "speech" or "transients":
+                var planes = AudioQualitySignals.Create(name, length);
+                return (planes[0], planes[1]);
             default:
                 return (new float[length], new float[length]);
         }

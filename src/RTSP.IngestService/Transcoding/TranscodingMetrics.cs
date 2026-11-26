@@ -45,7 +45,39 @@ internal enum TranscodingDropReason
     /// <summary>The sample's timestamp cannot be represented for the transcoder.</summary>
     Timestamp,
 
-    /// <summary>Encoder output that overlaps media already delivered by the previous transcoder process.</summary>
+    /// <summary>
+    /// Encoder output that overlaps media already delivered by the previous transcoder process, or managed source audio
+    /// that lies entirely before media already decoded.
+    /// </summary>
+    Overlap,
+
+    /// <summary>A source audio frame the managed decoder rejected; its duration is concealed with silence.</summary>
+    DecodeError,
+}
+
+/// <summary>Why the managed audio stage inserted silence.</summary>
+internal enum AudioConcealmentReason
+{
+    /// <summary>The source timestamps advanced further than the decoded audio.</summary>
+    Gap,
+
+    /// <summary>Source frames were dropped before decoding.</summary>
+    Drop,
+
+    /// <summary>A source frame failed to decode.</summary>
+    DecodeError,
+}
+
+/// <summary>Why the managed audio stage ended its output stream and started a new one.</summary>
+internal enum AudioResetReason
+{
+    /// <summary>The source timeline jumped or regressed.</summary>
+    Discontinuity,
+
+    /// <summary>The source timestamps advanced too far beyond the decoded audio to conceal.</summary>
+    Gap,
+
+    /// <summary>The source timestamps fell too far behind the decoded audio to trim.</summary>
     Overlap,
 }
 
@@ -124,6 +156,51 @@ internal sealed class TranscodingMetrics
     /// <summary>Time from submitting a source video frame to receiving its encoded frame.</summary>
     private readonly Histogram<double> _latency;
 
+    /// <summary>Multiplexer units, by track and outcome.</summary>
+    private readonly Counter<long> _muxUnits;
+
+    /// <summary>Units held in multiplexer queues, by track.</summary>
+    private readonly UpDownCounter<long> _muxQueuedUnits;
+
+    /// <summary>Payload bytes held in multiplexer queues, by track.</summary>
+    private readonly UpDownCounter<long> _muxQueuedBytes;
+
+    /// <summary>Units released before ordering was known to be safe, by track and reason.</summary>
+    private readonly Counter<long> _muxEarlyReleases;
+
+    /// <summary>Submissions that found their multiplexer queue full, by track and limit.</summary>
+    private readonly Counter<long> _muxSaturations;
+
+    /// <summary>How long producers waited for multiplexer queue room, by track.</summary>
+    private readonly Histogram<double> _muxBackpressure;
+
+    /// <summary>How long units stayed in multiplexer queues, by track.</summary>
+    private readonly Histogram<double> _muxHold;
+
+    /// <summary>Time from a multiplexer's first accepted unit to its first delivered unit.</summary>
+    private readonly Histogram<double> _muxStartup;
+
+    /// <summary>Multiplexer failures, by source.</summary>
+    private readonly Counter<long> _muxFailures;
+
+    /// <summary>Silent samples the managed audio stage inserted, by reason.</summary>
+    private readonly Counter<long> _audioConcealed;
+
+    /// <summary>Source samples the managed audio stage trimmed as overlap.</summary>
+    private readonly Counter<long> _audioTrimmed;
+
+    /// <summary>Managed audio output streams ended and restarted, by reason.</summary>
+    private readonly Counter<long> _audioResets;
+
+    /// <summary>Managed audio decoders replaced after a decode failure.</summary>
+    private readonly Counter<long> _audioDecoderRecreations;
+
+    /// <summary>Canonical samples the managed downmixer clipped.</summary>
+    private readonly Counter<long> _audioClipped;
+
+    /// <summary>Time from submitting a source audio frame to the managed encoder producing output from it.</summary>
+    private readonly Histogram<double> _audioLatency;
+
     /// <summary>Initializes a new instance of the <see cref="TranscodingMetrics"/> class.</summary>
     /// <param name="meterFactory">Factory owning the meter's lifetime.</param>
     public TranscodingMetrics(IMeterFactory meterFactory)
@@ -144,6 +221,21 @@ internal sealed class TranscodingMetrics
         _saturations = meter.CreateCounter<long>("transcoding.queue.saturations", "{event}", "Source samples that found their session queue or the aggregate budget full; tag track.");
         _bufferedBytes = meter.CreateUpDownCounter<long>("transcoding.queue.bytes", "By", "Source bytes held in session queues.");
         _latency = meter.CreateHistogram<double>("transcoding.latency", "s", "Time from submitting a source video frame to receiving the encoded frame with the same timestamp.");
+        _muxUnits = meter.CreateCounter<long>("transcoding.mux.units", "{unit}", "Encoded units through the media multiplexer; tags track and outcome (accepted, forwarded, discarded, rejected).");
+        _muxQueuedUnits = meter.CreateUpDownCounter<long>("transcoding.mux.queue.units", "{unit}", "Encoded units held in media multiplexer queues; tag track.");
+        _muxQueuedBytes = meter.CreateUpDownCounter<long>("transcoding.mux.queue.bytes", "By", "Encoded payload bytes held in media multiplexer queues; tag track.");
+        _muxEarlyReleases = meter.CreateCounter<long>("transcoding.mux.early_releases", "{unit}", "Units the media multiplexer released without the other track's ordering; tags track and reason.");
+        _muxSaturations = meter.CreateCounter<long>("transcoding.mux.saturations", "{event}", "Submissions that found their media multiplexer queue or the buffer budget full; tags track and limit.");
+        _muxBackpressure = meter.CreateHistogram<double>("transcoding.mux.backpressure.duration", "s", "How long a producer waited for media multiplexer queue room; tag track.");
+        _muxHold = meter.CreateHistogram<double>("transcoding.mux.hold.duration", "s", "How long units waited in media multiplexer queues; tag track.");
+        _muxStartup = meter.CreateHistogram<double>("transcoding.mux.startup.duration", "s", "Time from a media multiplexer's first accepted unit to its first delivered unit.");
+        _muxFailures = meter.CreateCounter<long>("transcoding.mux.failures", "{event}", "Media multiplexers stopped by a failure; tag source (downstream or producer).");
+        _audioConcealed = meter.CreateCounter<long>("transcoding.audio.concealed", "{sample}", "Silent source-rate samples the managed audio stage inserted for missing audio; tag reason (gap, drop, decode_error).");
+        _audioTrimmed = meter.CreateCounter<long>("transcoding.audio.trimmed", "{sample}", "Source-rate samples the managed audio stage removed as overlapping audio already decoded.");
+        _audioResets = meter.CreateCounter<long>("transcoding.audio.resets", "{event}", "Managed audio output streams ended and restarted on a new timeline anchor; tag reason (discontinuity, gap, overlap).");
+        _audioDecoderRecreations = meter.CreateCounter<long>("transcoding.audio.decoder.recreations", "{event}", "Managed audio decoders replaced after a source frame failed to decode.");
+        _audioClipped = meter.CreateCounter<long>("transcoding.audio.clipped", "{sample}", "Canonical samples the managed downmixer limited to full scale.");
+        _audioLatency = meter.CreateHistogram<double>("transcoding.audio.latency", "s", "Time from submitting a source audio frame to the managed encoder producing output from it.");
     }
 
     /// <summary>Records a session that took a slot.</summary>
@@ -203,6 +295,73 @@ internal sealed class TranscodingMetrics
     /// <summary>Records a frame's transcoding latency.</summary>
     /// <param name="seconds">The latency.</param>
     public void Latency(double seconds) => _latency.Record(seconds);
+
+    /// <summary>Records a multiplexer unit outcome.</summary>
+    /// <param name="track">Its track.</param>
+    /// <param name="outcome">The outcome.</param>
+    public void MultiplexerUnit(MediaTrack track, MultiplexerUnitOutcome outcome) => _muxUnits.Add(1, TrackTag(track), new KeyValuePair<string, object?>("outcome", Name(outcome)));
+
+    /// <summary>Records a change in a multiplexer queue.</summary>
+    /// <param name="track">Its track.</param>
+    /// <param name="units">The change in units.</param>
+    /// <param name="bytes">The change in bytes.</param>
+    public void MultiplexerQueued(MediaTrack track, int units, long bytes)
+    {
+        _muxQueuedUnits.Add(units, TrackTag(track));
+        _muxQueuedBytes.Add(bytes, TrackTag(track));
+    }
+
+    /// <summary>Records a unit released early.</summary>
+    /// <param name="track">Its track.</param>
+    /// <param name="reason">Why.</param>
+    public void MultiplexerReleasedEarly(MediaTrack track, MultiplexerEarlyRelease reason) => _muxEarlyReleases.Add(1, TrackTag(track), new KeyValuePair<string, object?>("reason", Name(reason)));
+
+    /// <summary>Records a full multiplexer queue.</summary>
+    /// <param name="track">Its track.</param>
+    /// <param name="limit">The limit reached.</param>
+    public void MultiplexerSaturated(MediaTrack track, MultiplexerEarlyRelease limit) => _muxSaturations.Add(1, TrackTag(track), new KeyValuePair<string, object?>("limit", Name(limit)));
+
+    /// <summary>Records how long a producer waited for room.</summary>
+    /// <param name="track">Its track.</param>
+    /// <param name="seconds">The wait.</param>
+    public void MultiplexerBackpressure(MediaTrack track, double seconds) => _muxBackpressure.Record(seconds, TrackTag(track));
+
+    /// <summary>Records how long a unit was queued.</summary>
+    /// <param name="track">Its track.</param>
+    /// <param name="seconds">The time.</param>
+    public void MultiplexerHeld(MediaTrack track, double seconds) => _muxHold.Record(seconds, TrackTag(track));
+
+    /// <summary>Records the time to a multiplexer's first delivered unit.</summary>
+    /// <param name="seconds">The time.</param>
+    public void MultiplexerStartup(double seconds) => _muxStartup.Record(seconds);
+
+    /// <summary>Records a multiplexer failure.</summary>
+    /// <param name="downstream">Whether the downstream stage failed, rather than a producer.</param>
+    public void MultiplexerFailure(bool downstream) => _muxFailures.Add(1, new KeyValuePair<string, object?>("source", downstream ? "downstream" : "producer"));
+
+    /// <summary>Records inserted silence.</summary>
+    /// <param name="reason">Why.</param>
+    /// <param name="samples">Source-rate samples per channel.</param>
+    public void AudioConcealed(AudioConcealmentReason reason, long samples) => _audioConcealed.Add(samples, new KeyValuePair<string, object?>("reason", Name(reason)));
+
+    /// <summary>Records trimmed overlap.</summary>
+    /// <param name="samples">Source-rate samples per channel.</param>
+    public void AudioTrimmed(long samples) => _audioTrimmed.Add(samples);
+
+    /// <summary>Records a managed audio stream restart.</summary>
+    /// <param name="reason">Why.</param>
+    public void AudioReset(AudioResetReason reason) => _audioResets.Add(1, new KeyValuePair<string, object?>("reason", Name(reason)));
+
+    /// <summary>Records a replaced decoder.</summary>
+    public void AudioDecoderRecreated() => _audioDecoderRecreations.Add(1);
+
+    /// <summary>Records clipped samples.</summary>
+    /// <param name="samples">The samples.</param>
+    public void AudioClipped(long samples) => _audioClipped.Add(samples);
+
+    /// <summary>Records managed audio latency.</summary>
+    /// <param name="seconds">The latency.</param>
+    public void AudioLatency(double seconds) => _audioLatency.Record(seconds);
 
     /// <summary>Returns the codec tag value.</summary>
     /// <param name="codec">The codec.</param>
@@ -276,7 +435,52 @@ internal sealed class TranscodingMetrics
         TranscodingDropReason.BudgetExhausted => "budget_exhausted",
         TranscodingDropReason.AwaitingKeyframe => "awaiting_keyframe",
         TranscodingDropReason.Timestamp => "timestamp",
+        TranscodingDropReason.Overlap => "overlap",
+        _ => "decode_error",
+    };
+
+    /// <summary>Returns the tag value.</summary>
+    /// <param name="reason">The value.</param>
+    /// <returns>The text.</returns>
+    private static string Name(AudioConcealmentReason reason) => reason switch
+    {
+        AudioConcealmentReason.Gap => "gap",
+        AudioConcealmentReason.Drop => "drop",
+        _ => "decode_error",
+    };
+
+    /// <summary>Returns the tag value.</summary>
+    /// <param name="reason">The value.</param>
+    /// <returns>The text.</returns>
+    private static string Name(AudioResetReason reason) => reason switch
+    {
+        AudioResetReason.Discontinuity => "discontinuity",
+        AudioResetReason.Gap => "gap",
         _ => "overlap",
+    };
+
+    /// <summary>Returns the tag value.</summary>
+    /// <param name="outcome">The value.</param>
+    /// <returns>The text.</returns>
+    private static string Name(MultiplexerUnitOutcome outcome) => outcome switch
+    {
+        MultiplexerUnitOutcome.Accepted => "accepted",
+        MultiplexerUnitOutcome.Forwarded => "forwarded",
+        MultiplexerUnitOutcome.Discarded => "discarded",
+        _ => "rejected",
+    };
+
+    /// <summary>Returns the tag value.</summary>
+    /// <param name="reason">The value.</param>
+    /// <returns>The text.</returns>
+    private static string Name(MultiplexerEarlyRelease reason) => reason switch
+    {
+        MultiplexerEarlyRelease.Startup => "startup",
+        MultiplexerEarlyRelease.Idle => "idle",
+        MultiplexerEarlyRelease.Units => "units",
+        MultiplexerEarlyRelease.Bytes => "bytes",
+        MultiplexerEarlyRelease.Duration => "duration",
+        _ => "budget",
     };
 
     /// <summary>Returns the tag value.</summary>

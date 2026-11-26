@@ -10,7 +10,15 @@
 //    breaks the limit is moved to the limit and requantised. The first non-zero band's scalefactor is global_gain.
 //  * Sections: dynamic programming over the bands chooses, per band, the codebook that minimises spectral bits plus
 //    section-header bits (4 + 5 long / 3 short). All-zero bands use the zero codebook.
-// Short windows are coded as eight groups of one window. Pulse, TNS and gain-control data are never used.
+//  * TNS (4.6.9), long windows only: the spectrum from 1.4 kHz to the TNS limit (band 40 or max_sfb), weighted by the
+//    inverse band RMS, gives an autocorrelation (Gaussian lag window) whose Levinson-Durbin prediction gain must lie
+//    in [3, 16] (4.8 to 12 dB). One filter of order up to 4 is coded with 4-bit coefficients, upward, uncompressed; the
+//    encoder filters with the dequantised coefficients and the decoder's reflection-to-LPC recursion, so the decoder's
+//    all-pole filter inverts it exactly. Band energies in the filtered range are recomputed and the allowed noise is
+//    scaled down with any energy reduction (never up), so the noise the decoder's filter shapes back along the
+//    temporal envelope keeps at least the model's energy-to-noise ratio. The caller decides whether the frame's
+//    temporal envelope is uneven enough to shape at all.
+// Short windows are coded as eight groups of one window. Pulse and gain-control data are never used.
 
 using RTSP.IngestService.Media.Codecs.Common.Bitstreams;
 
@@ -30,6 +38,24 @@ internal sealed class AacChannelCoder
 
     /// <summary>Codebooks 0 to 11.</summary>
     private const int BookCount = 12;
+
+    /// <summary>The TNS filter order searched (AAC-LC allows up to 12 for long windows).</summary>
+    private const int TnsMaxOrder = 4;
+
+    /// <summary>The lowest frequency TNS filters.</summary>
+    private const double TnsStartHz = 1400;
+
+    /// <summary>The smallest prediction gain (about 4.8 dB) for which TNS is used.</summary>
+    private const double TnsMinimumGain = 3.0;
+
+    /// <summary>
+    /// The largest prediction gain (12 dB) for which TNS is used: higher gains come from near-line spectra, such as a
+    /// tone stopping abruptly, where the shaped noise overshoots the envelope instead of following it.
+    /// </summary>
+    private const double TnsMaximumGain = 16;
+
+    /// <summary>The Gaussian lag-window parameter that smooths the TNS autocorrelation.</summary>
+    private const double TnsLagWindow = 0.1;
 
     /// <summary>2^(-3/16 (sf - 100)) by scalefactor: the companded reciprocal step.</summary>
     private static readonly float[] CompandedStep = CreateCompandedStep();
@@ -52,8 +78,17 @@ internal sealed class AacChannelCoder
     /// <summary>Section dynamic-programming back-pointers, per band and codebook.</summary>
     private readonly byte[] _from = new byte[BandStride * BookCount];
 
+    /// <summary>The quantised TNS reflection coefficients, 4-bit indices.</summary>
+    private readonly int[] _tnsIndex = new int[TnsMaxOrder];
+
     /// <summary>The frame layout.</summary>
     private AacFrameLayout _layout;
+
+    /// <summary>The TNS filter order, 0 when TNS is off.</summary>
+    private int _tnsOrder;
+
+    /// <summary>The TNS filter length in bands, counted down from the last scalefactor band.</summary>
+    private int _tnsLength;
 
     /// <summary>Gets the spectrum to code, in 16-bit scale, window-major for short windows.</summary>
     public float[] Spectrum { get; } = new float[AacTables.LongWindowLength];
@@ -75,6 +110,9 @@ internal sealed class AacChannelCoder
 
     /// <summary>Gets the global gain.</summary>
     public int GlobalGain { get; private set; }
+
+    /// <summary>Gets a value indicating whether the current frame uses a TNS filter.</summary>
+    public bool HasTns => _tnsOrder > 0;
 
     /// <summary>Prepares the per-band estimates from <see cref="Spectrum"/> and <see cref="Threshold"/>.</summary>
     /// <param name="layout">The frame layout.</param>
@@ -159,6 +197,122 @@ internal sealed class AacChannelCoder
         }
     }
 
+    /// <summary>
+    /// Decides and applies temporal noise shaping for a long window (see the file header): the spectrum from
+    /// <see cref="TnsStartHz"/> to the TNS limit is filtered with the quantised prediction-error filter, and the band
+    /// energies and allowed noise in that range are updated. Clears TNS when not enabled, for short windows, or for a
+    /// prediction gain outside [<see cref="TnsMinimumGain"/>, <see cref="TnsMaximumGain"/>].
+    /// </summary>
+    /// <param name="layout">The frame layout, before <see cref="Prepare"/>.</param>
+    /// <param name="enabled">Whether the frame may use TNS.</param>
+    public void ApplyTns(AacFrameLayout layout, bool enabled)
+    {
+        _tnsOrder = 0;
+        var top = Math.Min(AacTables.TnsMaxBandsLong[3], layout.MaxSfb);
+        var bottom = 0;
+        while (bottom < top && layout.Offsets[bottom] * 24000.0 / AacTables.LongWindowLength < TnsStartHz)
+        {
+            bottom++;
+        }
+
+        if (!enabled || layout.Windows != 1 || top - bottom < 4)
+        {
+            return;
+        }
+
+        var start = layout.Offsets[bottom];
+        var end = layout.Offsets[top];
+        Span<double> weighted = stackalloc double[end - start];
+        for (var b = bottom; b < top; b++)
+        {
+            var width = layout.Offsets[b + 1] - layout.Offsets[b];
+            var scale = 1 / Math.Sqrt((Energy[b] / width) + 1e-9);
+            for (var i = layout.Offsets[b]; i < layout.Offsets[b + 1]; i++)
+            {
+                weighted[i - start] = Spectrum[i] * scale;
+            }
+        }
+
+        Span<double> correlation = stackalloc double[TnsMaxOrder + 1];
+        for (var lag = 0; lag <= TnsMaxOrder; lag++)
+        {
+            var sum = 0.0;
+            for (var i = lag; i < weighted.Length; i++)
+            {
+                sum += weighted[i] * weighted[i - lag];
+            }
+
+            correlation[lag] = sum * Math.Exp(-0.5 * Math.Pow(TnsLagWindow * lag, 2));
+        }
+
+        if (correlation[0] <= 0)
+        {
+            return;
+        }
+
+        Span<double> reflection = stackalloc double[TnsMaxOrder];
+        var gain = correlation[0] / LevinsonDurbin(correlation, reflection);
+        if (gain < TnsMinimumGain || gain > TnsMaximumGain)
+        {
+            return;
+        }
+
+        var order = 0;
+        for (var i = 0; i < TnsMaxOrder; i++)
+        {
+            var index = (int)Math.Round(Math.Asin(reflection[i]) * (reflection[i] >= 0 ? 7.5 : 8.5) / (Math.PI / 2));
+            _tnsIndex[i] = Math.Clamp(index, -8, 7);
+            order = _tnsIndex[i] != 0 ? i + 1 : order;
+        }
+
+        if (order == 0)
+        {
+            return;
+        }
+
+        Span<float> parcor = stackalloc float[order];
+        for (var i = 0; i < order; i++)
+        {
+            parcor[i] = (float)Math.Sin(_tnsIndex[i] / ((_tnsIndex[i] >= 0 ? 7.5 : 8.5) / (Math.PI / 2)));
+        }
+
+        Span<float> lpc = stackalloc float[order + 1];
+        ToLpc(parcor, lpc);
+        Span<float> history = stackalloc float[order];
+        for (var i = start; i < end; i++)
+        {
+            var x = Spectrum[i];
+            var residual = x;
+            for (var j = 0; j < order; j++)
+            {
+                residual += lpc[j + 1] * history[j];
+            }
+
+            for (var j = order - 1; j > 0; j--)
+            {
+                history[j] = history[j - 1];
+            }
+
+            history[0] = x;
+            Spectrum[i] = residual;
+        }
+
+        for (var b = bottom; b < top; b++)
+        {
+            var energy = 0f;
+            for (var i = layout.Offsets[b]; i < layout.Offsets[b + 1]; i++)
+            {
+                energy += Spectrum[i] * Spectrum[i];
+            }
+
+            Threshold[b] = Energy[b] > 0 ? Threshold[b] * Math.Min(1, energy / Energy[b]) : Threshold[b];
+            Energy[b] = energy;
+        }
+
+        _tnsOrder = order;
+        _tnsLength = AacTables.LongBandOffsets[3].Length - 1 - bottom;
+    }
+
     /// <summary>Writes the individual_channel_stream body that follows a common ics_info: global_gain to spectral_data.</summary>
     /// <param name="writer">The writer.</param>
     public void Write(ref BitstreamWriter writer)
@@ -211,7 +365,21 @@ internal sealed class AacChannelCoder
         }
 
         writer.WriteBit(false);
-        writer.WriteBit(false);
+        writer.WriteBit(_tnsOrder > 0);
+        if (_tnsOrder > 0)
+        {
+            writer.Write(1, 2);
+            writer.WriteBit(true);
+            writer.Write((uint)_tnsLength, 6);
+            writer.Write((uint)_tnsOrder, 5);
+            writer.WriteBit(false);
+            writer.WriteBit(false);
+            for (var i = 0; i < _tnsOrder; i++)
+            {
+                writer.Write((uint)_tnsIndex[i] & 15, 4);
+            }
+        }
+
         writer.WriteBit(false);
 
         for (var w = 0; w < layout.Windows; w++)
@@ -364,6 +532,59 @@ internal sealed class AacChannelCoder
         {
             Book[(window * BandStride) + b] = (byte)choice;
             choice = _from[(b * BookCount) + choice];
+        }
+    }
+
+    /// <summary>Solves the normal equations by the Levinson-Durbin recursion, with the decoder's sign convention.</summary>
+    /// <param name="correlation">The autocorrelation, lags 0 to the order.</param>
+    /// <param name="reflection">Receives the reflection coefficients.</param>
+    /// <returns>The prediction error energy.</returns>
+    private static double LevinsonDurbin(ReadOnlySpan<double> correlation, Span<double> reflection)
+    {
+        Span<double> lpc = stackalloc double[reflection.Length + 1];
+        Span<double> previous = stackalloc double[reflection.Length + 1];
+        lpc[0] = 1;
+        var error = correlation[0];
+        for (var m = 1; m <= reflection.Length; m++)
+        {
+            var sum = correlation[m];
+            for (var i = 1; i < m; i++)
+            {
+                sum += lpc[i] * correlation[m - i];
+            }
+
+            var k = error > 0 ? Math.Clamp(-sum / error, -0.999, 0.999) : 0;
+            reflection[m - 1] = k;
+            lpc.CopyTo(previous);
+            for (var i = 1; i < m; i++)
+            {
+                lpc[i] = previous[i] + (k * previous[m - i]);
+            }
+
+            lpc[m] = k;
+            error *= 1 - (k * k);
+        }
+
+        return error;
+    }
+
+    /// <summary>Converts reflection coefficients to direct-form coefficients exactly as the decoder does, <c>lpc[0] = 1</c>.</summary>
+    /// <param name="reflection">The dequantised reflection coefficients.</param>
+    /// <param name="lpc">order + 1 outputs.</param>
+    private static void ToLpc(ReadOnlySpan<float> reflection, Span<float> lpc)
+    {
+        Span<float> previous = stackalloc float[TnsMaxOrder + 1];
+        lpc.Clear();
+        lpc[0] = 1;
+        for (var m = 1; m <= reflection.Length; m++)
+        {
+            lpc[..m].CopyTo(previous);
+            for (var i = 1; i < m; i++)
+            {
+                lpc[i] = previous[i] + (reflection[m - 1] * previous[m - i]);
+            }
+
+            lpc[m] = reflection[m - 1];
         }
     }
 

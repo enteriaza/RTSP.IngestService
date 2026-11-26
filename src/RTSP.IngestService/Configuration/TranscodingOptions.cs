@@ -63,6 +63,19 @@ public enum TranscodingHardwareAcceleration
     None,
 }
 
+/// <summary>Which implementation transcodes source audio to canonical AAC-LC.</summary>
+public enum TranscodingAudioEngine
+{
+    /// <summary>FFmpeg transcodes audio in the same process as video.</summary>
+    Ffmpeg,
+
+    /// <summary>
+    /// The service's managed AAC-LC decoder, downmixer, resampler and encoder transcode AAC-LC sources, and FFmpeg
+    /// transcodes video only; every other source audio codec and profile is still transcoded by FFmpeg.
+    /// </summary>
+    ManagedAacLc,
+}
+
 /// <summary>
 /// Settings for canonical transcoding of published streams (<see cref="TranscodingPublishSessionHandler"/>).
 /// </summary>
@@ -312,4 +325,11 @@ public sealed class TranscodingAudioOptions
     /// <summary>Gets or sets the AAC bitrate in kilobits per second. Defaults to 160; valid range is 32 to 512.</summary>
     [Range(32, 512)]
     public int BitrateKilobits { get; set; } = 160;
+
+    /// <summary>
+    /// Gets or sets which implementation transcodes AAC-LC source audio. Defaults to
+    /// <see cref="TranscodingAudioEngine.Ffmpeg"/>; a temporary control while the managed engine is introduced.
+    /// </summary>
+    [EnumDataType(typeof(TranscodingAudioEngine))]
+    public TranscodingAudioEngine Engine { get; set; } = TranscodingAudioEngine.Ffmpeg;
 }

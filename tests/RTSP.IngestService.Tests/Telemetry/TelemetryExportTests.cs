@@ -76,6 +76,21 @@ public sealed class TelemetryExportTests
         ["transcoding.queue.saturations"] = new() { ["track=video"] = 1 },
         ["transcoding.queue.bytes"] = new() { [""] = 4096 },
         ["transcoding.latency"] = new() { [""] = 0.2 },
+        ["transcoding.mux.units"] = new() { ["outcome=forwarded;track=video"] = 1 },
+        ["transcoding.mux.queue.units"] = new() { ["track=audio"] = 2 },
+        ["transcoding.mux.queue.bytes"] = new() { ["track=audio"] = 3000 },
+        ["transcoding.mux.early_releases"] = new() { ["reason=idle;track=video"] = 1 },
+        ["transcoding.mux.saturations"] = new() { ["limit=units;track=audio"] = 1 },
+        ["transcoding.mux.backpressure.duration"] = new() { ["track=audio"] = 0.05 },
+        ["transcoding.mux.hold.duration"] = new() { ["track=video"] = 0.1 },
+        ["transcoding.mux.startup.duration"] = new() { [""] = 0.3 },
+        ["transcoding.mux.failures"] = new() { ["source=downstream"] = 1 },
+        ["transcoding.audio.concealed"] = new() { ["reason=gap"] = 512 },
+        ["transcoding.audio.trimmed"] = new() { [""] = 256 },
+        ["transcoding.audio.resets"] = new() { ["reason=discontinuity"] = 1 },
+        ["transcoding.audio.decoder.recreations"] = new() { [""] = 1 },
+        ["transcoding.audio.clipped"] = new() { [""] = 3 },
+        ["transcoding.audio.latency"] = new() { [""] = 0.04 },
         ["hls.sessions.active"] = new() { [""] = 1 },
         ["hls.initialization_segments"] = new() { [""] = 1 },
         ["hls.segments"] = new() { ["boundary=keyframe"] = 1 },
@@ -253,7 +268,7 @@ public sealed class TelemetryExportTests
         provider.ForceFlush(10_000);
         var latest = Latest(exported);
 
-        Assert.Equal(73, instruments.Count);
+        Assert.Equal(88, instruments.Count);
         Assert.Equal(instruments.Count, instruments.Select(static i => i.Name).Distinct(StringComparer.Ordinal).Count());
         Assert.Equal(TelemetryTestSupport.Vocabulary.Keys.Order(StringComparer.Ordinal), instruments.Select(static i => i.Name).Order(StringComparer.Ordinal));
         Assert.Equal(TelemetryTestSupport.Vocabulary.Keys.Order(StringComparer.Ordinal), Expected.Keys.Order(StringComparer.Ordinal));
@@ -424,6 +439,20 @@ public sealed class TelemetryExportTests
         transcoding.Saturated(MediaTrack.Video);
         transcoding.Buffered(4096);
         transcoding.Latency(0.2);
+        transcoding.MultiplexerUnit(MediaTrack.Video, MultiplexerUnitOutcome.Forwarded);
+        transcoding.MultiplexerQueued(MediaTrack.Audio, 2, 3000);
+        transcoding.MultiplexerReleasedEarly(MediaTrack.Video, MultiplexerEarlyRelease.Idle);
+        transcoding.MultiplexerSaturated(MediaTrack.Audio, MultiplexerEarlyRelease.Units);
+        transcoding.MultiplexerBackpressure(MediaTrack.Audio, 0.05);
+        transcoding.MultiplexerHeld(MediaTrack.Video, 0.1);
+        transcoding.MultiplexerStartup(0.3);
+        transcoding.MultiplexerFailure(downstream: true);
+        transcoding.AudioConcealed(AudioConcealmentReason.Gap, 512);
+        transcoding.AudioTrimmed(256);
+        transcoding.AudioReset(AudioResetReason.Discontinuity);
+        transcoding.AudioDecoderRecreated();
+        transcoding.AudioClipped(3);
+        transcoding.AudioLatency(0.04);
 
         var hls = services.GetRequiredService<HlsMetrics>();
         hls.SessionStarted();

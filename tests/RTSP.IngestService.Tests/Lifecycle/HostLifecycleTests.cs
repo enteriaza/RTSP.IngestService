@@ -180,7 +180,11 @@ public sealed class HostLifecycleTests
         var lifecycle = host.Services.GetRequiredService<IApplicationLifecycle>();
 
         await host.StartAsync(TestContext.Current.CancellationToken);
-        await host.WaitForShutdownAsync(TestContext.Current.CancellationToken).WithinSafetyTimeout();
+
+        // Microsoft.Extensions.Hosting 11 rethrows a faulted background service from StopAsync, and therefore from
+        // WaitForShutdownAsync; ServiceRunner logs that as a shutdown failure.
+        var stopFailure = await Assert.ThrowsAsync<InvalidOperationException>(() => host.WaitForShutdownAsync(TestContext.Current.CancellationToken).WithinSafetyTimeout());
+        Assert.Equal(FaultingBackgroundService.FailureMessage, stopFailure.Message);
 
         Assert.Equal(ApplicationState.Failed, lifecycle.State);
         Assert.False(lifecycle.IsReady);

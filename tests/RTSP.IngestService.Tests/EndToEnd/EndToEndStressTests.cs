@@ -145,6 +145,11 @@ public sealed class EndToEndStressTests : IDisposable
             Assert.Contains(endReason, new[] { StreamEventReasons.ClientDisconnected, StreamEventReasons.ConnectionError });
             evidence.Add($"camera2 publisher killed: incarnation {old.IncarnationId} ended ({endReason}); catalog {catalog.Current.Find("live", "camera2")!.Publishing.State}/{catalog.Current.Find("live", "camera2")!.Hls.State}");
 
+            // The ended publication's HLS stream stays open until its transcoder has drained (up to
+            // Transcoding:DrainTimeout), and HLS refuses the identity until then; reconnect once it is released.
+            await Eventually.WaitUntilAsync(() => catalog.Current.Find("live", "camera2") is { Hls.State: not StreamHlsState.Live } e && e.IncarnationId == old.IncarnationId, "the disconnected publication's HLS stream has ended");
+            evidence.Add($"camera2 HLS stream released: {catalog.Current.Find("live", "camera2")!.Hls.State}");
+
             publishers.Add(new(tools.Ffmpeg, rtmpPort, EndToEndHost.Key(2), 60, "smptebars", 660));
             await Eventually.WaitUntilAsync(() => catalog.Current.Find("live", "camera2") is { Publishing.State: StreamPublishingState.Publishing, Hls.State: StreamHlsState.Live } e && e.IncarnationId != old.IncarnationId, "the reconnected publication is live");
             var replacement = catalog.Current.Find("live", "camera2")!;

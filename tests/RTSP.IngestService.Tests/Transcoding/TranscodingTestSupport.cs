@@ -1,5 +1,5 @@
 // Building blocks for transcoding tests that do not need FFmpeg: a scripted in-memory transcoder process (echoing its
-// FLV input as its output, crashing, exiting at once, stalling or failing to start), and a harness that drives
+// FLV input as its output, crashing, exiting at once, stalling, refusing all input or failing to start), and a harness that drives
 // TranscodingPublishSessionHandler directly with pooled messages and fixture FLV tags.
 
 using System.Buffers;
@@ -34,13 +34,16 @@ internal enum FakeTranscoderBehavior
 
     /// <summary>The process cannot be started.</summary>
     FailToStart,
+
+    /// <summary>Never reads its input and accepts no buffered input either, so the first write blocks until killed.</summary>
+    RefuseInput,
 }
 
 /// <summary>An in-memory transcoder process.</summary>
 internal sealed class FakeTranscoder : ITranscoderProcess
 {
     /// <summary>The input pipe; small, so a process that does not read blocks its writer quickly.</summary>
-    private readonly Pipe _input = new(new PipeOptions(pauseWriterThreshold: 16 * 1024, resumeWriterThreshold: 8 * 1024, useSynchronizationContext: false));
+    private readonly Pipe _input;
 
     /// <summary>The output pipe.</summary>
     private readonly Pipe _output = new(new PipeOptions(useSynchronizationContext: false));
@@ -72,6 +75,8 @@ internal sealed class FakeTranscoder : ITranscoderProcess
         Arguments = arguments;
         _behavior = behavior;
         _crashAfter = crashAfter;
+        var pause = behavior == FakeTranscoderBehavior.RefuseInput ? 1 : 16 * 1024;
+        _input = new Pipe(new PipeOptions(pauseWriterThreshold: pause, resumeWriterThreshold: pause / 2, useSynchronizationContext: false));
         Input = _input.Writer.AsStream();
         Output = _output.Reader.AsStream();
         Exited = Task.Run(RunAsync);
@@ -135,7 +140,11 @@ internal sealed class FakeTranscoder : ITranscoderProcess
         Input.Dispose();
         await Output.DisposeAsync().ConfigureAwait(false);
         _kill.Dispose();
+        Disposed = true;
     }
+
+    /// <summary>Gets a value indicating whether the session disposed the process.</summary>
+    public bool Disposed { get; private set; }
 
     /// <summary>Runs the behaviour.</summary>
     /// <returns>The exit code.</returns>
@@ -149,7 +158,7 @@ internal sealed class FakeTranscoder : ITranscoderProcess
                 case FakeTranscoderBehavior.ExitAtStart:
                     _diagnostics = "Invalid data found when processing input";
                     return await ExitAsync(1).ConfigureAwait(false);
-                case FakeTranscoderBehavior.Stall:
+                case FakeTranscoderBehavior.Stall or FakeTranscoderBehavior.RefuseInput:
                     await Task.Delay(Timeout.Infinite, token).ConfigureAwait(false);
                     return 0;
             }

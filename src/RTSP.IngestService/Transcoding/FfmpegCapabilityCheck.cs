@@ -71,6 +71,7 @@ internal sealed partial class FfmpegCapabilityCheck : IHostedService
         }
 
         LogReady(path, version);
+        LogAudioEngine(_options.Audio.Engine);
     }
 
     /// <inheritdoc />
@@ -226,6 +227,11 @@ internal sealed partial class FfmpegCapabilityCheck : IHostedService
     /// <param name="version">The version line.</param>
     [LoggerMessage(EventId = 10015, Level = LogLevel.Information, Message = "Transcoding uses FFmpeg at {Path}: {Version}")]
     private partial void LogReady(string path, string version);
+
+    /// <summary>Logs the configured audio engine.</summary>
+    /// <param name="engine">The engine.</param>
+    [LoggerMessage(EventId = 10017, Level = LogLevel.Information, Message = "Transcoding audio engine is {Engine} (Transcoding:Audio:Engine); with ManagedAacLc, AAC-LC sources are transcoded by the managed audio codecs and FFmpeg transcodes their video only")]
+    private partial void LogAudioEngine(TranscodingAudioEngine engine);
 }
 
 /// <summary>Terminates any transcoder still running when the host stops.</summary>

@@ -40,6 +40,12 @@ internal sealed partial class TranscodingPublishSessionHandler : IPublishSession
     /// <summary>The canonical IDR interval.</summary>
     private readonly TimeSpan _keyframeInterval;
 
+    /// <summary>The bounds of each session's media multiplexer.</summary>
+    private readonly MultiplexerLimits _limits;
+
+    /// <summary>The clock for multiplexer hold deadlines.</summary>
+    private readonly TimeProvider _time;
+
     /// <summary>Active sessions by session ID.</summary>
     private readonly ConcurrentDictionary<Guid, SessionState> _sessions = new();
 
@@ -54,7 +60,8 @@ internal sealed partial class TranscodingPublishSessionHandler : IPublishSession
     /// <param name="factory">Starts transcoders.</param>
     /// <param name="metrics">Metrics.</param>
     /// <param name="logger">Logger.</param>
-    public TranscodingPublishSessionHandler(IOptions<TranscodingOptions> options, IOptions<MediaOptions> media, IOptions<HlsOptions> hls, IPublishSessionHandler downstream, ITranscoderProcessFactory factory, TranscodingMetrics metrics, ILogger<TranscodingPublishSessionHandler> logger)
+    /// <param name="time">The clock for multiplexer hold deadlines; the system clock when <see langword="null"/>.</param>
+    public TranscodingPublishSessionHandler(IOptions<TranscodingOptions> options, IOptions<MediaOptions> media, IOptions<HlsOptions> hls, IPublishSessionHandler downstream, ITranscoderProcessFactory factory, TranscodingMetrics metrics, ILogger<TranscodingPublishSessionHandler> logger, TimeProvider? time = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(media);
@@ -65,8 +72,10 @@ internal sealed partial class TranscodingPublishSessionHandler : IPublishSession
         _factory = factory;
         _metrics = metrics;
         _logger = logger;
-        _budget = new TranscodingBufferBudget(_options.MaxTotalBufferBytes);
+        _budget = TranscodingBufferBudget.FromOptions(_options, _media);
         _keyframeInterval = _options.Video.KeyframeInterval ?? hls.Value.TargetSegmentDuration;
+        _limits = MultiplexerLimits.FromOptions(_options);
+        _time = time ?? TimeProvider.System;
     }
 
     /// <summary>Gets the downstream media stage, when it is the built-in one.</summary>
@@ -75,8 +84,11 @@ internal sealed partial class TranscodingPublishSessionHandler : IPublishSession
     /// <summary>Gets the number of sessions holding a slot; for tests.</summary>
     internal int ActiveSessionCount => Volatile.Read(ref _active);
 
-    /// <summary>Gets the bytes held in all session queues; for tests.</summary>
+    /// <summary>Gets the bytes held in all session and multiplexer queues; for tests.</summary>
     internal long BufferedBytes => _budget.Used;
+
+    /// <summary>Gets the service-wide buffer budget; for tests.</summary>
+    internal TranscodingBufferBudget Budget => _budget;
 
     /// <summary>Returns a session's pipeline; for tests.</summary>
     /// <param name="sessionId">The session.</param>
@@ -102,7 +114,7 @@ internal sealed partial class TranscodingPublishSessionHandler : IPublishSession
             throw new TranscodingRejectedException(TranscodingRejectionReason.Capacity, "All transcoding sessions are in use.");
         }
 
-        var state = new SessionState(new TranscodingSession(session, _downstream, _options, _media, _factory, _budget, _metrics, _logger, _keyframeInterval));
+        var state = new SessionState(new TranscodingSession(session, _downstream, _options, _media, _factory, _budget, _metrics, _logger, _keyframeInterval, _limits, _time));
         if (!_sessions.TryAdd(session.SessionId, state))
         {
             Interlocked.Decrement(ref _active);
@@ -162,6 +174,14 @@ internal sealed partial class TranscodingPublishSessionHandler : IPublishSession
         {
             var configuration = pipeline.Parser.Configuration;
             LogConfiguration(session.SessionId, configuration.Video?.Description ?? "none", configuration.Audio?.Description ?? "none", configuration.Color?.IsHighDynamicRange == true);
+            if (configuration.Audio is { } audio && !pipeline.RouteAudio(audio))
+            {
+                result.Sample?.Dispose();
+                const string Detail = "The source audio changed to a configuration the ManagedAacLc engine does not support; the audio engine cannot change during a publish.";
+                _metrics.Rejection(TranscodingRejectionReason.UnsupportedCodec);
+                LogMediaRejected(session.SessionId, MediaTrack.Audio, TranscodingRejectionReason.UnsupportedCodec, Detail);
+                throw new TranscodingRejectedException(TranscodingRejectionReason.UnsupportedCodec, Detail);
+            }
         }
 
         switch (result.Outcome)
@@ -174,6 +194,10 @@ internal sealed partial class TranscodingPublishSessionHandler : IPublishSession
                 if (result.Track == MediaTrack.Video)
                 {
                     pipeline.MarkVideoBroken();
+                }
+                else
+                {
+                    pipeline.MarkAudioLost();
                 }
 
                 if (state.LoggedErrors.Add((result.Track, result.ErrorKind)))

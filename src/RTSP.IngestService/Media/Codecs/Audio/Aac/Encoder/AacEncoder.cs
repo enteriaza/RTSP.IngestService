@@ -19,7 +19,15 @@
 //    target, and no access unit exceeds 12288 bits (6144 per channel).
 //  * Bandwidth: bands starting at or above a bitrate-dependent cutoff (12 kHz at 64 kbit/s to 20 kHz above
 //    192 kbit/s) are not coded.
-// Not used: intensity stereo, PNS, TNS, pulse data, KBD windows and short-window grouping.
+//  * TNS: a channel's frame may use it when the first-difference energy of its 2048 input samples, in sixteen
+//    128-sample blocks, has an arithmetic-to-geometric mean ratio of at least 1 dB (a temporal envelope to shape:
+//    voice onsets, pitch pulses, decays; a stationary tone is predictable across frequency too, but has none), and
+//    the frame is ONLY_LONG, or LONG_STOP from 48 kbit/s (starved decays after an attack clip when the excess noise
+//    is shaped into the attack). LONG_START frames never use it: their window overlaps the coming attack, and shaping
+//    noise toward it is pre-echo. Nor do frames that include Flush's silent padding: the edge it creates is not
+//    programme material, and shaped noise at a tone cut off there overshoots by up to 5 dB at 64 kbit/s.
+//    AacChannelCoder then decides by prediction gain.
+// Not used: intensity stereo, PNS, pulse data, KBD windows and short-window grouping.
 
 using RTSP.IngestService.Media.Codecs.Audio.Processing;
 using RTSP.IngestService.Media.Codecs.Common.Bitstreams;
@@ -45,6 +53,9 @@ internal sealed class AacEncoderStatistics
 
     /// <summary>Gets the LONG_START and LONG_STOP transition frames.</summary>
     public long TransitionFrames { get; internal set; }
+
+    /// <summary>Gets the channel frames coded with a TNS filter.</summary>
+    public long TnsChannels { get; internal set; }
 
     /// <summary>Gets the bands coded as mid/side.</summary>
     public long MidSideBands { get; internal set; }
@@ -82,6 +93,18 @@ internal sealed class AacEncoder : IDisposable
 
     /// <summary>An offset at which every band quantises to zero.</summary>
     private const int SilentOffset = 300;
+
+    /// <summary>
+    /// The smallest mean frame size, in bits, at which LONG_STOP frames use TNS (48 kbit/s): below it the decay after
+    /// an attack is starved, and shaping the excess noise into the attack clips.
+    /// </summary>
+    private const int LongStopTnsMinimumBits = 1024;
+
+    /// <summary>
+    /// The smallest temporal-envelope unevenness (<see cref="EnvelopeFlatnessDb"/>) for which a frame may use TNS: a
+    /// stationary sine's spectrum is predictable across frequency too, but has no envelope to shape.
+    /// </summary>
+    private const double TnsMinimumEnvelopeDb = 1;
 
     /// <summary>Samples held: blocks k-1, k and k+1.</summary>
     private const int BufferLength = 3 * FrameLength;
@@ -342,6 +365,11 @@ internal sealed class AacEncoder : IDisposable
                     coder.Energy.AsSpan(w * AacChannelCoder.BandStride, AacChannelCoder.BandStride),
                     coder.Threshold.AsSpan(w * AacChannelCoder.BandStride, AacChannelCoder.BandStride));
             }
+
+            var padded = (_frameIndex + 1) * FrameLength > _inputSamples;
+            var tns = !padded && (sequence == AacWindowSequence.OnlyLong || (sequence == AacWindowSequence.LongStop && _meanBits >= LongStopTnsMinimumBits));
+            coder.ApplyTns(layout, tns && EnvelopeFlatnessDb(_buffer[c]) >= TnsMinimumEnvelopeDb);
+            Statistics.TnsChannels += coder.HasTns ? 1 : 0;
         }
 
         var midSide = ChooseStereo(layout);
@@ -399,6 +427,33 @@ internal sealed class AacEncoder : IDisposable
     /// <param name="index">The access unit index.</param>
     /// <returns>The timestamp.</returns>
     private long TimestampOf(long index) => _anchor + new MediaTimeBase(1, SampleRate).Rescale((index - 1) * FrameLength, _timeBase);
+
+    /// <summary>
+    /// The temporal-envelope unevenness of frame k's 2048 input samples: 10 log10 of the arithmetic over the geometric
+    /// mean of the first-difference energy in sixteen 128-sample blocks. 0 dB for a stationary signal.
+    /// </summary>
+    /// <param name="samples">The channel buffer, blocks k-1 and k first.</param>
+    /// <returns>The unevenness in decibels.</returns>
+    private static double EnvelopeFlatnessDb(float[] samples)
+    {
+        const int blocks = 16;
+        const int blockLength = 2 * FrameLength / blocks;
+        double arithmetic = 0, logarithmic = 0;
+        for (var b = 0; b < blocks; b++)
+        {
+            var energy = 1.0;
+            for (var n = Math.Max(1, b * blockLength); n < (b + 1) * blockLength; n++)
+            {
+                var difference = samples[n] - samples[n - 1];
+                energy += difference * difference;
+            }
+
+            arithmetic += energy / blocks;
+            logarithmic += Math.Log(energy) / blocks;
+        }
+
+        return 10 * Math.Log10(arithmetic / Math.Exp(logarithmic));
+    }
 
     /// <summary>Whether either channel has an attack in the region starting at a buffer offset.</summary>
     /// <param name="start">The buffer offset.</param>

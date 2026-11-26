@@ -165,7 +165,7 @@ public sealed class HlsFfmpegInteropTests
     /// <param name="playlist">The playlist.</param>
     /// <param name="sampleRate">The AAC sample rate.</param>
     /// <returns>A task.</returns>
-    private static async Task AssertTimingAsync(string probe, string path, InMemoryHlsSegmentStore store, string identity, HlsPlaylistSnapshot playlist, int sampleRate)
+    internal static async Task AssertTimingAsync(string probe, string path, InMemoryHlsSegmentStore store, string identity, HlsPlaylistSnapshot playlist, int sampleRate)
     {
         var video = new List<(long Dts, long Pts, long Duration)>();
         var audio = new List<(long Start, long Duration)>();
@@ -338,7 +338,7 @@ public sealed class HlsFfmpegInteropTests
     internal sealed record ProbeResult(IReadOnlyList<ProbeStream> Streams, double Duration);
 
     /// <summary>A temporary directory holding a reconstructed presentation.</summary>
-    private sealed class TemporaryDirectory : IDisposable
+    internal sealed class TemporaryDirectory : IDisposable
     {
         /// <summary>The path.</summary>
         private readonly string _path = Directory.CreateTempSubdirectory("rtsp-hls-").FullName;

@@ -33,6 +33,7 @@ public sealed class TranscodingOptionsTests
         Assert.Null(options.Video.KeyframeInterval);
         Assert.Null(options.AcceptedVideoCodecs);
         Assert.Equal(160, options.Audio.BitrateKilobits);
+        Assert.Equal(TranscodingAudioEngine.Ffmpeg, options.Audio.Engine);
     }
 
     /// <summary>Every setting binds from configuration, including codec lists by name.</summary>
@@ -52,6 +53,7 @@ public sealed class TranscodingOptionsTests
             ["Transcoding:Video:KeyframeInterval"] = "00:00:02",
             ["Transcoding:Video:ConstantRateFactor"] = "30",
             ["Transcoding:Audio:BitrateKilobits"] = "96",
+            ["Transcoding:Audio:Engine"] = "ManagedAacLc",
             ["Transcoding:DrainTimeout"] = "00:00:10",
         });
         var options = provider.GetRequiredService<IOptions<TranscodingOptions>>().Value;
@@ -65,6 +67,7 @@ public sealed class TranscodingOptionsTests
         Assert.Equal(TimeSpan.FromSeconds(2), options.Video.KeyframeInterval);
         Assert.Equal(30, options.Video.ConstantRateFactor);
         Assert.Equal(96, options.Audio.BitrateKilobits);
+        Assert.Equal(TranscodingAudioEngine.ManagedAacLc, options.Audio.Engine);
         Assert.Equal(TimeSpan.FromSeconds(10), options.DrainTimeout);
     }
 
@@ -92,6 +95,8 @@ public sealed class TranscodingOptionsTests
     [InlineData("Video:KeyframeInterval", "00:01:01")]
     [InlineData("Audio:BitrateKilobits", "31")]
     [InlineData("Audio:BitrateKilobits", "513")]
+    [InlineData("Audio:Engine", "Managed")]
+    [InlineData("Audio:Engine", "7")]
     [InlineData("AcceptedVideoCodecs:0", "Vp8")]
     [InlineData("AcceptedAudioCodecs:0", "Pcm")]
     [InlineData("OverloadPolicy", "Passthrough")]

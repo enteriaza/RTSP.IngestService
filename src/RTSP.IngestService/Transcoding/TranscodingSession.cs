@@ -1,48 +1,174 @@
 // One publisher's transcoding pipeline. The RTMP receive loop submits validated source samples into a bounded queue
 // (frame counts per track, bytes per session and a service-wide byte budget); a writer task feeds them to the
-// session's transcoder process as FLV, and a reader task turns the canonical FLV output back into RTMP messages for
-// the existing media/HLS stage, which therefore only ever sees canonical H.264/AAC. The reader is the only caller of
-// the downstream handler while the session runs, so its calls stay sequential. The process is restarted when the
-// source configuration changes or the timeline jumps; a failure ends only this session.
+// session's transcoder process as FLV, and a reader task turns the canonical FLV output into encoded access units for
+// the session's media multiplexer, which delivers them to the existing media/HLS stage, so that stage only ever sees
+// canonical H.264/AAC. The multiplexer is the only caller of the downstream handler while the session runs, so its
+// calls stay sequential. The process is restarted when the source configuration changes or the timeline jumps; a
+// restart flushes the multiplexer first, so one process's output is delivered before the next one's. A failure ends
+// only this session.
 
 using System.Diagnostics;
 using System.Threading.Channels;
 using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Media;
-using RTSP.IngestService.Rtmp.Protocol;
+using RTSP.IngestService.Media.Codecs;
 using RTSP.IngestService.Rtmp.Publishing;
+using RTSP.IngestService.Rtp;
 
 namespace RTSP.IngestService.Transcoding;
 
-/// <summary>A service-wide budget of bytes held in transcoding queues.</summary>
-/// <param name="limit">The budget in bytes.</param>
-internal sealed class TranscodingBufferBudget(long limit)
+/// <summary>
+/// A service-wide budget of bytes held in transcoding queues, which is never exceeded. It is split into a shared pool,
+/// from which source queues and non-empty multiplexer queues reserve, and <see cref="Floors"/> floors of
+/// <see cref="FloorBytes"/> each, one of which an empty multiplexer queue uses for its head unit. A multiplexer queue
+/// can therefore always take a unit of up to <see cref="FloorBytes"/> however full the shared pool is, so a producer
+/// that must deliver output before its source queue can drain always progresses, without any overdraft.
+/// </summary>
+internal sealed class TranscodingBufferBudget
 {
-    /// <summary>Bytes reserved.</summary>
+    /// <summary>Guards <see cref="_waiters"/>.</summary>
+    private readonly Lock _gate = new();
+
+    /// <summary>Signals of producers waiting for shared bytes.</summary>
+    private readonly List<RtpSenderSignal> _waiters = [];
+
+    /// <summary>Bytes reserved from the shared pool.</summary>
+    private long _shared;
+
+    /// <summary>Bytes held by all reservations, shared and floor.</summary>
     private long _used;
 
-    /// <summary>Gets the bytes reserved.</summary>
+    /// <summary>The most bytes held at once.</summary>
+    private long _peak;
+
+    /// <summary>Floors in use.</summary>
+    private int _floorsInUse;
+
+    /// <summary>Entries in <see cref="_waiters"/>; read without the lock.</summary>
+    private int _waiterCount;
+
+    /// <summary>Initializes a new instance of the <see cref="TranscodingBufferBudget"/> class with no floors.</summary>
+    /// <param name="limit">The budget in bytes.</param>
+    public TranscodingBufferBudget(long limit)
+        : this(limit, 0, 0)
+    {
+    }
+
+    /// <summary>Initializes a new instance of the <see cref="TranscodingBufferBudget"/> class.</summary>
+    /// <param name="limit">The budget in bytes.</param>
+    /// <param name="floorBytes">The size of each floor.</param>
+    /// <param name="floors">The number of floors.</param>
+    /// <exception cref="ArgumentOutOfRangeException">The floors do not fit in the budget.</exception>
+    public TranscodingBufferBudget(long limit, long floorBytes, int floors)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(limit);
+        ArgumentOutOfRangeException.ThrowIfNegative(floorBytes);
+        ArgumentOutOfRangeException.ThrowIfNegative(floors);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(floorBytes * floors, limit, nameof(floorBytes));
+        Limit = limit;
+        FloorBytes = floorBytes;
+        Floors = floors;
+        SharedLimit = limit - (floorBytes * floors);
+    }
+
+    /// <summary>
+    /// Derives the floors for a transcoding configuration: two per session (one per multiplexer track queue), each as
+    /// large as the largest unit a multiplexer accepts, but together at most an eighth of the budget, so the shared
+    /// pool keeps at least seven eighths.
+    /// </summary>
+    /// <param name="options">The transcoding options.</param>
+    /// <param name="media">The media limits.</param>
+    /// <returns>The budget.</returns>
+    public static TranscodingBufferBudget FromOptions(TranscodingOptions options, MediaOptions media)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(media);
+        var floors = 2 * options.MaxConcurrentSessions;
+        var floorBytes = Math.Min(media.MaxSampleSize + 64L, options.MaxTotalBufferBytes / 8 / floors);
+        return new TranscodingBufferBudget(options.MaxTotalBufferBytes, floorBytes, floors);
+    }
+
+    /// <summary>Gets the bytes held.</summary>
     public long Used => Interlocked.Read(ref _used);
 
-    /// <summary>Gets the budget in bytes.</summary>
-    public long Limit { get; } = limit;
+    /// <summary>Gets the most bytes held at once; never more than <see cref="Limit"/>.</summary>
+    public long Peak => Interlocked.Read(ref _peak);
 
-    /// <summary>Reserves bytes if the budget allows.</summary>
+    /// <summary>Gets the budget in bytes.</summary>
+    public long Limit { get; }
+
+    /// <summary>Gets the size of each floor.</summary>
+    public long FloorBytes { get; }
+
+    /// <summary>Gets the number of floors.</summary>
+    public int Floors { get; }
+
+    /// <summary>Gets the shared pool's size: <see cref="Limit"/> less the floors.</summary>
+    public long SharedLimit { get; }
+
+    /// <summary>Gets a value indicating whether the shared pool is full.</summary>
+    public bool SharedExhausted => Interlocked.Read(ref _shared) >= SharedLimit;
+
+    /// <summary>Reserves shared bytes if the shared pool allows.</summary>
     /// <param name="bytes">The bytes.</param>
     /// <returns><see langword="true"/> if reserved.</returns>
     public bool TryReserve(long bytes)
     {
-        var used = Interlocked.Read(ref _used);
+        var shared = Interlocked.Read(ref _shared);
         while (true)
         {
-            if (used + bytes > Limit)
+            if (shared + bytes > SharedLimit)
             {
                 return false;
             }
 
-            var observed = Interlocked.CompareExchange(ref _used, used + bytes, used);
+            var observed = Interlocked.CompareExchange(ref _shared, shared + bytes, shared);
+            if (observed == shared)
+            {
+                Add(bytes);
+                return true;
+            }
+
+            shared = observed;
+        }
+    }
+
+    /// <summary>Releases shared bytes and wakes producers waiting for them.</summary>
+    /// <param name="bytes">The bytes.</param>
+    public void Release(long bytes)
+    {
+        Interlocked.Add(ref _shared, -bytes);
+        Interlocked.Add(ref _used, -bytes);
+        if (Volatile.Read(ref _waiterCount) > 0)
+        {
+            lock (_gate)
+            {
+                foreach (var waiter in _waiters)
+                {
+                    waiter.Set();
+                }
+            }
+        }
+    }
+
+    /// <summary>Takes a floor for up to <see cref="FloorBytes"/> bytes, if one is free.</summary>
+    /// <param name="bytes">The bytes held on it, at most <see cref="FloorBytes"/>.</param>
+    /// <returns><see langword="true"/> if taken.</returns>
+    public bool TryUseFloor(long bytes)
+    {
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(bytes, FloorBytes);
+        var used = Volatile.Read(ref _floorsInUse);
+        while (true)
+        {
+            if (used >= Floors)
+            {
+                return false;
+            }
+
+            var observed = Interlocked.CompareExchange(ref _floorsInUse, used + 1, used);
             if (observed == used)
             {
+                Add(bytes);
                 return true;
             }
 
@@ -50,9 +176,66 @@ internal sealed class TranscodingBufferBudget(long limit)
         }
     }
 
-    /// <summary>Releases reserved bytes.</summary>
+    /// <summary>Returns a floor taken by <see cref="TryUseFloor"/>.</summary>
+    /// <param name="bytes">The bytes held on it.</param>
+    public void ReturnFloor(long bytes)
+    {
+        Interlocked.Decrement(ref _floorsInUse);
+        Interlocked.Add(ref _used, -bytes);
+    }
+
+    /// <summary>Registers a signal set whenever shared bytes are released.</summary>
+    /// <param name="signal">The signal.</param>
+    public void AddWaiter(RtpSenderSignal signal)
+    {
+        lock (_gate)
+        {
+            _waiters.Add(signal);
+            _waiterCount = _waiters.Count;
+        }
+    }
+
+    /// <summary>Removes a signal registered by <see cref="AddWaiter"/>.</summary>
+    /// <param name="signal">The signal.</param>
+    public void RemoveWaiter(RtpSenderSignal signal)
+    {
+        lock (_gate)
+        {
+            _waiters.Remove(signal);
+            _waiterCount = _waiters.Count;
+        }
+    }
+
+    /// <summary>Adds held bytes and records the peak.</summary>
     /// <param name="bytes">The bytes.</param>
-    public void Release(long bytes) => Interlocked.Add(ref _used, -bytes);
+    private void Add(long bytes)
+    {
+        var used = Interlocked.Add(ref _used, bytes);
+        var peak = Interlocked.Read(ref _peak);
+        while (used > peak)
+        {
+            var observed = Interlocked.CompareExchange(ref _peak, used, peak);
+            if (observed == peak)
+            {
+                break;
+            }
+
+            peak = observed;
+        }
+    }
+}
+
+/// <summary>Which engine transcodes a session's audio.</summary>
+internal enum AudioRoute
+{
+    /// <summary>No audio configuration has been seen.</summary>
+    Undecided,
+
+    /// <summary>FFmpeg, in the same process as video.</summary>
+    Ffmpeg,
+
+    /// <summary>The <see cref="ManagedAudioStage"/>; FFmpeg transcodes video only.</summary>
+    Managed,
 }
 
 /// <summary>The transcoding pipeline of one publishing session.</summary>
@@ -76,9 +259,6 @@ internal sealed partial class TranscodingSession : IDisposable
 
     /// <summary>The publishing session.</summary>
     private readonly PublisherSession _publisher;
-
-    /// <summary>The downstream media stage.</summary>
-    private readonly IPublishSessionHandler _downstream;
 
     /// <summary>The transcoding options.</summary>
     private readonly TranscodingOptions _options;
@@ -128,11 +308,38 @@ internal sealed partial class TranscodingSession : IDisposable
     /// <summary>Completed when queue space is released, for the backpressure policy.</summary>
     private TaskCompletionSource? _spaceWaiter;
 
+    /// <summary>The multiplexer between the transcoder output and the downstream stage.</summary>
+    private readonly MediaMultiplexer _mux;
+
     /// <summary>Whether video must be dropped until the next keyframe (receive-loop state).</summary>
     private bool _videoBroken;
 
-    /// <summary>1 when publisher metadata changed and the downstream stage has not been told.</summary>
-    private int _metadataPending;
+    /// <summary>Which engine transcodes the session's audio; decided once, on the receive loop, read by the writer.</summary>
+    private int _audioRoute;
+
+    /// <summary>The managed audio stage, when audio is routed to it.</summary>
+    private ManagedAudioStage? _audioStage;
+
+    /// <summary>The last audio configuration accepted by <see cref="RouteAudio"/> (receive-loop state).</summary>
+    private SourceAudioConfiguration? _routedAudio;
+
+    /// <summary>Managed-route audio units lost since the last one queued (receive-loop state).</summary>
+    private int _audioLost;
+
+    /// <summary>The first managed-route audio timestamp while the source has no video (receive-loop state).</summary>
+    private long? _firstAudioWithoutVideo;
+
+    /// <summary>Whether video was declared absent to the multiplexer for an audio-only managed stream (receive-loop state).</summary>
+    private bool _videoDeclaredAbsent;
+
+    /// <summary>The video-only view of the configuration written to FFmpeg when audio is managed (writer-task state).</summary>
+    private SourceStreamConfiguration? _videoView;
+
+    /// <summary>
+    /// 1 once <see cref="StopAsync"/> asked for a drain. Set before the queue is completed, so a writer that sees the
+    /// queue end flushes the transcoder only when a drain was requested.
+    /// </summary>
+    private int _drainRequested;
 
     /// <summary>The first failure, once failed.</summary>
     private Exception? _fault;
@@ -180,11 +387,12 @@ internal sealed partial class TranscodingSession : IDisposable
     /// <param name="metrics">Metrics.</param>
     /// <param name="logger">Logger.</param>
     /// <param name="keyframeInterval">The canonical IDR interval.</param>
-    public TranscodingSession(PublisherSession publisher, IPublishSessionHandler downstream, TranscodingOptions options, MediaOptions media, ITranscoderProcessFactory factory, TranscodingBufferBudget budget, TranscodingMetrics metrics, ILogger logger, TimeSpan keyframeInterval)
+    /// <param name="limits">The multiplexer bounds.</param>
+    /// <param name="time">The clock for multiplexer hold deadlines.</param>
+    public TranscodingSession(PublisherSession publisher, IPublishSessionHandler downstream, TranscodingOptions options, MediaOptions media, ITranscoderProcessFactory factory, TranscodingBufferBudget budget, TranscodingMetrics metrics, ILogger logger, TimeSpan keyframeInterval, MultiplexerLimits limits, TimeProvider time)
     {
         _keyframeInterval = keyframeInterval;
         _publisher = publisher;
-        _downstream = downstream;
         _options = options;
         _media = media;
         _factory = factory;
@@ -192,6 +400,7 @@ internal sealed partial class TranscodingSession : IDisposable
         _metrics = metrics;
         _logger = logger;
         Parser = new SourceMediaParser(options, media);
+        _mux = new MediaMultiplexer(publisher, downstream, limits, budget, metrics, logger, time, SetFault, _abort.Token);
     }
 
     /// <summary>Gets the session's source parser.</summary>
@@ -202,6 +411,12 @@ internal sealed partial class TranscodingSession : IDisposable
 
     /// <summary>Gets the number of transcoder processes started; for tests.</summary>
     internal int ProcessCount => Volatile.Read(ref _processes);
+
+    /// <summary>Gets which engine transcodes the session's audio.</summary>
+    internal AudioRoute AudioEngine => (AudioRoute)Volatile.Read(ref _audioRoute);
+
+    /// <summary>Gets the managed audio stage, if audio is routed to it; for tests.</summary>
+    internal ManagedAudioStage? AudioStage => Volatile.Read(ref _audioStage);
 
     /// <summary>Gets the bytes currently queued; for tests.</summary>
     internal long QueuedBytes
@@ -215,8 +430,12 @@ internal sealed partial class TranscodingSession : IDisposable
         }
     }
 
-    /// <summary>Starts the writer task.</summary>
-    public void Start() => _worker = Task.Run(RunAsync);
+    /// <summary>Starts the multiplexer and the writer task.</summary>
+    public void Start()
+    {
+        _mux.Start();
+        _worker = Task.Run(RunAsync);
+    }
 
     /// <summary>Throws the pipeline's failure, if any.</summary>
     /// <exception cref="TranscodingFailedException">The pipeline failed.</exception>
@@ -229,10 +448,81 @@ internal sealed partial class TranscodingSession : IDisposable
     }
 
     /// <summary>Records that publisher metadata changed; the downstream stage is told before the next output.</summary>
-    public void NotifyMetadata() => Volatile.Write(ref _metadataPending, 1);
+    public void NotifyMetadata() => _mux.NotifyMetadata();
 
     /// <summary>Records that a video packet was lost, so video waits for the next keyframe.</summary>
     public void MarkVideoBroken() => _videoBroken = true;
+
+    /// <summary>Records that a source audio packet was lost, so managed audio conceals its duration.</summary>
+    public void MarkAudioLost()
+    {
+        if (AudioEngine == AudioRoute.Managed)
+        {
+            _audioLost++;
+        }
+    }
+
+    /// <summary>
+    /// Routes the session's audio when its configuration appears or changes; call before any sample under the
+    /// configuration is submitted. The first configuration decides the engine for the rest of the publish: the managed
+    /// engine when it is configured and the source is AAC-LC that the managed decoder accepts, otherwise FFmpeg. Later
+    /// configurations stay on that engine.
+    /// </summary>
+    /// <param name="configuration">The audio configuration.</param>
+    /// <returns>
+    /// <see langword="false"/> if audio is managed and the new configuration is not eligible; the publish must then end,
+    /// because the engine is never switched while publishing.
+    /// </returns>
+    public bool RouteAudio(SourceAudioConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        if (ReferenceEquals(configuration, _routedAudio))
+        {
+            return true;
+        }
+
+        switch (AudioEngine)
+        {
+            case AudioRoute.Undecided:
+                ManagedAudioIneligibility reason = default;
+                var managed = _options.Audio.Engine == TranscodingAudioEngine.ManagedAacLc && ManagedAudioStage.IsEligible(configuration, out reason);
+                if (managed)
+                {
+                    var stage = new ManagedAudioStage(_publisher, _mux.Audio, _options.Audio.BitrateKilobits * 1000, _metrics, _logger, Release, FailAudio, System.Buffers.ArrayPool<byte>.Shared, _abort.Token);
+                    lock (_gate)
+                    {
+                        Volatile.Write(ref _audioStage, stage);
+                        Volatile.Write(ref _audioRoute, (int)AudioRoute.Managed);
+                    }
+
+                    stage.Start();
+                    LogAudioEngine(_publisher.SessionId, TranscodingAudioEngine.ManagedAacLc, configuration.Description);
+                }
+                else
+                {
+                    lock (_gate)
+                    {
+                        Volatile.Write(ref _audioRoute, (int)AudioRoute.Ffmpeg);
+                    }
+
+                    if (_options.Audio.Engine == TranscodingAudioEngine.ManagedAacLc)
+                    {
+                        LogAudioFallback(_publisher.SessionId, configuration.Description, reason);
+                    }
+                    else
+                    {
+                        LogAudioEngine(_publisher.SessionId, TranscodingAudioEngine.Ffmpeg, configuration.Description);
+                    }
+                }
+
+                break;
+            case AudioRoute.Managed when !ManagedAudioStage.IsEligible(configuration, out _):
+                return false;
+        }
+
+        _routedAudio = configuration;
+        return true;
+    }
 
     /// <summary>Queues a sample for the transcoder, applying the overload policy.</summary>
     /// <param name="sample">The sample; ownership transfers to this method.</param>
@@ -252,6 +542,12 @@ internal sealed partial class TranscodingSession : IDisposable
                 return;
             }
 
+            var stage = video ? null : AudioStage;
+            if (stage is not null)
+            {
+                DeclareVideoAbsentIfAudioOnly(sample);
+            }
+
             while (true)
             {
                 Task? wait;
@@ -261,7 +557,7 @@ internal sealed partial class TranscodingSession : IDisposable
                     reason = TryAccount(sample);
                     if (reason is null)
                     {
-                        if (!_queue.Writer.TryWrite(sample))
+                        if (!(stage?.TryWrite(sample, _audioLost) ?? _queue.Writer.TryWrite(sample)))
                         {
                             Unaccount(sample.Track, sample.Message.Length);
                             ThrowIfFaulted();
@@ -272,6 +568,10 @@ internal sealed partial class TranscodingSession : IDisposable
                         if (video)
                         {
                             _videoBroken = false;
+                        }
+                        else if (stage is not null)
+                        {
+                            _audioLost = 0;
                         }
 
                         return;
@@ -293,6 +593,10 @@ internal sealed partial class TranscodingSession : IDisposable
                     {
                         _videoBroken = true;
                     }
+                    else if (stage is not null)
+                    {
+                        _audioLost++;
+                    }
 
                     return;
                 }
@@ -308,6 +612,66 @@ internal sealed partial class TranscodingSession : IDisposable
                 sample.Dispose();
             }
         }
+    }
+
+    /// <summary>
+    /// Declares video absent once a managed-audio source without video has sent <see cref="StartupHold"/> of audio, so
+    /// the multiplexer stops holding audio for a first video keyframe that will not come. A video process started
+    /// later declares video again.
+    /// </summary>
+    /// <param name="sample">A managed-route audio sample.</param>
+    private void DeclareVideoAbsentIfAudioOnly(SourceSample sample)
+    {
+        if (_videoDeclaredAbsent || sample.Configuration.Video is not null)
+        {
+            return;
+        }
+
+        _firstAudioWithoutVideo ??= sample.DecodeTimestamp;
+        if (sample.DecodeTimestamp - _firstAudioWithoutVideo.Value >= StartupHold || sample.DecodeTimestamp < _firstAudioWithoutVideo.Value)
+        {
+            _videoDeclaredAbsent = true;
+            _mux.Video.Declare(false);
+        }
+    }
+
+    /// <summary>Ends the publish after a managed audio failure.</summary>
+    /// <param name="failure">The failure.</param>
+    private void FailAudio(TranscodingFailedException failure)
+    {
+        if (Fault is null)
+        {
+            _metrics.Failure(failure.Stage, failure.Initialization);
+            LogFailed(_publisher.SessionId, failure.Stage, failure.Initialization, -1, failure.Message, "managed audio stage");
+        }
+
+        _mux.Audio.Fail(failure);
+        SetFault(failure);
+    }
+
+    /// <summary>
+    /// The configuration written to FFmpeg: the source configuration, or, when audio is managed, its video-only view.
+    /// The view is reused while the video configuration and colour description are unchanged, so an audio change does
+    /// not restart the video process.
+    /// </summary>
+    /// <param name="configuration">The source configuration.</param>
+    /// <returns>The configuration to write under.</returns>
+    private SourceStreamConfiguration VideoConfiguration(SourceStreamConfiguration configuration)
+    {
+        if (AudioEngine != AudioRoute.Managed || configuration.Audio is null)
+        {
+            return configuration;
+        }
+
+        foreach (var candidate in (ReadOnlySpan<SourceStreamConfiguration?>)[_instance?.Configuration, _videoView])
+        {
+            if (candidate is { Audio: null } && ReferenceEquals(candidate.Video, configuration.Video) && Equals(candidate.Color, configuration.Color))
+            {
+                return candidate;
+            }
+        }
+
+        return _videoView = configuration with { Audio = null };
     }
 
     /// <summary>
@@ -331,14 +695,21 @@ internal sealed partial class TranscodingSession : IDisposable
     private async Task StopCoreAsync(bool drain)
     {
         await Task.Yield();
-        _queue.Writer.TryComplete();
+        var stage = AudioStage;
         if (drain && Fault is null)
         {
+            Volatile.Write(ref _drainRequested, 1);
+            _queue.Writer.TryComplete();
+            stage?.Complete(drain: true);
             _abort.CancelAfter(_options.DrainTimeout);
         }
         else
         {
+            // Cancel before completing the queues: an idle writer woken by the completion must find the pipeline
+            // already aborted rather than take the end of the queue as the end of a normal publish.
             await _abort.CancelAsync().ConfigureAwait(false);
+            _queue.Writer.TryComplete();
+            stage?.Complete(drain: false);
         }
 
         WakeWaiter();
@@ -347,6 +718,24 @@ internal sealed partial class TranscodingSession : IDisposable
             await worker.ConfigureAwait(false);
         }
 
+        if (stage is not null)
+        {
+            if (drain && Fault is null && !_abort.IsCancellationRequested)
+            {
+                // The video process has drained, so audio no longer waits for video while the stage flushes.
+                _mux.Video.Complete();
+            }
+
+            await stage.Completion.ConfigureAwait(false);
+        }
+
+        // Only a drain that finished cleanly delivers what the multiplexer still holds; otherwise it is discarded.
+        if (drain && Fault is null && !_abort.IsCancellationRequested)
+        {
+            await _mux.CompleteAsync().ConfigureAwait(false);
+        }
+
+        await _mux.DisposeAsync().ConfigureAwait(false);
         var input = Interlocked.Read(ref _inputFrames);
         var output = Interlocked.Read(ref _outputFrames);
         var dropped = Interlocked.Read(ref _droppedFrames);
@@ -522,6 +911,12 @@ internal sealed partial class TranscodingSession : IDisposable
                 }
             }
 
+            if (Volatile.Read(ref _drainRequested) == 0)
+            {
+                // The queue ended without a drain request: the pipeline was aborted; the finally block kills.
+                return;
+            }
+
             if (held.Count > 0)
             {
                 await FlushHeldAsync(held, held[^1].Configuration, token).ConfigureAwait(false);
@@ -642,6 +1037,7 @@ internal sealed partial class TranscodingSession : IDisposable
     /// <returns>A task that completes when written or dropped.</returns>
     private async ValueTask ProcessAsync(SourceSample sample, SourceStreamConfiguration configuration, CancellationToken token, long? baseTimestamp = null)
     {
+        configuration = VideoConfiguration(configuration);
         var instance = _instance;
         TranscoderStartReason? reason = instance is null ? _nextReason
             : !ReferenceEquals(configuration, instance.Configuration) ? TranscoderStartReason.Configuration
@@ -738,17 +1134,32 @@ internal sealed partial class TranscodingSession : IDisposable
         Interlocked.Increment(ref _processes);
         _metrics.ProcessStarted(reason);
         LogProcessStarted(_publisher.SessionId, reason, configuration.Video?.Description ?? "none", configuration.Audio?.Description ?? "none", configuration.Color?.IsHighDynamicRange == true);
+        _mux.Video.Declare(configuration.Video is not null);
+        lock (_gate)
+        {
+            // Managed audio declares its own track; the route cannot change to managed between the check and the declaration.
+            if (AudioEngine != AudioRoute.Managed)
+            {
+                _mux.Audio.Declare(configuration.Audio is not null);
+            }
+        }
         instance.Reader = Task.Run(() => ReadOutputAsync(instance, _abort.Token), CancellationToken.None);
         try
         {
             await instance.Writer.WriteHeaderAsync(configuration.Audio is not null, configuration.Video is not null, token).AsTask().WaitAsync(StallTimeout, token).ConfigureAwait(false);
             await instance.Writer.WriteSequenceStartsAsync(configuration, 0, token).AsTask().WaitAsync(StallTimeout, token).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is IOException or TimeoutException)
+        catch (Exception ex)
         {
+            // The instance is not yet the session's current one, so nothing else would stop this process.
             await StopInstanceAsync(instance, drain: false).ConfigureAwait(false);
-            ThrowIfFaulted();
-            throw new TranscodingFailedException(TranscodingStage.Decoder, true, "The transcoder did not accept the stream configuration.", ex);
+            if (ex is IOException or TimeoutException)
+            {
+                ThrowIfFaulted();
+                throw new TranscodingFailedException(TranscodingStage.Decoder, true, "The transcoder did not accept the stream configuration.", ex);
+            }
+
+            throw;
         }
 
         return instance;
@@ -767,10 +1178,15 @@ internal sealed partial class TranscodingSession : IDisposable
             try
             {
                 await instance.Reader!.WaitAsync(_abort.Token).ConfigureAwait(false);
+                await _mux.FlushAsync(_abort.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
                 LogDrainTimeout(_publisher.SessionId);
+            }
+            catch (InvalidOperationException) when (Fault is not null)
+            {
+                // The multiplexer failed and faulted the session; the caller observes the fault.
             }
         }
 
@@ -864,28 +1280,25 @@ internal sealed partial class TranscodingSession : IDisposable
         SetFault(new TranscodingFailedException(stage, initialization, message));
     }
 
-    /// <summary>Delivers one output tag downstream.</summary>
+    /// <summary>Submits one output tag to the multiplexer.</summary>
     /// <param name="instance">The producing instance.</param>
     /// <param name="tag">The tag; ownership transfers to this method.</param>
     /// <param name="token">Cancellation.</param>
-    /// <returns>A task that completes when downstream accepted it.</returns>
-    private async ValueTask DeliverAsync(Instance instance, FlvTag tag, CancellationToken token)
+    /// <returns>A task that completes when the multiplexer queued it.</returns>
+    private ValueTask DeliverAsync(Instance instance, FlvTag tag, CancellationToken token)
     {
-        PublishedMessageKind kind;
         MediaTrack track;
         switch (tag.Type)
         {
             case 8:
-                kind = PublishedMessageKind.Audio;
                 track = MediaTrack.Audio;
                 break;
             case 9:
-                kind = PublishedMessageKind.Video;
                 track = MediaTrack.Video;
                 break;
             default:
                 tag.Body.Dispose();
-                return;
+                return ValueTask.CompletedTask;
         }
 
         var body = tag.Body.Memory.Span;
@@ -903,7 +1316,7 @@ internal sealed partial class TranscodingSession : IDisposable
             {
                 tag.Body.Dispose();
                 Drop(track, TranscodingDropReason.Overlap);
-                return;
+                return ValueTask.CompletedTask;
             }
 
             last = decodeTimestamp;
@@ -917,22 +1330,10 @@ internal sealed partial class TranscodingSession : IDisposable
             }
         }
 
-        if (Interlocked.Exchange(ref _metadataPending, 0) == 1)
-        {
-            var data = new PooledBuffer(System.Buffers.ArrayPool<byte>.Shared);
-            await _downstream.OnMessageAsync(_publisher, new PublishedMessage(PublishedMessageKind.Data, 18, (uint)decodeTimestamp, data), token).ConfigureAwait(false);
-        }
-
-        var message = new PublishedMessage(kind, tag.Type, (uint)decodeTimestamp, tag.Body);
-        try
-        {
-            await _downstream.OnMessageAsync(_publisher, message, token).ConfigureAwait(false);
-        }
-        catch
-        {
-            message.Dispose();
-            throw;
-        }
+        var kind = !header ? EncodedUnitKind.Sample : body.Length >= 2 && body[1] == 0 ? EncodedUnitKind.SequenceStart : EncodedUnitKind.SequenceEnd;
+        var sync = track == MediaTrack.Audio || (body.Length > 0 && ((body[0] >> 4) & 0x07) == 1);
+        var unit = new EncodedAccessUnit(kind, decodeTimestamp, MediaTimeBase.Milliseconds, sync, tag.Body);
+        return (track == MediaTrack.Video ? _mux.Video : _mux.Audio).SubmitAsync(unit, token);
     }
 
     /// <summary>Records when a video frame with a presentation time was submitted.</summary>
@@ -1007,6 +1408,20 @@ internal sealed partial class TranscodingSession : IDisposable
     /// <param name="reason">Why.</param>
     [LoggerMessage(EventId = 10004, Level = LogLevel.Debug, Message = "Session {SessionId} {Track} frame dropped ({Reason})")]
     private partial void LogDrop(Guid sessionId, MediaTrack track, TranscodingDropReason reason);
+
+    /// <summary>Logs the engine chosen for the session's audio.</summary>
+    /// <param name="sessionId">The session.</param>
+    /// <param name="engine">The engine.</param>
+    /// <param name="audio">The source audio description.</param>
+    [LoggerMessage(EventId = 10024, Level = LogLevel.Information, Message = "Session {SessionId} audio is transcoded by the {Engine} engine: source audio {Audio}")]
+    private partial void LogAudioEngine(Guid sessionId, TranscodingAudioEngine engine, string audio);
+
+    /// <summary>Logs source audio the managed engine cannot take.</summary>
+    /// <param name="sessionId">The session.</param>
+    /// <param name="audio">The source audio description.</param>
+    /// <param name="reason">Why.</param>
+    [LoggerMessage(EventId = 10025, Level = LogLevel.Warning, Message = "Session {SessionId} source audio {Audio} is not supported by the ManagedAacLc engine ({Reason}); it is transcoded by FFmpeg")]
+    private partial void LogAudioFallback(Guid sessionId, string audio, ManagedAudioIneligibility reason);
 
     /// <summary>Logs the session summary.</summary>
     /// <param name="sessionId">The session.</param>
