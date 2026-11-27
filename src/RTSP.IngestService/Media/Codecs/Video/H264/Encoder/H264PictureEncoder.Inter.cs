@@ -3,6 +3,9 @@
 // result, quarter-sample refinement by SATD, and the choice between P_Skip, P_L0_16x16, P_8x8 and intra. Every
 // candidate is bounded: vectors stay within the level's vertical range and at most 24 samples outside the picture.
 
+using System.Buffers.Binary;
+using System.Runtime.Intrinsics;
+
 namespace RTSP.IngestService.Media.Codecs.Video.H264.Encoder;
 
 /// <summary>Inter mode decision and motion estimation.</summary>
@@ -385,18 +388,51 @@ internal sealed partial class H264PictureEncoder
     {
         int width = reference.Width, height = reference.Height;
         var plane = reference.Luma;
-        var sad = 0;
-        for (var j = 0; j < size; j++)
+        int px = x0 + ix, py = y0 + iy;
+        int sad;
+        if (px >= 0 && py >= 0 && px + size <= width && py + size <= height)
         {
-            var row = Math.Clamp(y0 + iy + j, 0, height - 1) * width;
-            var src = (((by * 4) + j) * 16) + (bx * 4);
-            for (var i = 0; i < size; i++)
+            sad = Sad(_srcY.AsSpan((by * 64) + (bx * 4)), plane.AsSpan((py * width) + px), width, size);
+        }
+        else
+        {
+            sad = 0;
+            for (var j = 0; j < size; j++)
             {
-                sad += Math.Abs(_srcY[src + i] - plane[row + Math.Clamp(x0 + ix + i, 0, width - 1)]);
+                var row = Math.Clamp(py + j, 0, height - 1) * width;
+                var src = (((by * 4) + j) * 16) + (bx * 4);
+                for (var i = 0; i < size; i++)
+                {
+                    sad += Math.Abs(_srcY[src + i] - plane[row + Math.Clamp(px + i, 0, width - 1)]);
+                }
             }
         }
 
         return sad + BitCost(H264BitWriter.SeBits((ix * 4) - pmx) + H264BitWriter.SeBits((iy * 4) - pmy));
+    }
+
+    /// <summary>Returns the sum of absolute differences of a block that lies inside the reference.</summary>
+    /// <param name="source">The source block's first sample, stride 16.</param>
+    /// <param name="reference">The reference block's first sample.</param>
+    /// <param name="stride">The reference stride.</param>
+    /// <param name="size">The side, 8 or 16.</param>
+    /// <returns>The SAD.</returns>
+    private static int Sad(ReadOnlySpan<byte> source, ReadOnlySpan<byte> reference, int stride, int size)
+    {
+        // Each 16-bit lane gains at most 2 * 255 per row, so 16 rows cannot overflow.
+        var sum = Vector128<ushort>.Zero;
+        for (var j = 0; j < size; j++)
+        {
+            Vector128<byte> a = Row(source[(j * 16)..], size), b = Row(reference[(j * stride)..], size);
+            var (low, high) = Vector128.Widen(Vector128.Max(a, b) - Vector128.Min(a, b));
+            sum += low + high;
+        }
+
+        var (sumLow, sumHigh) = Vector128.Widen(sum);
+        return (int)Vector128.Sum(sumLow + sumHigh);
+
+        static Vector128<byte> Row(ReadOnlySpan<byte> row, int size) =>
+            size == 16 ? Vector128.Create(row) : Vector128.CreateScalar(BinaryPrimitives.ReadUInt64LittleEndian(row)).AsByte();
     }
 
     /// <summary>Returns the SATD of a quarter-sample candidate plus its vector cost.</summary>

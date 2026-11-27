@@ -17,16 +17,32 @@ internal static class H264InterPrediction
     /// <param name="fy">yFracL, 0 to 3.</param>
     /// <param name="size">The block side: 4, 8 or 16.</param>
     /// <param name="output">Receives size * size samples.</param>
+    /// <remarks>
+    /// Sample (i, j) of the block is G at window (i + 2, j + 2). b (8-241) is the horizontal half sample right of a
+    /// window sample, h (8-242) the vertical half sample below it, s and m the b below and the h to the right, j
+    /// (8-243 to 8-245) the centre half sample filtered from unclipped b sums; quarter samples average two of these
+    /// (8-250 to 8-261, Table 8-12). Each fractional class computes only the values it uses.
+    /// </remarks>
     public static void Luma(byte[] plane, int width, int height, int x, int y, int fx, int fy, int size, Span<byte> output)
     {
         var ws = size + 5;
         Span<byte> window = stackalloc byte[21 * 21];
-        for (var j = 0; j < ws; j++)
+        if (x >= 2 && y >= 2 && x + size + 3 <= width && y + size + 3 <= height)
         {
-            var row = Math.Clamp(y + j - 2, 0, height - 1) * width;
-            for (var i = 0; i < ws; i++)
+            for (var j = 0; j < ws; j++)
             {
-                window[(j * ws) + i] = plane[row + Math.Clamp(x + i - 2, 0, width - 1)];
+                plane.AsSpan(((y + j - 2) * width) + x - 2, ws).CopyTo(window.Slice(j * ws, ws));
+            }
+        }
+        else
+        {
+            for (var j = 0; j < ws; j++)
+            {
+                var row = Math.Clamp(y + j - 2, 0, height - 1) * width;
+                for (var i = 0; i < ws; i++)
+                {
+                    window[(j * ws) + i] = plane[row + Math.Clamp(x + i - 2, 0, width - 1)];
+                }
             }
         }
 
@@ -36,38 +52,50 @@ internal static class H264InterPrediction
             {
                 window.Slice(((j + 2) * ws) + 2, size).CopyTo(output.Slice(j * size, size));
             }
-
-            return;
         }
-
-        // b1 for rows -2 .. size + 2 (horizontal half-sample sums), h1 for columns 0 .. size (vertical sums).
-        Span<int> b1 = stackalloc int[21 * 16];
-        Span<int> h1 = stackalloc int[16 * 17];
-        for (var j = 0; j < ws; j++)
+        else if (fy == 0)
         {
-            for (var i = 0; i < size; i++)
+            // b, averaged with G (xFrac 1) or the G to its right (xFrac 3).
+            for (var j = 0; j < size; j++)
             {
-                var k = (j * ws) + i;
-                b1[(j * size) + i] = window[k] - (5 * window[k + 1]) + (20 * window[k + 2]) + (20 * window[k + 3]) - (5 * window[k + 4]) + window[k + 5];
+                for (var i = 0; i < size; i++)
+                {
+                    var k = ((j + 2) * ws) + i;
+                    var b = Clip((Tap(window, k, 1) + 16) >> 5);
+                    output[(j * size) + i] = (byte)(fx == 2 ? b : (window[k + 2 + (fx >> 1)] + b + 1) >> 1);
+                }
             }
         }
-
-        var hw = size + 1;
-        for (var j = 0; j < size; j++)
+        else if (fx == 0)
         {
-            for (var i = 0; i <= size; i++)
+            // h, averaged with G (yFrac 1) or the G below it (yFrac 3).
+            for (var j = 0; j < size; j++)
             {
-                var k = (j * ws) + i + 2;
-                h1[(j * hw) + i] = window[k] - (5 * window[k + ws]) + (20 * window[k + (2 * ws)]) + (20 * window[k + (3 * ws)]) - (5 * window[k + (4 * ws)]) + window[k + (5 * ws)];
+                for (var i = 0; i < size; i++)
+                {
+                    var k = (j * ws) + i + 2;
+                    var h = Clip((Tap(window, k, ws) + 16) >> 5);
+                    output[(j * size) + i] = (byte)(fy == 2 ? h : (window[k + ((2 + (fy >> 1)) * ws)] + h + 1) >> 1);
+                }
             }
         }
-
-        for (var j = 0; j < size; j++)
+        else if (fx != 2 && fy != 2)
         {
-            for (var i = 0; i < size; i++)
+            // Diagonal quarter samples: b (yFrac 1) or s (yFrac 3), averaged with h (xFrac 1) or m (xFrac 3).
+            int rowOffset = fy == 1 ? 2 : 3, columnOffset = fx == 1 ? 2 : 3;
+            for (var j = 0; j < size; j++)
             {
-                output[(j * size) + i] = (byte)Sample(window, ws, b1, h1, size, i, j, fx, fy);
+                for (var i = 0; i < size; i++)
+                {
+                    var horizontal = Clip((Tap(window, ((j + rowOffset) * ws) + i, 1) + 16) >> 5);
+                    var vertical = Clip((Tap(window, (j * ws) + i + columnOffset, ws) + 16) >> 5);
+                    output[(j * size) + i] = (byte)((horizontal + vertical + 1) >> 1);
+                }
             }
+        }
+        else
+        {
+            LumaCentre(window, ws, fx, fy, size, output);
         }
     }
 
@@ -100,65 +128,59 @@ internal static class H264InterPrediction
         }
     }
 
-    /// <summary>Computes one luma prediction sample (8-241 to 8-261, Table 8-12).</summary>
+    /// <summary>Predicts the fractional classes that use the centre half sample j: (2, 2), and j averaged with b, s, h or m.</summary>
     /// <param name="window">Reference samples from (-2, -2), stride <paramref name="ws"/>.</param>
     /// <param name="ws">The window stride.</param>
-    /// <param name="b1">Horizontal intermediate sums for rows -2 onwards, stride <paramref name="size"/>.</param>
-    /// <param name="h1">Vertical intermediate sums, stride <paramref name="size"/> + 1.</param>
-    /// <param name="size">The block side.</param>
-    /// <param name="i">Column.</param>
-    /// <param name="j">Row.</param>
     /// <param name="fx">xFracL.</param>
-    /// <param name="fy">yFracL.</param>
-    /// <returns>The sample.</returns>
-    private static int Sample(ReadOnlySpan<byte> window, int ws, ReadOnlySpan<int> b1, ReadOnlySpan<int> h1, int size, int i, int j, int fx, int fy)
+    /// <param name="fy">yFracL; one of the two is 2.</param>
+    /// <param name="size">The block side.</param>
+    /// <param name="output">Receives size * size samples.</param>
+    private static void LumaCentre(ReadOnlySpan<byte> window, int ws, int fx, int fy, int size, Span<byte> output)
     {
-        var hw = size + 1;
-        var g = window[((j + 2) * ws) + i + 2];
-        var b = Clip((b1[((j + 2) * size) + i] + 16) >> 5);
-        var h = Clip((h1[(j * hw) + i] + 16) >> 5);
-        switch (fx, fy)
+        // Unclipped horizontal 6-tap sums for window rows -2 .. size + 2, stride size.
+        Span<int> b1 = stackalloc int[21 * 16];
+        for (var j = 0; j < ws; j++)
         {
-            case (1, 0):
-                return (g + b + 1) >> 1;
-            case (2, 0):
-                return b;
-            case (3, 0):
-                return (window[((j + 2) * ws) + i + 3] + b + 1) >> 1;
-            case (0, 1):
-                return (g + h + 1) >> 1;
-            case (0, 2):
-                return h;
-            case (0, 3):
-                return (window[((j + 3) * ws) + i + 2] + h + 1) >> 1;
+            for (var i = 0; i < size; i++)
+            {
+                b1[(j * size) + i] = Tap(window, (j * ws) + i, 1);
+            }
         }
 
-        var m = Clip((h1[(j * hw) + i + 1] + 16) >> 5);
-        var s = Clip((b1[((j + 3) * size) + i] + 16) >> 5);
-        switch (fx, fy)
+        for (var j = 0; j < size; j++)
         {
-            case (1, 1):
-                return (b + h + 1) >> 1;
-            case (3, 1):
-                return (b + m + 1) >> 1;
-            case (1, 3):
-                return (h + s + 1) >> 1;
-            case (3, 3):
-                return (m + s + 1) >> 1;
+            for (var i = 0; i < size; i++)
+            {
+                var centre = Clip((Tap(b1, (j * size) + i, size) + 512) >> 10);
+                var other = (fx, fy) switch
+                {
+                    (2, 2) => centre,
+                    (2, 1) => Clip((b1[((j + 2) * size) + i] + 16) >> 5),
+                    (2, 3) => Clip((b1[((j + 3) * size) + i] + 16) >> 5),
+                    (1, 2) => Clip((Tap(window, (j * ws) + i + 2, ws) + 16) >> 5),
+                    _ => Clip((Tap(window, (j * ws) + i + 3, ws) + 16) >> 5),
+                };
+                output[(j * size) + i] = (byte)((centre + other + 1) >> 1);
+            }
         }
-
-        var k = (j * size) + i;
-        var sum = b1[k] - (5 * b1[k + size]) + (20 * b1[k + (2 * size)]) + (20 * b1[k + (3 * size)]) - (5 * b1[k + (4 * size)]) + b1[k + (5 * size)];
-        var center = Clip((sum + 512) >> 10);
-        return (fx, fy) switch
-        {
-            (2, 2) => center,
-            (2, 1) => (b + center + 1) >> 1,
-            (2, 3) => (s + center + 1) >> 1,
-            (1, 2) => (h + center + 1) >> 1,
-            _ => (m + center + 1) >> 1,
-        };
     }
+
+    /// <summary>Applies the 6-tap filter (1, -5, 20, 20, -5, 1) to six samples.</summary>
+    /// <param name="samples">The samples.</param>
+    /// <param name="k">The first sample.</param>
+    /// <param name="stride">The distance between taps: 1 horizontally, the row stride vertically.</param>
+    /// <returns>The unclipped, unrounded sum.</returns>
+    private static int Tap(ReadOnlySpan<byte> samples, int k, int stride) =>
+        samples[k] - (5 * samples[k + stride]) + (20 * samples[k + (2 * stride)]) + (20 * samples[k + (3 * stride)]) - (5 * samples[k + (4 * stride)]) + samples[k + (5 * stride)];
+
+    /// <summary>Applies the 6-tap filter to six intermediate sums.</summary>
+    /// <param name="sums">The sums.</param>
+    /// <param name="k">The first sum.</param>
+    /// <param name="stride">The distance between taps.</param>
+    /// <returns>The unclipped, unrounded sum.</returns>
+    private static int Tap(ReadOnlySpan<int> sums, int k, int stride) =>
+        sums[k] - (5 * sums[k + stride]) + (20 * sums[k + (2 * stride)]) + (20 * sums[k + (3 * stride)]) - (5 * sums[k + (4 * stride)]) + sums[k + (5 * stride)];
+
     /// <summary>Clips to 8 bits.</summary>
     /// <param name="value">The value.</param>
     /// <returns>The clipped value.</returns>

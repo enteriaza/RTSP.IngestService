@@ -24,7 +24,8 @@ public sealed class TranscodingMultiplexerLifecycleTests
         await harness.SendTagsAsync(session, tags.Take(tags.Count / 2));
         await Eventually.WaitUntilAsync(() => harness.Handler.FindSession(session.SessionId)?.Fault is not null, "the session has faulted");
 
-        await Assert.ThrowsAsync<TranscodingFailedException>(() => harness.SendTagsAsync(session, tags.Skip(tags.Count / 2)));
+        var failure = await Assert.ThrowsAsync<TranscodingFailedException>(() => harness.SendTagsAsync(session, tags.Skip(tags.Count / 2)));
+        Assert.Equal(TranscodingStage.Pipeline, failure.Stage);
         await harness.EndAsync(session, PublishEndReason.HandlerFailed);
 
         Assert.Equal("ended", harness.Downstream.Events.Last().Kind);

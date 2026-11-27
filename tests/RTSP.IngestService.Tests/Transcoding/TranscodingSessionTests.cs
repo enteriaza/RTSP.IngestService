@@ -1,7 +1,7 @@
 // Tests of the transcoding stage with its managed video and audio stages: canonical output decoded by the managed
 // decoder on the source presentation timeline; admission (disabled, capacity, release); rejection of codecs and H.264
 // formats the managed pipeline does not transcode, before any stage starts; decoder failures that end only the failing
-// session; both overload policies against a blocked downstream stage; new canonical streams on a configuration change
+// session; an oversized encoded picture attributed to the encoder stage; both overload policies against a blocked downstream stage; new canonical streams on a configuration change
 // and on a timeline discontinuity; the startup hold for a late or absent second track; draining versus aborting,
 // including an idle stage; declared HDR tone mapped to BT.709; the drain timeout; host shutdown; malformed packets
 // mid-stream; and concurrent sessions. Every test also checks
@@ -228,6 +228,34 @@ public sealed class TranscodingSessionTests
         await harness.EndAsync(healthy);
         ManagedVideoTestSupport.AssertCanonical(ManagedVideoTestSupport.Decode(harness.Delivered(healthy, PublishedMessageKind.Video)), 160, 120);
         Assert.DoesNotContain(harness.Delivered(failing, PublishedMessageKind.Video), static e => e.Payload![1] == 1);
+        AssertReleased(harness);
+    }
+
+    /// <summary>
+    /// An encoded picture larger than <c>Media:MaxSampleSize</c> fails the session at the encoder stage, as an
+    /// initialization failure when nothing was encoded yet. A tiny noise source (QP 51) re-encoded at QP 0 makes the
+    /// first canonical picture exceed the limit while every source sample is within it.
+    /// </summary>
+    /// <returns>A task.</returns>
+    [Fact]
+    public async Task OversizedEncodedPicture_FailsAtTheEncoderStage()
+    {
+        const int MaxSampleSize = 8192;
+        using var harness = new TranscodingHarness(static o => o.Video.Quantizer = 0, new MediaOptions { MaxSampleSize = MaxSampleSize });
+        var tags = ManagedVideoTestSupport.SyntheticTags(SyntheticPattern.Noise, 320, 240, 3, qp: 51);
+        Assert.All(tags, static t => Assert.True(t.Body.Length < MaxSampleSize, $"source tag of {t.Body.Length} bytes"));
+        var session = await harness.StartAsync();
+        await harness.SendTagsAsync(session, tags);
+        var pipeline = harness.Handler.FindSession(session.SessionId)!;
+        await Eventually.WaitUntilAsync(() => pipeline.Fault is not null, "the oversized picture faults the session");
+
+        var failure = Assert.IsType<TranscodingFailedException>(pipeline.Fault);
+        Assert.Equal(TranscodingStage.Encoder, failure.Stage);
+        Assert.True(failure.Initialization);
+        Assert.Contains(10001, harness.EventIds());
+
+        await harness.EndAsync(session, PublishEndReason.HandlerFailed);
+        Assert.DoesNotContain(harness.Delivered(session, PublishedMessageKind.Video), static e => e.Payload![1] == 1);
         AssertReleased(harness);
     }
 
@@ -680,11 +708,16 @@ public sealed class TranscodingSessionTests
     }
 
     /// <summary>Concurrent sessions each get their own codecs and complete, uncorrupted canonical output.</summary>
+    /// <remarks>
+    /// The drain timeout is raised because this asserts complete output, not drain timing: four concurrent drains of
+    /// unoptimised (Debug) codecs under a parallel test run can exceed the 5 s default, which then discards the tail
+    /// by design (covered by <see cref="DrainTimeout_DiscardsUndeliveredOutput"/>).
+    /// </remarks>
     /// <returns>A task.</returns>
     [Fact]
     public async Task ConcurrentSessions_AreIsolated()
     {
-        using var harness = new TranscodingHarness();
+        using var harness = new TranscodingHarness(static o => o.DrainTimeout = TimeSpan.FromMinutes(1));
         List<FlvTag>[] sources =
         [
             [.. FlvFile.ReadFixture("h264-aac.flv")],

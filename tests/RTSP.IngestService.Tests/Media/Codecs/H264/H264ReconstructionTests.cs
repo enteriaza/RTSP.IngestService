@@ -268,6 +268,42 @@ public sealed class H264ReconstructionTests
         }
     }
 
+    /// <summary>
+    /// Every fractional luma position, at every block size, inside the picture, across its edges and far outside it,
+    /// equals a per-sample evaluation of 8-241 to 8-261 and Table 8-12 on edge-clamped reference samples.
+    /// </summary>
+    [Fact]
+    public void LumaMatchesPerSampleEquations()
+    {
+        const int width = 48, height = 40;
+        var random = new Random(11);
+        var plane = new byte[width * height];
+        random.NextBytes(plane);
+        var output = new byte[256];
+        for (var trial = 0; trial < 60; trial++)
+        {
+            int x = random.Next(-24, width + 8), y = random.Next(-24, height + 8);
+            foreach (var size in new[] { 4, 8, 16 })
+            {
+                for (var fy = 0; fy < 4; fy++)
+                {
+                    for (var fx = 0; fx < 4; fx++)
+                    {
+                        H264InterPrediction.Luma(plane, width, height, x, y, fx, fy, size, output);
+                        for (var j = 0; j < size; j++)
+                        {
+                            for (var i = 0; i < size; i++)
+                            {
+                                var expected = LumaSample(plane, width, height, x + i, y + j, fx, fy);
+                                Assert.True(expected == output[(j * size) + i], $"({x}, {y}) size {size} frac ({fx}, {fy}) sample ({i}, {j}) is {output[(j * size) + i]}, expected {expected}.");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// <summary>Chroma prediction is the eighth-sample bilinear blend of 8-266.</summary>
     [Fact]
     public void ChromaBilinear()
@@ -280,6 +316,48 @@ public sealed class H264ReconstructionTests
 
         H264InterPrediction.Chroma(plane, 2, 2, 0, 0, 1, 7, 1, output);
         Assert.Equal((byte)(((7 * 1 * 0) + (1 * 1 * 64) + (7 * 7 * 128) + (1 * 7 * 192) + 32) >> 6), output[0]);
+    }
+
+    /// <summary>Evaluates one luma prediction sample directly from the equations of 8.4.2.2.1.</summary>
+    /// <param name="plane">The reference plane.</param>
+    /// <param name="width">Its width.</param>
+    /// <param name="height">Its height.</param>
+    /// <param name="x">The integer sample x of G.</param>
+    /// <param name="y">The integer sample y of G.</param>
+    /// <param name="fx">xFracL.</param>
+    /// <param name="fy">yFracL.</param>
+    /// <returns>The predicted sample.</returns>
+    private static int LumaSample(byte[] plane, int width, int height, int x, int y, int fx, int fy)
+    {
+        int G(int dx, int dy) => plane[(Math.Clamp(y + dy, 0, height - 1) * width) + Math.Clamp(x + dx, 0, width - 1)];
+        static int Tap(Func<int, int> at) => at(-2) - (5 * at(-1)) + (20 * at(0)) + (20 * at(1)) - (5 * at(2)) + at(3);
+        static int Clip(int v) => Math.Clamp(v, 0, 255);
+        int B1(int dx, int dy) => Tap(t => G(dx + t, dy));
+        int H1(int dx, int dy) => Tap(t => G(dx, dy + t));
+        var b = Clip((B1(0, 0) + 16) >> 5);
+        var h = Clip((H1(0, 0) + 16) >> 5);
+        var s = Clip((B1(0, 1) + 16) >> 5);
+        var m = Clip((H1(1, 0) + 16) >> 5);
+        var j = Clip((Tap(t => B1(0, t)) + 512) >> 10);
+        return (fx, fy) switch
+        {
+            (0, 0) => G(0, 0),
+            (1, 0) => (G(0, 0) + b + 1) >> 1,
+            (2, 0) => b,
+            (3, 0) => (b + G(1, 0) + 1) >> 1,
+            (0, 1) => (G(0, 0) + h + 1) >> 1,
+            (0, 2) => h,
+            (0, 3) => (h + G(0, 1) + 1) >> 1,
+            (1, 1) => (b + h + 1) >> 1,
+            (3, 1) => (b + m + 1) >> 1,
+            (1, 3) => (h + s + 1) >> 1,
+            (3, 3) => (s + m + 1) >> 1,
+            (2, 2) => j,
+            (2, 1) => (b + j + 1) >> 1,
+            (2, 3) => (j + s + 1) >> 1,
+            (1, 2) => (h + j + 1) >> 1,
+            _ => (j + m + 1) >> 1,
+        };
     }
 
     /// <summary>Asserts a block's samples.</summary>
