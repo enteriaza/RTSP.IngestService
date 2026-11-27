@@ -1,6 +1,6 @@
 // The managed AAC-LC audio stage of one publisher: a task that decodes queued AAC-LC source access units with the
 // managed decoder, converts them to 48 kHz stereo (downmix, resample, clip), encodes canonical AAC-LC and submits the
-// FLV-framed units to the session's media multiplexer, independently of the FFmpeg video process. Its timeline
+// FLV-framed units to the session's media multiplexer, independently of the managed video stage. Its timeline
 // controller keeps canonical audio on integer 48 kHz sample positions anchored at the first source timestamp:
 // differences between the source timestamps and the decoded duration of up to 100 ms are absorbed, larger gaps are
 // concealed with silence and larger overlaps trimmed, and beyond one second, or at a source discontinuity, the output
@@ -20,7 +20,7 @@ using RTSP.IngestService.Rtmp.Publishing;
 
 namespace RTSP.IngestService.Transcoding;
 
-/// <summary>Why a source audio configuration is transcoded by FFmpeg although the managed engine is configured.</summary>
+/// <summary>Why a source audio configuration cannot be transcoded by the managed audio stage.</summary>
 internal enum ManagedAudioIneligibility
 {
     /// <summary>The source audio is not AAC.</summary>
@@ -306,7 +306,7 @@ internal sealed partial class ManagedAudioStage
         {
             if (!_token.IsCancellationRequested)
             {
-                _onFailure(ex as TranscodingFailedException ?? new TranscodingFailedException(TranscodingStage.Process, Interlocked.Read(ref _encoded) == 0, "The managed audio stage failed.", ex));
+                _onFailure(ex as TranscodingFailedException ?? new TranscodingFailedException(TranscodingStage.Pipeline, Interlocked.Read(ref _encoded) == 0, "The managed audio stage failed.", ex));
             }
         }
         finally
@@ -600,7 +600,7 @@ internal sealed partial class ManagedAudioStage
         }
         catch (Exception ex)
         {
-            throw new TranscodingFailedException(TranscodingStage.Process, Interlocked.Read(ref _encoded) == 0, "The managed audio converter failed.", ex);
+            throw new TranscodingFailedException(TranscodingStage.Pipeline, Interlocked.Read(ref _encoded) == 0, "The managed audio converter failed.", ex);
         }
 
         ReportClipped();
@@ -679,7 +679,7 @@ internal sealed partial class ManagedAudioStage
         }
         catch (Exception ex)
         {
-            throw new TranscodingFailedException(TranscodingStage.Process, Interlocked.Read(ref _encoded) == 0, "The managed audio converter failed.", ex);
+            throw new TranscodingFailedException(TranscodingStage.Pipeline, Interlocked.Read(ref _encoded) == 0, "The managed audio converter failed.", ex);
         }
 
         ReportClipped();

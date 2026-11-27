@@ -2,7 +2,7 @@
 
 RTSP.IngestService is a .NET 10 Generic Host worker that runs unchanged as a console application, a Windows service and a
 systemd service. This document describes the hosting foundation (lifecycle, failure handling, configuration and
-logging), the RTMP ingest server, media processing, HLS packaging, the HTTP HLS origin and RTP output. Deployment is covered in [deployment/windows.md](deployment/windows.md) and
+logging), the RTMP ingest server, transcoding, media processing, HLS packaging, the HTTP HLS origin and RTP output. Deployment is covered in [deployment/windows.md](deployment/windows.md) and
 [deployment/linux.md](deployment/linux.md).
 
 ## Components
@@ -19,6 +19,7 @@ logging), the RTMP ingest server, media processing, HLS packaging, the HTTP HLS 
 | Identity | `Configuration/ApplicationIdentity`, `Logging/ApplicationIdentityEnricher` | Application name from the entry assembly and the configured deployment identity, on logs and the telemetry resource (see [Application and deployment identity](#application-and-deployment-identity)). |
 | Logging | `Logging/SerilogPipeline`, `SystemdConsoleFormatter`, `BoundedAsyncSink`, `BufferedConsoleSink` | Serilog sinks per hosting mode, written asynchronously through a bounded queue; bootstrap logger for pre-host failures. |
 | RTMP ingest | `Rtmp/*` | RTMP publishing server: listener, connections, chunk protocol, AMF0, sessions (see [RTMP ingest](#rtmp-ingest)). |
+| Transcoding | `Transcoding/*`, `Media/Codecs/*` | Managed re-encoding of every publish to canonical H.264 High and AAC-LC before media processing (see [Transcoding](#transcoding)). |
 | Media processing | `Media/*` | H.264/AAC parsing into typed samples and stream descriptions (see [Media processing](#media-processing)). |
 | HLS packaging | `Hls/*` | fMP4 segments and live playlists in a bounded in-memory store (see [HLS packaging](#hls-packaging)). |
 | HTTP HLS origin | `Http/*` | Kestrel-based HTTP/1.1 server for playlists and segments (see [HTTP HLS origin](#http-hls-origin)). |
@@ -524,6 +525,73 @@ The automated interoperability tests in `FfmpegInteropTests` (an FLV1/ADPCM publ
 through media processing) run when FFmpeg is on the `PATH` or `RTSP_FFMPEG_PATH` points to it, and are skipped
 otherwise. FFmpeg is used only by tests and to generate the checked-in fixture, never by the service.
 
+## Transcoding
+
+`TranscodingPublishSessionHandler` sits between RTMP ingest and media processing and re-encodes every publish to one
+canonical profile, entirely in managed C# inside the service: no FFmpeg, external process, native library or P/Invoke
+is used, and none is needed at runtime. FFmpeg appears only in tests, as a third-party publisher and an independent
+decode/probe oracle.
+
+```
+RtmpSession ──► TranscodingPublishSessionHandler ──► MediaPublishSessionHandler ──► HLS
+                 per session: TranscodingSession
+                   source parser ──► ManagedVideoStage (H.264 decode ─► colour ─► H.264 encode) ──┐
+                                └──► ManagedAudioStage (AAC decode ─► downmix/resample ─► AAC encode) ──┴► MediaMultiplexer
+```
+
+| Track | Accepted source | Canonical output |
+|-------|-----------------|------------------|
+| Video | H.264 (legacy FLV or Enhanced RTMP `avc1`), 8-bit 4:2:0 progressive, Constrained Baseline/Main/High with B-frames, NAL length size 1, 2 or 4, at most 4096 per side, 36864 macroblocks and `Transcoding:MaxInput*` | H.264 High, 8-bit 4:2:0 progressive, BT.709 limited range declared in the VUI, CAVLC, no B-frames, one reference frame, IDR every `KeyframeInterval` (default: the HLS target segment duration), 90 kHz timestamps equal to the source presentation times |
+| Audio | AAC-LC with 1024-sample frames, any channel configuration the decoder supports | AAC-LC 48 kHz stereo at `Audio:BitrateKilobits` |
+
+Anything else (HEVC, AV1, VP9, 10-bit, 4:2:2, 4:4:4, lossless or interlaced H.264, HE-AAC, MP3, Opus, FLAC, AC-3,
+E-AC-3, an unknown codec) ends the publish at its configuration with a reason (`UnsupportedCodec`,
+`ResolutionLimit`, `FrameRateLimit`, `CodecNotAccepted`); there is no fallback engine.
+
+The video stage owns one decoder, one encoder and the frames between them. Source colour is taken from the SPS VUI,
+overridden by declared Enhanced RTMP HDR metadata; unspecified fields are treated as BT.709 (logged once, event
+10032), and BT.601, BT.2020 and PQ/HLG sources are converted to BT.709 (HDR is tone mapped). A source frame that fails
+to decode is dropped, the decoder is recreated and video resumes at the next IDR; more than 10 such failures within
+60 s of source time, an unsupported or over-limit picture, or 60 s without an IDR end only that session. A failed
+decoder is never called again. A new source configuration or a timestamp discontinuity drains the decoder, flushes
+the encoder and starts a new canonical stream (`transcoding.video.streams`, reason `configuration` or
+`discontinuity`); pictures at or before the last presentation time are dropped as overlap. A picture-size change
+reconfigures the encoder; the new AVC sequence header is sent only when the configuration record changes.
+
+`TranscodingSession` keeps the shared buffer budget, the per-track source queues and the overload policy
+(`DropUntilKeyframe` or `Backpressure`), and feeds both stages' output into the per-session `MediaMultiplexer`, the
+only caller of the downstream handler. A video-only publish declares audio absent after the 1 s startup hold. A normal
+end drains both stages within `DrainTimeout`; any other end aborts them. Every stage is disposed exactly once.
+
+The managed encoder runs on the CPU without SIMD tuning; high resolutions or frame rates may encode slower than real
+time, in which case the overload policy drops (or holds) source video rather than buffering without bound.
+
+Configuration (`Transcoding`):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `Enabled` | `true` | When `false`, every publish is rejected (only canonical media may reach HLS). |
+| `MaxConcurrentSessions` | 16 | Publishes transcoded at once; more are rejected with `Capacity`. |
+| `MaxInputWidth`, `MaxInputHeight`, `MaxInputFrameRate` | 3840, 3840, 60 | Source limits (the managed codecs also cap at 4096 per side and 36864 macroblocks). |
+| `MaxBufferedVideoFrames`, `MaxBufferedAudioFrames`, `MaxSessionBufferMegabytes`, `MaxTotalBufferMegabytes` | 120, 500, 64, 512 | Bounded source queues and the shared budget. |
+| `OverloadPolicy` | `DropUntilKeyframe` | `Backpressure` makes the publisher wait instead. |
+| `AcceptedVideoCodecs`, `AcceptedAudioCodecs` | all transcodable | Optional allow-lists; may name only `H264` and `Aac`. |
+| `Video:Quantizer` | 22 | Encoder base QP (0–51). |
+| `Video:MaxBitrateKilobits` | 8000 | Rate cap. |
+| `Video:KeyframeInterval` | HLS target segment duration | IDR cadence (1–60 s). |
+| `Audio:BitrateKilobits` | 160 | AAC bitrate (32–512). |
+| `DrainTimeout` | 5 s | Bound on a normal end (1–60 s); output not delivered by then is discarded. |
+| `HardwareAcceleration` | `None` | Reserved; only `None` is accepted. |
+
+The keys of the earlier FFmpeg pipeline (`FfmpegPath`, `ThreadsPerSession`, `Video:Encoder`, `Video:Preset`,
+`Video:ConstantRateFactor`, `Audio:Engine`) no longer exist and fail strict binding at startup; remove them from
+environment-specific configuration.
+
+Metrics are on the `RTSP.IngestService.Transcoding` meter (`transcoding.*`, including `transcoding.video.streams` and
+`transcoding.video.decoder.recreations`); logs and metrics carry no stream keys, names, addresses, incarnation IDs or
+codec configuration payloads. Events: 10000 (canonical stream started), 10001 (stage failure), 10002 (drain timeout),
+10003/10004 (drops), 10005 (session summary), 10011 (track not accepted), 10012 (source packet dropped), 10015/10016 (ready/disabled at startup),
+10031 (audio stage), 10032–10035 (video stage).
 ## Media processing
 
 `MediaPublishSessionHandler` is the host's `IPublishSessionHandler`. It turns each session's RTMP audio and video

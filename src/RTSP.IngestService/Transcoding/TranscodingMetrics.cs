@@ -46,12 +46,12 @@ internal enum TranscodingDropReason
     Timestamp,
 
     /// <summary>
-    /// Encoder output that overlaps media already delivered by the previous transcoder process, or managed source audio
-    /// that lies entirely before media already decoded.
+    /// A decoded video picture whose presentation time does not follow the last one encoded, or source audio that lies
+    /// entirely before media already decoded.
     /// </summary>
     Overlap,
 
-    /// <summary>A source audio frame the managed decoder rejected; its duration is concealed with silence.</summary>
+    /// <summary>A source frame the managed decoder rejected; audio conceals its duration with silence, video waits for the next IDR picture.</summary>
     DecodeError,
 }
 
@@ -81,33 +81,17 @@ internal enum AudioResetReason
     Overlap,
 }
 
-/// <summary>Which part of the transcoder failed.</summary>
+/// <summary>Which part of the transcoding pipeline failed.</summary>
 internal enum TranscodingStage
 {
-    /// <summary>The decoder or demuxer.</summary>
+    /// <summary>The source decoder.</summary>
     Decoder,
 
-    /// <summary>The filter graph or encoder.</summary>
+    /// <summary>The colour converter, resampler or encoder.</summary>
     Encoder,
 
-    /// <summary>The process itself (start failure, unexpected exit, invalid output).</summary>
-    Process,
-}
-
-/// <summary>Why a transcoder process was started.</summary>
-internal enum TranscoderStartReason
-{
-    /// <summary>The session's first process.</summary>
-    Initial,
-
-    /// <summary>A track configuration or the colour description changed, or a track appeared or disappeared.</summary>
-    Configuration,
-
-    /// <summary>A timestamp regression or jump.</summary>
-    Discontinuity,
-
-    /// <summary>The process's timestamp range was exhausted.</summary>
-    Timeline,
+    /// <summary>The pipeline itself (unexpected failure, output that cannot be delivered).</summary>
+    Pipeline,
 }
 
 /// <summary>Transcoding metrics, published on the <see cref="MeterName"/> meter.</summary>
@@ -120,13 +104,16 @@ internal sealed class TranscodingMetrics
     /// <summary>Active transcoding sessions.</summary>
     private readonly UpDownCounter<long> _activeSessions;
 
-    /// <summary>Transcoder processes started, by reason.</summary>
-    private readonly Counter<long> _processStarts;
+    /// <summary>Canonical video streams started, by reason.</summary>
+    private readonly Counter<long> _videoStreams;
 
-    /// <summary>Transcoder initialisation failures, by stage.</summary>
+    /// <summary>Managed video decoders replaced after a decode failure.</summary>
+    private readonly Counter<long> _videoDecoderRecreations;
+
+    /// <summary>Pipeline failures before producing output, by stage.</summary>
     private readonly Counter<long> _initializationFailures;
 
-    /// <summary>Transcoder runtime failures, by stage.</summary>
+    /// <summary>Pipeline failures after producing output, by stage.</summary>
     private readonly Counter<long> _failures;
 
     /// <summary>Publishes refused, by reason.</summary>
@@ -209,9 +196,10 @@ internal sealed class TranscodingMetrics
         var meter = meterFactory.Create(MeterName);
 
         _activeSessions = meter.CreateUpDownCounter<long>("transcoding.sessions.active", "{session}", "Published streams holding a transcoding slot.");
-        _processStarts = meter.CreateCounter<long>("transcoding.process.starts", "{process}", "Transcoder processes started; tag reason.");
-        _initializationFailures = meter.CreateCounter<long>("transcoding.initialization.failures", "{process}", "Transcoder processes that failed before producing output; tag stage.");
-        _failures = meter.CreateCounter<long>("transcoding.failures", "{process}", "Transcoder processes that failed after producing output; tag stage.");
+        _videoStreams = meter.CreateCounter<long>("transcoding.video.streams", "{stream}", "Canonical video streams the managed video stage started; tag reason (initial, configuration, discontinuity).");
+        _videoDecoderRecreations = meter.CreateCounter<long>("transcoding.video.decoder.recreations", "{event}", "Managed video decoders replaced after a source frame failed to decode.");
+        _initializationFailures = meter.CreateCounter<long>("transcoding.initialization.failures", "{session}", "Transcoding pipelines that failed before producing output; tag stage.");
+        _failures = meter.CreateCounter<long>("transcoding.failures", "{session}", "Transcoding pipelines that failed after producing output; tag stage.");
         _rejections = meter.CreateCounter<long>("transcoding.rejections", "{session}", "Publishes refused or ended by transcoding admission or codec policy; tag reason.");
         _inputFrames = meter.CreateCounter<long>("transcoding.frames.decoded", "{frame}", "Source frames submitted to a decoder; tags track and codec.");
         _outputFrames = meter.CreateCounter<long>("transcoding.frames.encoded", "{frame}", "Canonical frames produced by the encoder; tag track.");
@@ -244,11 +232,14 @@ internal sealed class TranscodingMetrics
     /// <summary>Records a session that released its slot.</summary>
     public void SessionEnded() => _activeSessions.Add(-1);
 
-    /// <summary>Records a process start.</summary>
+    /// <summary>Records a canonical video stream start.</summary>
     /// <param name="reason">Why.</param>
-    public void ProcessStarted(TranscoderStartReason reason) => _processStarts.Add(1, new KeyValuePair<string, object?>("reason", Name(reason)));
+    public void VideoStreamStarted(VideoStreamStartReason reason) => _videoStreams.Add(1, new KeyValuePair<string, object?>("reason", Name(reason)));
 
-    /// <summary>Records a process failure.</summary>
+    /// <summary>Records a replaced video decoder.</summary>
+    public void VideoDecoderRecreated() => _videoDecoderRecreations.Add(1);
+
+    /// <summary>Records a pipeline failure.</summary>
     /// <param name="stage">The failing stage.</param>
     /// <param name="initialization">Whether it failed before producing output.</param>
     public void Failure(TranscodingStage stage, bool initialization) =>
@@ -395,12 +386,11 @@ internal sealed class TranscodingMetrics
     /// <summary>Returns the tag value.</summary>
     /// <param name="reason">The value.</param>
     /// <returns>The text.</returns>
-    private static string Name(TranscoderStartReason reason) => reason switch
+    private static string Name(VideoStreamStartReason reason) => reason switch
     {
-        TranscoderStartReason.Initial => "initial",
-        TranscoderStartReason.Configuration => "configuration",
-        TranscoderStartReason.Discontinuity => "discontinuity",
-        _ => "timeline",
+        VideoStreamStartReason.Initial => "initial",
+        VideoStreamStartReason.Configuration => "configuration",
+        _ => "discontinuity",
     };
 
     /// <summary>Returns the tag value.</summary>
@@ -410,7 +400,7 @@ internal sealed class TranscodingMetrics
     {
         TranscodingStage.Decoder => "decoder",
         TranscodingStage.Encoder => "encoder",
-        _ => "process",
+        _ => "pipeline",
     };
 
     /// <summary>Returns the tag value.</summary>

@@ -1,5 +1,7 @@
-// Locates the FFmpeg and ffprobe executables used by tests: RTSP_FFMPEG_PATH, else the PATH. Tests that need them
-// call Require, which skips the test when FFmpeg is absent, or fails it when RTSP_FFMPEG_REQUIRED=true (as in CI).
+// Locates the FFmpeg and ffprobe executables some tests use as an independent oracle (decoding or probing the
+// service's output, or publishing as a third-party client): RTSP_FFMPEG_PATH, else the PATH. The service itself never
+// uses FFmpeg. Tests that need it call Require, which skips the test when FFmpeg is absent, or fails it when
+// RTSP_FFMPEG_REQUIRED=true (as in CI).
 
 namespace RTSP.IngestService.Tests.Infrastructure;
 
@@ -30,7 +32,7 @@ internal static class FfmpegTool
         }
 
         Assert.False(Required, "FFmpeg (and ffprobe) were not found but RTSP_FFMPEG_REQUIRED is set; tests that need them must not be skipped.");
-        Assert.Skip("FFmpeg was not found; set RTSP_FFMPEG_PATH or add ffmpeg to PATH. Publishing through the service requires it because every stream is transcoded.");
+        Assert.Skip("FFmpeg was not found; set RTSP_FFMPEG_PATH or add ffmpeg to PATH. This test uses it as an independent oracle.");
         return null!;
     }
 

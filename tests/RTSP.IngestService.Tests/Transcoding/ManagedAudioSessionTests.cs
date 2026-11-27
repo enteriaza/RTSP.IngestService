@@ -1,6 +1,6 @@
 // Tests of managed AAC-LC audio inside a transcoding session, with the real managed codecs, multiplexer and session
-// lifecycle and the scripted in-memory transcoder for video: engine routing and fallback, FFmpeg video-only arguments,
-// audio-only publishes that start no transcoder, drain and kill, the timeline controller (absorbed jitter, concealed
+// lifecycle alongside the managed video stage: eligibility and rejection of audio the managed codecs do not take,
+// audio-only publishes that start no video stage, drain and kill, the timeline controller (absorbed jitter, concealed
 // gaps, trimmed overlaps, restarts, drops, timestamp wrap), decoder recovery and persistent decode failure,
 // downstream failure, the buffer budget, and stream replacement.
 
@@ -24,55 +24,32 @@ public sealed class ManagedAudioSessionTests
     /// <summary>An AAC-LC configuration with 960-sample frames, which the managed decoder does not support.</summary>
     private static readonly byte[] Aac960Config = [0x11, 0x94];
 
-    /// <summary>AAC-LC audio and H.264 video: audio goes to the managed engine and FFmpeg is started for video only.</summary>
+    /// <summary>AAC-LC audio and H.264 video: each track goes to its managed stage and both are delivered completely.</summary>
     /// <returns>A task.</returns>
     [Fact]
-    public async Task AacLc_IsTranscodedByTheManagedEngine_AndFfmpegGetsVideoOnly()
+    public async Task AacLc_IsTranscodedByTheManagedStage_AlongsideManagedVideo()
     {
         using var harness = Managed();
         var tags = FlvFile.ReadFixture("h264-aac.flv");
         var session = await harness.StartAsync();
         var pipeline = harness.Handler.FindSession(session.SessionId)!;
         await harness.SendTagsAsync(session, tags);
-        Assert.Equal(AudioRoute.Managed, pipeline.AudioEngine);
+        Assert.NotNull(pipeline.AudioStage);
+        Assert.NotNull(pipeline.VideoStage);
         await harness.EndAsync(session);
 
-        var process = Assert.Single(harness.Factory.Started);
-        Assert.True(process.InputCompleted);
-        Assert.Contains("libx264", process.Arguments);
-        Assert.DoesNotContain("0:a:0", process.Arguments);
-        Assert.DoesNotContain("-c:a", process.Arguments);
         var sourceAudio = tags.Count(static t => t.Type == 8 && t.Body.Length > 2 && t.Body[1] == 1);
         var rate = SourceRate(tags);
         AssertCanonicalAudio(harness, session, ExpectedUnits(sourceAudio, rate));
-        Assert.NotEmpty(harness.Delivered(session, PublishedMessageKind.Video));
-        Assert.Contains(10024, harness.EventIds());
+        var video = ManagedVideoTestSupport.Decode(harness.Delivered(session, PublishedMessageKind.Video));
+        Assert.Equal(ManagedVideoTestSupport.SourcePresentationTimes(tags), video.Pictures.Select(static p => p.Timestamp));
         Assert.Contains(10031, harness.EventIds());
         Assert.DoesNotContain(10001, harness.EventIds());
         Assert.True(harness.Handler.Budget.Peak <= harness.Handler.Budget.Limit);
         AssertReleased(harness);
     }
 
-    /// <summary>The default engine keeps audio in FFmpeg and logs the choice.</summary>
-    /// <returns>A task.</returns>
-    [Fact]
-    public async Task DefaultEngine_KeepsAudioInFfmpeg()
-    {
-        using var harness = new TranscodingHarness();
-        var session = await harness.StartAsync();
-        var pipeline = harness.Handler.FindSession(session.SessionId)!;
-        await harness.SendTagsAsync(session, FlvFile.ReadFixture("h264-aac.flv"));
-        Assert.Equal(AudioRoute.Ffmpeg, pipeline.AudioEngine);
-        Assert.Null(pipeline.AudioStage);
-        await harness.EndAsync(session);
-
-        Assert.Contains("0:a:0", Assert.Single(harness.Factory.Started).Arguments);
-        Assert.Contains(10024, harness.EventIds());
-        Assert.DoesNotContain(10031, harness.EventIds());
-        AssertReleased(harness);
-    }
-
-    /// <summary>An audio-only managed publish starts no transcoder and drains all its audio, encoder tail included.</summary>
+    /// <summary>An audio-only publish starts no video stage and drains all its audio, encoder tail included.</summary>
     /// <returns>A task.</returns>
     [Fact]
     public async Task AudioOnly_StartsNoProcess_AndDrains()
@@ -81,14 +58,15 @@ public sealed class ManagedAudioSessionTests
         var (config, units) = Fixture("aac-lc-48k-stereo.aac");
         var session = await harness.StartAsync();
         await SendAudioAsync(harness, session, config, units, 48000);
+        Assert.Null(harness.Handler.FindSession(session.SessionId)!.VideoStage);
         await harness.EndAsync(session);
 
-        Assert.Equal(0, harness.Factory.Starts);
+        Assert.Empty(harness.Delivered(session, PublishedMessageKind.Video));
         AssertCanonicalAudio(harness, session, units.Count + 1);
         AssertReleased(harness);
     }
 
-    /// <summary>A killed audio-only publish starts no transcoder, does not flush and releases everything.</summary>
+    /// <summary>A killed audio-only publish starts no video stage, does not flush and releases everything.</summary>
     /// <returns>A task.</returns>
     [Fact]
     public async Task AudioOnly_Kill_DoesNotFlush()
@@ -99,7 +77,7 @@ public sealed class ManagedAudioSessionTests
         await SendAudioAsync(harness, session, config, units, 48000);
         await harness.EndAsync(session, PublishEndReason.ConnectionError);
 
-        Assert.Equal(0, harness.Factory.Starts);
+        Assert.Empty(harness.Delivered(session, PublishedMessageKind.Video));
         Assert.True(Samples(harness, session).Count < units.Count + 1, "A killed publish does not deliver the encoder's flush tail.");
         AssertReleased(harness);
     }
@@ -122,29 +100,28 @@ public sealed class ManagedAudioSessionTests
         }
     }
 
-    /// <summary>An unsupported profile falls back to FFmpeg audio with a warning, and the managed stage never runs.</summary>
+    /// <summary>
+    /// An AAC profile the managed decoder does not support (here 960-sample frames; likewise HE-AAC) ends the publish at
+    /// its sequence header with a reason, and the managed stage never runs; there is no fallback engine.
+    /// </summary>
     /// <returns>A task.</returns>
     [Fact]
-    public async Task UnsupportedProfile_FallsBackToFfmpeg()
+    public async Task UnsupportedProfile_EndsThePublish()
     {
         using var harness = Managed();
         var session = await harness.StartAsync();
         var pipeline = harness.Handler.FindSession(session.SessionId)!;
-        await harness.SendAsync(session, PublishedMessageKind.Audio, 0, FlvPackets.AacSequenceHeader(Aac960Config));
-        for (var i = 0; i < 80; i++)
-        {
-            await harness.SendAsync(session, PublishedMessageKind.Audio, (uint)(i * 20), FlvPackets.AacRaw(0x21, 0x10, 0x04));
-        }
-
-        Assert.Equal(AudioRoute.Ffmpeg, pipeline.AudioEngine);
+        var ex = await Assert.ThrowsAsync<TranscodingRejectedException>(() => harness.SendAsync(session, PublishedMessageKind.Audio, 0, FlvPackets.AacSequenceHeader(Aac960Config)));
+        Assert.Equal(TranscodingRejectionReason.UnsupportedCodec, ex.Reason);
+        Assert.Contains("AAC-LC", ex.Message, StringComparison.Ordinal);
         Assert.Null(pipeline.AudioStage);
-        await harness.EndAsync(session);
-        Assert.Contains("0:a:0", Assert.Single(harness.Factory.Started).Arguments);
-        Assert.Contains(10025, harness.EventIds());
+        Assert.Contains(10011, harness.EventIds());
+        await harness.EndAsync(session, PublishEndReason.HandlerFailed);
+        Assert.Empty(harness.Delivered(session, PublishedMessageKind.Audio));
         AssertReleased(harness);
     }
 
-    /// <summary>A managed publish whose audio changes to an ineligible configuration is rejected rather than switching engines.</summary>
+    /// <summary>A publish whose audio changes to a configuration the managed stage does not take is rejected.</summary>
     /// <returns>A task.</returns>
     [Fact]
     public async Task ManagedThenIneligible_EndsThePublish()
@@ -437,20 +414,15 @@ public sealed class ManagedAudioSessionTests
         await harness.EndAsync(second);
 
         AssertCanonicalAudio(harness, second, units.Count + 1);
-        Assert.Equal(0, harness.Factory.Starts);
         AssertReleased(harness);
     }
 
-    /// <summary>Creates a harness configured for the managed engine.</summary>
+    /// <summary>Creates a harness.</summary>
     /// <param name="configure">Further option changes.</param>
     /// <param name="media">Media options.</param>
     /// <returns>The harness.</returns>
     private static TranscodingHarness Managed(Action<TranscodingOptions>? configure = null, MediaOptions? media = null) =>
-        new(o =>
-        {
-            o.Audio.Engine = TranscodingAudioEngine.ManagedAacLc;
-            configure?.Invoke(o);
-        }, media);
+        new(configure, media);
 
     /// <summary>Reads an ADTS fixture.</summary>
     /// <param name="name">The file name.</param>

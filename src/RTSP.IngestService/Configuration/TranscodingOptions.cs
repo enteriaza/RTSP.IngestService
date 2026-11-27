@@ -1,7 +1,7 @@
 // Transcoding settings bound from the "Transcoding" configuration section. Every accepted publication is decoded and
-// re-encoded into the canonical profile (H.264 High, yuv420p, 8-bit, BT.709; AAC-LC, 48 kHz, stereo) by a per-stream
-// FFmpeg child process before HLS packaging. The canonical format itself is fixed; these settings choose encoder
-// quality, admission limits, buffering and the FFmpeg executable. No free-form FFmpeg arguments are accepted.
+// re-encoded into the canonical profile (H.264 High, yuv420p, 8-bit, BT.709; AAC-LC, 48 kHz, stereo) by the service's
+// managed H.264 and AAC codecs before HLS packaging; no external process or native library is involved. The canonical
+// format itself is fixed; these settings choose encoder quality, admission limits and buffering.
 
 using System.ComponentModel.DataAnnotations;
 using Microsoft.Extensions.Options;
@@ -27,53 +27,11 @@ public enum TranscodingOverloadPolicy
     Backpressure,
 }
 
-/// <summary>The libx264 speed/quality preset of the canonical video encoder.</summary>
-public enum TranscodingVideoPreset
-{
-    /// <summary>x264 <c>ultrafast</c>.</summary>
-    Ultrafast,
-
-    /// <summary>x264 <c>superfast</c>.</summary>
-    Superfast,
-
-    /// <summary>x264 <c>veryfast</c>.</summary>
-    Veryfast,
-
-    /// <summary>x264 <c>faster</c>.</summary>
-    Faster,
-
-    /// <summary>x264 <c>fast</c>.</summary>
-    Fast,
-
-    /// <summary>x264 <c>medium</c>.</summary>
-    Medium,
-}
-
-/// <summary>The canonical video encoder implementation.</summary>
-public enum TranscodingVideoEncoder
-{
-    /// <summary>The libx264 software encoder.</summary>
-    Libx264,
-}
-
 /// <summary>Hardware acceleration used for decoding and encoding.</summary>
 public enum TranscodingHardwareAcceleration
 {
     /// <summary>Software decoders and encoders only.</summary>
     None,
-}
-
-/// <summary>Which implementation transcodes source audio to canonical AAC-LC.</summary>
-public enum TranscodingAudioEngine
-{
-    /// <summary>FFmpeg transcodes audio in the same process as video.</summary>
-    Ffmpeg,
-
-    /// <summary>
-    /// The service's managed AAC-LC decoder, downmixer, resampler and encoder transcode AAC-LC sources, and FFmpeg
-    /// transcodes video only; every other source audio codec and profile is still transcoded by FFmpeg.
-    /// </summary>
-    ManagedAacLc,
 }
 
 /// <summary>
@@ -93,29 +51,22 @@ public sealed class TranscodingOptions : IValidatableObject
 
     /// <summary>
     /// Gets or sets a value indicating whether publishes are transcoded. Defaults to <see langword="true"/>. When
-    /// <see langword="false"/>, every publish is rejected and FFmpeg is neither probed nor started.
+    /// <see langword="false"/>, every publish is rejected.
     /// </summary>
     public bool Enabled { get; set; } = true;
 
     /// <summary>
-    /// Gets or sets the FFmpeg executable: an absolute path, or a path relative to the service directory. Defaults to
-    /// <see langword="null"/>, meaning <c>ffmpeg/ffmpeg.exe</c> (Windows) or <c>ffmpeg/ffmpeg</c> (Linux) beside the
-    /// service executable, where release packages place it. The <c>PATH</c> is never searched. FFmpeg 9.0 or later
-    /// with libx264, libdav1d and the decoders listed in the documentation is required and verified at startup.
-    /// </summary>
-    public string? FfmpegPath { get; set; }
-
-    /// <summary>
     /// Gets or sets the most publishes transcoded at once. A publish beyond the limit is rejected. Defaults to 16;
     /// valid range is 1 to 1000. This is an admission bound, not a measured capacity: each session runs a software
-    /// decoder and encoder whose CPU cost depends on resolution, frame rate and preset.
+    /// decoder and encoder whose CPU cost depends on resolution and frame rate.
     /// </summary>
     [Range(1, 1000)]
     public int MaxConcurrentSessions { get; set; } = 16;
 
     /// <summary>
     /// Gets or sets the widest accepted input picture in pixels. Wider video ends the publish. Defaults to 3840;
-    /// valid range is 16 to 8192.
+    /// valid range is 16 to 8192. The managed codecs additionally limit pictures to 4096 pixels per side and 36864
+    /// macroblocks (for example 4096x2304); larger video ends the publish whatever this limit is.
     /// </summary>
     [Range(16, 8192)]
     public int MaxInputWidth { get; set; } = 3840;
@@ -135,14 +86,14 @@ public sealed class TranscodingOptions : IValidatableObject
     public int MaxInputFrameRate { get; set; } = 60;
 
     /// <summary>
-    /// Gets or sets the most video frames buffered for one session between the connection and its transcoder.
+    /// Gets or sets the most video frames buffered for one session between the connection and its video decoder.
     /// Defaults to 120; valid range is 8 to 10000.
     /// </summary>
     [Range(8, 10000)]
     public int MaxBufferedVideoFrames { get; set; } = 120;
 
     /// <summary>
-    /// Gets or sets the most audio frames buffered for one session between the connection and its transcoder.
+    /// Gets or sets the most audio frames buffered for one session between the connection and its audio decoder.
     /// Defaults to 500; valid range is 16 to 20000.
     /// </summary>
     [Range(16, 20000)]
@@ -167,28 +118,23 @@ public sealed class TranscodingOptions : IValidatableObject
     public TranscodingOverloadPolicy OverloadPolicy { get; set; } = TranscodingOverloadPolicy.DropUntilKeyframe;
 
     /// <summary>
-    /// Gets or sets how long a normally ended publish waits for its transcoder to flush buffered media into HLS before
-    /// the process is killed. Defaults to 5 seconds; valid range is one second to one minute.
+    /// Gets or sets how long a normally ended publish waits for its pipeline to flush buffered media into HLS before
+    /// the remainder is discarded. Defaults to 5 seconds; valid range is one second to one minute.
     /// </summary>
     [TimeSpanRange("00:00:01", "00:01:00")]
     public TimeSpan DrainTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// Gets or sets the decoder and encoder threads per session; 0 lets FFmpeg choose. Defaults to 0; valid range is 0
-    /// to 64.
-    /// </summary>
-    [Range(0, 64)]
-    public int ThreadsPerSession { get; set; }
-
-    /// <summary>
-    /// Gets or sets the accepted input video codecs, or <see langword="null"/> (the default) for every supported
-    /// codec. A publish using another video codec is ended.
+    /// Gets or sets the accepted input video codecs, or <see langword="null"/> (the default) for every codec the
+    /// managed pipeline transcodes. Only <see cref="SourceVideoCodec.H264"/> is transcoded, so it is the only value
+    /// allowed. A publish using another video codec is ended.
     /// </summary>
     public SourceVideoCodec[]? AcceptedVideoCodecs { get; set; }
 
     /// <summary>
-    /// Gets or sets the accepted input audio codecs, or <see langword="null"/> (the default) for every supported
-    /// codec. A publish using another audio codec is ended.
+    /// Gets or sets the accepted input audio codecs, or <see langword="null"/> (the default) for every codec the
+    /// managed pipeline transcodes. Only <see cref="SourceAudioCodec.Aac"/> (AAC-LC) is transcoded, so it is the only
+    /// value allowed. A publish using another audio codec or AAC profile is ended.
     /// </summary>
     public SourceAudioCodec[]? AcceptedAudioCodecs { get; set; }
 
@@ -209,17 +155,6 @@ public sealed class TranscodingOptions : IValidatableObject
 
     /// <summary>Gets <see cref="MaxTotalBufferMegabytes"/> in bytes.</summary>
     internal long MaxTotalBufferBytes => MaxTotalBufferMegabytes * 1024L * 1024L;
-
-    /// <summary>Resolves <see cref="FfmpegPath"/> to an absolute path.</summary>
-    /// <param name="baseDirectory">The service directory.</param>
-    /// <returns>The executable path.</returns>
-    internal string ResolveFfmpegPath(string baseDirectory)
-    {
-        var configured = string.IsNullOrWhiteSpace(FfmpegPath)
-            ? Path.Combine("ffmpeg", OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg")
-            : FfmpegPath;
-        return Path.GetFullPath(configured, baseDirectory);
-    }
 
     /// <summary>Whether a video codec is accepted.</summary>
     /// <param name="codec">The codec.</param>
@@ -243,17 +178,12 @@ public sealed class TranscodingOptions : IValidatableObject
                 [nameof(MaxSessionBufferMegabytes), nameof(MaxTotalBufferMegabytes)]);
         }
 
-        if (FfmpegPath is { } path && (path.Length == 0 || path.Trim().Length != path.Length || path.IndexOfAny(Path.GetInvalidPathChars()) >= 0))
-        {
-            yield return new ValidationResult($"{nameof(FfmpegPath)} must be a non-empty path without surrounding whitespace or invalid characters.", [nameof(FfmpegPath)]);
-        }
-
-        foreach (var result in ValidateList(AcceptedVideoCodecs, nameof(AcceptedVideoCodecs)))
+        foreach (var result in ValidateList(AcceptedVideoCodecs, nameof(AcceptedVideoCodecs), SourceVideoCodec.H264))
         {
             yield return result;
         }
 
-        foreach (var result in ValidateList(AcceptedAudioCodecs, nameof(AcceptedAudioCodecs)))
+        foreach (var result in ValidateList(AcceptedAudioCodecs, nameof(AcceptedAudioCodecs), SourceAudioCodec.Aac))
         {
             yield return result;
         }
@@ -263,8 +193,9 @@ public sealed class TranscodingOptions : IValidatableObject
     /// <typeparam name="T">The codec enumeration.</typeparam>
     /// <param name="values">The list.</param>
     /// <param name="name">The property name.</param>
-    /// <returns>A failure for an empty list, an undefined value or a duplicate.</returns>
-    private static IEnumerable<ValidationResult> ValidateList<T>(T[]? values, string name)
+    /// <param name="transcoded">The only codec the managed pipeline transcodes.</param>
+    /// <returns>A failure for an empty list, an undefined value, a codec that is not transcoded or a duplicate.</returns>
+    private static IEnumerable<ValidationResult> ValidateList<T>(T[]? values, string name, T transcoded)
         where T : struct, Enum
     {
         if (values is null)
@@ -280,6 +211,10 @@ public sealed class TranscodingOptions : IValidatableObject
         {
             yield return new ValidationResult($"{name} contains an undefined codec.", [name]);
         }
+        else if (values.Any(value => !EqualityComparer<T>.Default.Equals(value, transcoded)))
+        {
+            yield return new ValidationResult($"{name} may list only {transcoded}, the only codec the managed pipeline transcodes.", [name]);
+        }
         else if (values.Distinct().Count() != values.Length)
         {
             yield return new ValidationResult($"{name} lists a codec more than once.", [name]);
@@ -290,17 +225,13 @@ public sealed class TranscodingOptions : IValidatableObject
 /// <summary>Canonical H.264 encoder settings. Codec, profile (High), pixel format and colour description are fixed.</summary>
 public sealed class TranscodingVideoOptions
 {
-    /// <summary>Gets or sets the encoder. Only <see cref="TranscodingVideoEncoder.Libx264"/> exists.</summary>
-    [EnumDataType(typeof(TranscodingVideoEncoder))]
-    public TranscodingVideoEncoder Encoder { get; set; } = TranscodingVideoEncoder.Libx264;
-
-    /// <summary>Gets or sets the x264 preset. Defaults to <see cref="TranscodingVideoPreset.Veryfast"/>.</summary>
-    [EnumDataType(typeof(TranscodingVideoPreset))]
-    public TranscodingVideoPreset Preset { get; set; } = TranscodingVideoPreset.Veryfast;
-
-    /// <summary>Gets or sets the constant rate factor (lower is better quality). Defaults to 21; valid range is 0 to 51.</summary>
+    /// <summary>
+    /// Gets or sets the quantiser of P pictures (lower is better quality and more bits); IDR pictures use 3 less. It
+    /// is raised per picture only as far as <see cref="MaxBitrateKilobits"/> requires. Defaults to 22; valid range is
+    /// 0 to 51.
+    /// </summary>
     [Range(0, 51)]
-    public int ConstantRateFactor { get; set; } = 21;
+    public int Quantizer { get; set; } = 22;
 
     /// <summary>
     /// Gets or sets the peak video bitrate in kilobits per second (VBV cap with a two-second buffer). Defaults to 8000;
@@ -325,11 +256,4 @@ public sealed class TranscodingAudioOptions
     /// <summary>Gets or sets the AAC bitrate in kilobits per second. Defaults to 160; valid range is 32 to 512.</summary>
     [Range(32, 512)]
     public int BitrateKilobits { get; set; } = 160;
-
-    /// <summary>
-    /// Gets or sets which implementation transcodes AAC-LC source audio. Defaults to
-    /// <see cref="TranscodingAudioEngine.Ffmpeg"/>; a temporary control while the managed engine is introduced.
-    /// </summary>
-    [EnumDataType(typeof(TranscodingAudioEngine))]
-    public TranscodingAudioEngine Engine { get; set; } = TranscodingAudioEngine.Ffmpeg;
 }

@@ -1,8 +1,9 @@
 // The transcoding stage: an IPublishSessionHandler placed in front of the media/HLS stage. It admits publishes
 // against the configured session limit, parses each publisher's audio and video codec-aware (legacy FLV and
-// Enhanced RTMP), queues validated source samples for that publisher's transcoder and lets the transcoder's canonical
-// H.264/AAC output, not the publisher's media, reach the media stage. Disabled transcoding rejects every publish
-// rather than passing source media through, and unsupported or out-of-policy media ends the publish with a reason.
+// Enhanced RTMP), queues validated source samples for that publisher's managed video and audio stages and lets their
+// canonical H.264/AAC output, not the publisher's media, reach the media stage. Disabled transcoding rejects every
+// publish rather than passing source media through, and unsupported or out-of-policy media ends the publish with a
+// reason.
 
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Options;
@@ -25,9 +26,6 @@ internal sealed partial class TranscodingPublishSessionHandler : IPublishSession
     /// <summary>The downstream media stage.</summary>
     private readonly IPublishSessionHandler _downstream;
 
-    /// <summary>Starts transcoders.</summary>
-    private readonly ITranscoderProcessFactory _factory;
-
     /// <summary>Metrics.</summary>
     private readonly TranscodingMetrics _metrics;
 
@@ -37,8 +35,8 @@ internal sealed partial class TranscodingPublishSessionHandler : IPublishSession
     /// <summary>The service-wide buffer budget.</summary>
     private readonly TranscodingBufferBudget _budget;
 
-    /// <summary>The canonical IDR interval.</summary>
-    private readonly TimeSpan _keyframeInterval;
+    /// <summary>The managed video stage's settings.</summary>
+    private readonly ManagedVideoSettings _videoSettings;
 
     /// <summary>The bounds of each session's media multiplexer.</summary>
     private readonly MultiplexerLimits _limits;
@@ -57,11 +55,10 @@ internal sealed partial class TranscodingPublishSessionHandler : IPublishSession
     /// <param name="media">The media limits.</param>
     /// <param name="hls">The HLS settings, whose target segment duration is the default IDR interval.</param>
     /// <param name="downstream">The downstream media stage.</param>
-    /// <param name="factory">Starts transcoders.</param>
     /// <param name="metrics">Metrics.</param>
     /// <param name="logger">Logger.</param>
     /// <param name="time">The clock for multiplexer hold deadlines; the system clock when <see langword="null"/>.</param>
-    public TranscodingPublishSessionHandler(IOptions<TranscodingOptions> options, IOptions<MediaOptions> media, IOptions<HlsOptions> hls, IPublishSessionHandler downstream, ITranscoderProcessFactory factory, TranscodingMetrics metrics, ILogger<TranscodingPublishSessionHandler> logger, TimeProvider? time = null)
+    public TranscodingPublishSessionHandler(IOptions<TranscodingOptions> options, IOptions<MediaOptions> media, IOptions<HlsOptions> hls, IPublishSessionHandler downstream, TranscodingMetrics metrics, ILogger<TranscodingPublishSessionHandler> logger, TimeProvider? time = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(media);
@@ -69,11 +66,10 @@ internal sealed partial class TranscodingPublishSessionHandler : IPublishSession
         _options = options.Value;
         _media = media.Value;
         _downstream = downstream;
-        _factory = factory;
         _metrics = metrics;
         _logger = logger;
         _budget = TranscodingBufferBudget.FromOptions(_options, _media);
-        _keyframeInterval = _options.Video.KeyframeInterval ?? hls.Value.TargetSegmentDuration;
+        _videoSettings = ManagedVideoSettings.FromOptions(_options, _media, _options.Video.KeyframeInterval ?? hls.Value.TargetSegmentDuration);
         _limits = MultiplexerLimits.FromOptions(_options);
         _time = time ?? TimeProvider.System;
     }
@@ -114,7 +110,7 @@ internal sealed partial class TranscodingPublishSessionHandler : IPublishSession
             throw new TranscodingRejectedException(TranscodingRejectionReason.Capacity, "All transcoding sessions are in use.");
         }
 
-        var state = new SessionState(new TranscodingSession(session, _downstream, _options, _media, _factory, _budget, _metrics, _logger, _keyframeInterval, _limits, _time));
+        var state = new SessionState(new TranscodingSession(session, _downstream, _options, _media, _videoSettings, _budget, _metrics, _logger, _limits, _time));
         if (!_sessions.TryAdd(session.SessionId, state))
         {
             Interlocked.Decrement(ref _active);
@@ -174,13 +170,21 @@ internal sealed partial class TranscodingPublishSessionHandler : IPublishSession
         {
             var configuration = pipeline.Parser.Configuration;
             LogConfiguration(session.SessionId, configuration.Video?.Description ?? "none", configuration.Audio?.Description ?? "none", configuration.Color?.IsHighDynamicRange == true);
-            if (configuration.Audio is { } audio && !pipeline.RouteAudio(audio))
+            if (configuration.Video is { } video && pipeline.RouteVideo(video) is { } rejection)
             {
                 result.Sample?.Dispose();
-                const string Detail = "The source audio changed to a configuration the ManagedAacLc engine does not support; the audio engine cannot change during a publish.";
+                _metrics.Rejection(rejection.Reason);
+                LogMediaRejected(session.SessionId, MediaTrack.Video, rejection.Reason, rejection.Detail);
+                throw new TranscodingRejectedException(rejection.Reason, rejection.Detail);
+            }
+
+            if (configuration.Audio is { } audio && pipeline.RouteAudio(audio) is { } ineligibility)
+            {
+                result.Sample?.Dispose();
+                var detail = AudioRejectionDetail(ineligibility);
                 _metrics.Rejection(TranscodingRejectionReason.UnsupportedCodec);
-                LogMediaRejected(session.SessionId, MediaTrack.Audio, TranscodingRejectionReason.UnsupportedCodec, Detail);
-                throw new TranscodingRejectedException(TranscodingRejectionReason.UnsupportedCodec, Detail);
+                LogMediaRejected(session.SessionId, MediaTrack.Audio, TranscodingRejectionReason.UnsupportedCodec, detail);
+                throw new TranscodingRejectedException(TranscodingRejectionReason.UnsupportedCodec, detail);
             }
         }
 
@@ -250,8 +254,18 @@ internal sealed partial class TranscodingPublishSessionHandler : IPublishSession
     /// Stops every remaining pipeline without draining; used when the host stops. The sessions stay registered so
     /// their <see cref="OnSessionEndedAsync"/> still ends them downstream and releases their slots.
     /// </summary>
-    /// <returns>A task that completes when every transcoder has exited.</returns>
+    /// <returns>A task that completes when every pipeline has stopped.</returns>
     internal Task AbortAllAsync() => Task.WhenAll(_sessions.Values.Select(static state => state.Pipeline.StopAsync(drain: false)));
+
+    /// <summary>Describes source audio the managed audio stage cannot transcode, without publisher data.</summary>
+    /// <param name="reason">Why it is ineligible.</param>
+    /// <returns>The description.</returns>
+    private static string AudioRejectionDetail(ManagedAudioIneligibility reason) => reason switch
+    {
+        ManagedAudioIneligibility.Codec => "The source audio is not AAC; only AAC-LC audio is transcoded.",
+        ManagedAudioIneligibility.Profile => "The source AAC profile or frame length is not supported; only AAC-LC with 1024-sample frames is transcoded.",
+        _ => "The source AAC AudioSpecificConfig is invalid.",
+    };
 
     /// <summary>Releases a session's slot.</summary>
     /// <param name="sessionId">The session.</param>

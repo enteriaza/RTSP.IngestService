@@ -64,7 +64,8 @@ public sealed class TelemetryExportTests
         ["media.timestamp_discontinuities"] = new() { ["kind=jump;track=video"] = 1 },
         ["media.sessions.active"] = new() { [""] = 1 },
         ["transcoding.sessions.active"] = new() { [""] = 1 },
-        ["transcoding.process.starts"] = new() { ["reason=initial"] = 1 },
+        ["transcoding.video.streams"] = new() { ["reason=initial"] = 1 },
+        ["transcoding.video.decoder.recreations"] = new() { [""] = 1 },
         ["transcoding.initialization.failures"] = new() { ["stage=decoder"] = 1 },
         ["transcoding.failures"] = new() { ["stage=encoder"] = 1 },
         ["transcoding.rejections"] = new() { ["reason=capacity"] = 1 },
@@ -268,7 +269,7 @@ public sealed class TelemetryExportTests
         provider.ForceFlush(10_000);
         var latest = Latest(exported);
 
-        Assert.Equal(88, instruments.Count);
+        Assert.Equal(89, instruments.Count);
         Assert.Equal(instruments.Count, instruments.Select(static i => i.Name).Distinct(StringComparer.Ordinal).Count());
         Assert.Equal(TelemetryTestSupport.Vocabulary.Keys.Order(StringComparer.Ordinal), instruments.Select(static i => i.Name).Order(StringComparer.Ordinal));
         Assert.Equal(TelemetryTestSupport.Vocabulary.Keys.Order(StringComparer.Ordinal), Expected.Keys.Order(StringComparer.Ordinal));
@@ -428,7 +429,8 @@ public sealed class TelemetryExportTests
 
         var transcoding = services.GetRequiredService<TranscodingMetrics>();
         transcoding.SessionStarted();
-        transcoding.ProcessStarted(TranscoderStartReason.Initial);
+        transcoding.VideoStreamStarted(VideoStreamStartReason.Initial);
+        transcoding.VideoDecoderRecreated();
         transcoding.Failure(TranscodingStage.Decoder, initialization: true);
         transcoding.Failure(TranscodingStage.Encoder, initialization: false);
         transcoding.Rejection(TranscodingRejectionReason.Capacity);

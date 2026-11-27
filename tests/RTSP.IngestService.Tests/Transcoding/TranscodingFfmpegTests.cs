@@ -1,8 +1,10 @@
-// End-to-end codec tests: a real FFmpeg publisher sends each supported source codec (legacy FLV and Enhanced RTMP)
-// to a service host, which transcodes it, and the HLS presentation served over HTTP is verified with ffprobe to be
-// the canonical profile (H.264 High yuv420p 8-bit BT.709 limited range; AAC-LC 48 kHz stereo) and decoded in full
-// with -xerror. Fixtures are a few seconds of generated media. The tests need FFmpeg and ffprobe and skip without
-// them unless RTSP_FFMPEG_REQUIRED=true.
+// End-to-end codec tests with FFmpeg as a third-party RTMP publisher (legacy FLV and Enhanced RTMP) to a service host,
+// which transcodes with its managed pipeline only. For each H.264 and AAC variant the pipeline accepts, the HLS
+// presentation served over HTTP is verified with ffprobe to be the canonical profile (H.264 High yuv420p 8-bit BT.709
+// limited range; AAC-LC 48 kHz stereo), decoded in full with -xerror, and decoded independently with the managed
+// H.264 decoder; every codec or format it does not accept (10-bit or 4:2:2 H.264, HEVC, AV1, VP9, MP3, Opus, FLAC,
+// AC-3, E-AC-3) ends the publish with a rejection and packages nothing. Fixtures are a few seconds of generated media.
+// The tests need FFmpeg and ffprobe as test tools and skip without them unless RTSP_FFMPEG_REQUIRED=true.
 
 using System.Globalization;
 using System.Net;
@@ -10,6 +12,7 @@ using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Testing;
+using RTSP.IngestService.Hls;
 using RTSP.IngestService.Http;
 using RTSP.IngestService.Rtmp;
 using RTSP.IngestService.Rtmp.Publishing;
@@ -18,7 +21,7 @@ using RTSP.IngestService.Tests.Infrastructure;
 
 namespace RTSP.IngestService.Tests.Transcoding;
 
-/// <summary>Real-FFmpeg tests of every supported source codec through transcoding to HLS.</summary>
+/// <summary>Real-FFmpeg-publisher tests of source codecs through managed transcoding to HLS.</summary>
 public sealed class TranscodingFfmpegTests
 {
     /// <summary>The publisher stream key.</summary>
@@ -36,36 +39,41 @@ public sealed class TranscodingFfmpegTests
     /// <summary>Captured host logs.</summary>
     private readonly FakeLogCollector _logs = new();
 
-    /// <summary>Gets the video fixtures: name and FFmpeg encoder arguments.</summary>
+    /// <summary>Gets the H.264 sources the managed decoder accepts: name and FFmpeg encoder arguments.</summary>
     public static TheoryData<string, string[]> VideoCodecs => new()
     {
-        { "h264", ["-c:v", "libx264", "-profile:v", "high", "-bf", "2", "-g", "25", "-pix_fmt", "yuv420p"] },
-        { "h264-10bit", ["-c:v", "libx264", "-profile:v", "high10", "-g", "25", "-pix_fmt", "yuv420p10le"] },
-        { "hevc", ["-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error:keyint=25", "-pix_fmt", "yuv420p"] },
-        { "hevc-10bit-pq", ["-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le", "-x265-params", "log-level=error:keyint=25:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc", "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc"] },
-        { "hevc-10bit-hlg", ["-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le", "-x265-params", "log-level=error:keyint=25:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc", "-color_primaries", "bt2020", "-color_trc", "arib-std-b67", "-colorspace", "bt2020nc"] },
-        { "av1", ["-c:v", "libsvtav1", "-preset", "12", "-g", "25", "-pix_fmt", "yuv420p", "-svtav1-params", "lp=2"] },
-        { "av1-10bit", ["-c:v", "libsvtav1", "-preset", "12", "-g", "25", "-pix_fmt", "yuv420p10le", "-svtav1-params", "lp=2"] },
-        { "vp9", ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-g", "25", "-pix_fmt", "yuv420p"] },
-        { "vp9-10bit", ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-g", "25", "-profile:v", "2", "-pix_fmt", "yuv420p10le"] },
+        { "h264-high-bframes", ["-c:v", "libx264", "-profile:v", "high", "-bf", "2", "-g", "25", "-pix_fmt", "yuv420p"] },
+        { "h264-main", ["-c:v", "libx264", "-profile:v", "main", "-g", "25", "-pix_fmt", "yuv420p"] },
+        { "h264-baseline", ["-c:v", "libx264", "-profile:v", "baseline", "-g", "25", "-pix_fmt", "yuv420p"] },
+        { "h264-bt601", ["-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p", "-color_primaries", "smpte170m", "-color_trc", "smpte170m", "-colorspace", "smpte170m"] },
     };
 
-    /// <summary>Gets the audio fixtures: name, FFmpeg encoder arguments and source channel count.</summary>
+    /// <summary>Gets the AAC sources the managed decoder accepts: name and FFmpeg encoder arguments.</summary>
     public static TheoryData<string, string[]> AudioCodecs => new()
     {
         { "aac-44k-mono", ["-c:a", "aac", "-ar", "44100", "-ac", "1", "-b:a", "96k"] },
         { "aac-5.1", ["-c:a", "aac", "-ac", "6", "-b:a", "256k"] },
-        { "mp3", ["-c:a", "libmp3lame", "-ar", "44100", "-ac", "2", "-b:a", "128k"] },
-        { "opus", ["-c:a", "libopus", "-ac", "2", "-b:a", "96k"] },
-        { "flac", ["-c:a", "flac", "-ac", "2"] },
-        { "ac3-5.1", ["-c:a", "ac3", "-ac", "6", "-b:a", "384k"] },
-        { "eac3-5.1", ["-c:a", "eac3", "-ac", "6", "-b:a", "384k"] },
+    };
+
+    /// <summary>Gets the sources the managed pipeline does not transcode: name and full FFmpeg encoder arguments.</summary>
+    public static TheoryData<string, string[]> UnsupportedCodecs => new()
+    {
+        { "h264-10bit", ["-c:v", "libx264", "-profile:v", "high10", "-g", "25", "-pix_fmt", "yuv420p10le", "-c:a", "aac"] },
+        { "h264-422", ["-c:v", "libx264", "-profile:v", "high422", "-g", "25", "-pix_fmt", "yuv422p", "-c:a", "aac"] },
+        { "hevc", ["-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error:keyint=25", "-pix_fmt", "yuv420p", "-c:a", "aac"] },
+        { "av1", ["-c:v", "libsvtav1", "-preset", "12", "-g", "25", "-pix_fmt", "yuv420p", "-svtav1-params", "lp=2", "-c:a", "aac"] },
+        { "vp9", ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-g", "25", "-pix_fmt", "yuv420p", "-c:a", "aac"] },
+        { "mp3", ["-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p", "-c:a", "libmp3lame", "-ar", "44100", "-ac", "2", "-b:a", "128k"] },
+        { "opus", ["-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p", "-c:a", "libopus", "-ac", "2", "-b:a", "96k"] },
+        { "flac", ["-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p", "-c:a", "flac", "-ac", "2"] },
+        { "ac3-5.1", ["-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p", "-c:a", "ac3", "-ac", "6", "-b:a", "384k"] },
+        { "eac3-5.1", ["-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p", "-c:a", "eac3", "-ac", "6", "-b:a", "384k"] },
     };
 
     /// <summary>Gets the test cancellation token.</summary>
     private static CancellationToken Token => TestContext.Current.CancellationToken;
 
-    /// <summary>Each source video codec, with AAC audio, becomes canonical H.264 with every frame preserved.</summary>
+    /// <summary>Each accepted H.264 source, with AAC audio, becomes canonical H.264 with every frame preserved.</summary>
     /// <param name="name">The fixture name.</param>
     /// <param name="encoder">The FFmpeg encoder arguments.</param>
     /// <returns>A task that completes when the test is finished.</returns>
@@ -80,9 +88,10 @@ public sealed class TranscodingFfmpegTests
         Assert.Equal(Seconds * 25, probe.Video!.Frames);
         AssertCanonicalAudio(probe.Audio, name);
         await HlsFfmpegInteropTests.DecodeAsync(tools.Ffmpeg, run.PlaylistUri.AbsoluteUri);
+        Assert.Equal(Seconds * 25, run.DecodeManaged().Sum(static p => p.Pictures.Count));
     }
 
-    /// <summary>Each source audio codec, with H.264 video, becomes canonical AAC-LC 48 kHz stereo.</summary>
+    /// <summary>Each accepted AAC source, with H.264 video, becomes canonical AAC-LC 48 kHz stereo.</summary>
     /// <param name="name">The fixture name.</param>
     /// <param name="encoder">The FFmpeg encoder arguments.</param>
     /// <returns>A task that completes when the test is finished.</returns>
@@ -98,6 +107,35 @@ public sealed class TranscodingFfmpegTests
         var seconds = probe.Audio!.Frames * 1024 / 48000.0;
         Assert.InRange(seconds, Seconds - 0.25, Seconds + 0.25);
         await HlsFfmpegInteropTests.DecodeAsync(tools.Ffmpeg, run.PlaylistUri.AbsoluteUri);
+        Assert.Equal(probe.Audio.Frames, run.DecodeManaged().Sum(static p => p.AudioStarts.Count));
+    }
+
+    /// <summary>
+    /// A source the managed pipeline does not transcode ends the publish at its configuration with a rejection, and
+    /// nothing is packaged; there is no fallback.
+    /// </summary>
+    /// <param name="name">The fixture name.</param>
+    /// <param name="encoder">The FFmpeg encoder arguments.</param>
+    /// <returns>A task that completes when the test is finished.</returns>
+    [Theory]
+    [MemberData(nameof(UnsupportedCodecs))]
+    public async Task UnsupportedCodec_IsRejected(string name, string[] encoder)
+    {
+        var tools = HlsFfmpegInteropTests.Tools();
+        using var host = TestHosts.CreateBuilder(_logs, overrides: Settings()).Build();
+        await host.StartAsync(Token).WithinSafetyTimeout();
+        try
+        {
+            var port = ((IPEndPoint)host.Services.GetRequiredService<RtmpListener>().LocalEndPoint!).Port;
+            await HlsFfmpegInteropTests.RunAsync(tools.Ffmpeg, ["-hide_banner", "-loglevel", "error", "-nostdin", .. VideoInput, .. AudioInput, "-t", Seconds.ToString(CultureInfo.InvariantCulture), .. encoder, "-f", "flv", $"rtmp://127.0.0.1:{port}/live/{StreamKey}"]);
+            await Eventually.WaitUntilAsync(() => _logs.GetSnapshot().Any(static r => r.Id.Id == 10011), $"{name} is rejected");
+            Assert.True(host.Services.GetRequiredService<IHlsSegmentStore>().GetPlaylist("live", "camera") is null or { Segments.Count: 0 }, $"{name}: nothing is packaged.");
+            Assert.DoesNotContain(_logs.GetSnapshot(), static r => r.Id.Id == 10000);
+        }
+        finally
+        {
+            await host.StopAsync(CancellationToken.None);
+        }
     }
 
     /// <summary>A stream without audio produces canonical video only; one without video produces canonical audio only.</summary>
@@ -110,18 +148,18 @@ public sealed class TranscodingFfmpegTests
     {
         var tools = HlsFfmpegInteropTests.Tools();
         string[] arguments = video
-            ? [.. VideoInput, "-t", "3", "-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error:keyint=25", "-pix_fmt", "yuv420p"]
-            : [.. AudioInput, "-t", "3", "-c:a", "libopus", "-b:a", "96k"];
+            ? [.. VideoInput, "-t", "3", "-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p"]
+            : [.. AudioInput, "-t", "3", "-c:a", "aac", "-b:a", "96k"];
         await using var run = await PublishAsync(tools.Ffmpeg, arguments);
         var probe = await ProbeCanonicalAsync(tools.Probe, run.PlaylistUri);
         if (video)
         {
-            AssertCanonicalVideo(probe.Video, "hevc video-only");
+            AssertCanonicalVideo(probe.Video, "h264 video-only");
             Assert.Null(probe.Audio);
         }
         else
         {
-            AssertCanonicalAudio(probe.Audio, "opus audio-only");
+            AssertCanonicalAudio(probe.Audio, "aac audio-only");
             Assert.Null(probe.Video);
         }
 
@@ -140,8 +178,8 @@ public sealed class TranscodingFfmpegTests
         var source = run.SourceVideoFrames;
         Assert.Equal(source, probe.Video!.Frames);
         await HlsFfmpegInteropTests.DecodeAsync(tools.Ffmpeg, run.PlaylistUri.AbsoluteUri);
+        Assert.Equal(source, run.DecodeManaged().Sum(static p => p.Pictures.Count));
     }
-
     /// <summary>Asserts the canonical video profile.</summary>
     /// <param name="video">The probed stream.</param>
     /// <param name="name">The fixture, for messages.</param>
@@ -259,7 +297,10 @@ public sealed class TranscodingFfmpegTests
         return (video, audio);
     }
 
-    /// <summary>Host settings: publisher <c>camera</c>, 1 s segments, a window holding the whole stream, and backpressure so a faster-than-real-time publisher loses nothing.</summary>
+    /// <summary>
+    /// Host settings: publisher <c>camera</c>, 1 s segments, a window holding the whole stream, backpressure so a
+    /// faster-than-real-time publisher loses nothing, and the longest drain timeout so its queued video is encoded.
+    /// </summary>
     /// <returns>The overrides.</returns>
     internal static Dictionary<string, string?> Settings() => new()
     {
@@ -270,6 +311,7 @@ public sealed class TranscodingFfmpegTests
         ["Hls:MaxSegmentDuration"] = "00:00:04",
         ["Hls:PlaylistWindowSize"] = "20",
         ["Transcoding:OverloadPolicy"] = "Backpressure",
+        ["Transcoding:DrainTimeout"] = "00:01:00",
     };
 
     /// <summary>Probed properties of a canonical stream.</summary>
@@ -293,6 +335,16 @@ public sealed class TranscodingFfmpegTests
     /// <param name="SourceVideoFrames">Source video frames, when counted.</param>
     private sealed record PublishRun(IHost Host, Uri PlaylistUri, int SourceVideoFrames) : IAsyncDisposable
     {
+        /// <summary>Decodes the stored presentation with the managed decoders.</summary>
+        /// <returns>Its periods.</returns>
+        public List<HlsPeriod> DecodeManaged()
+        {
+            var store = Host.Services.GetRequiredService<IHlsSegmentStore>();
+            var playlist = store.GetPlaylist("live", "camera");
+            Assert.NotNull(playlist);
+            return HlsOutputDecoder.Decode(playlist, name => store.ReadSegment("live", "camera", name) ?? throw new InvalidOperationException($"{name} is not stored."));
+        }
+
         /// <inheritdoc />
         public async ValueTask DisposeAsync()
         {

@@ -251,8 +251,9 @@ the hardening options. A temporary drop-in moved the listeners to test ports.
 - Watchdog keep-alives advanced.
 - `systemctl stop` exited with status 0, `Result=success` and no restart.
 - A configuration error exited with status 78, `Result=exit-code` and no restart.
-- The same package, run as a console process with FFmpeg 9.0.2, served live and ended HLS playlists that `ffprobe`
-  and a full FFmpeg decode read.
+- The same package, run as a console process, served live and ended HLS playlists that `ffprobe` and a full FFmpeg
+  decode read. That release still transcoded with FFmpeg 9.0.2; the service now transcodes in managed code and needs
+  no FFmpeg installation.
 
 **Earlier self-contained non-AOT build.** This was run as a user unit (`systemctl --user`, with `User=`, `Group=` and
 the hardening block removed, `WatchdogSec=4` and `TimeoutAbortSec=5`):

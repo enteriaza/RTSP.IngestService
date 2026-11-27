@@ -1,8 +1,7 @@
 // The "audio-integration-smoke" diagnostic command, run instead of the service when it is the first argument. It
-// publishes one ADTS AAC-LC file as an audio-only RTMP publish through the real transcoding stage with the managed
-// AAC-LC engine, so the managed audio stage, the media multiplexer and the session lifecycle run exactly as in the
-// service, and a Native AOT build can be shown to execute them. No transcoder process may start: the process factory
-// fails the run if asked. The delivered FLV audio is checked (sequence header first and once, unit count, a
+// publishes one ADTS AAC-LC file as an audio-only RTMP publish through the real transcoding stage, so the managed
+// audio stage, the media multiplexer and the session lifecycle run exactly as in the service, and a Native AOT build
+// can be shown to execute them. The delivered FLV audio is checked (sequence header first and once, unit count, a
 // continuous timeline, and every unit decoding with the managed decoder to 48 kHz stereo; exit code 1 on a mismatch),
 // and counts and a digest are printed for comparing JIT and AOT builds. It does not build the host or read
 // configuration, and it prints only stream properties, counts and digests.
@@ -43,8 +42,8 @@ public static class AudioIntegrationSmokeCommand
         """
         Usage:
           RTSP.IngestService audio-integration-smoke <input.aac>
-        Publishes an ADTS AAC-LC file as audio-only RTMP through the transcoding stage with the managed AAC-LC engine
-        and checks the 48 kHz stereo AAC-LC it delivers. Diagnostic only; starts no transcoder process.
+        Publishes an ADTS AAC-LC file as audio-only RTMP through the transcoding stage and checks the 48 kHz stereo
+        AAC-LC it delivers. Diagnostic only.
         """;
 
     /// <summary>Runs the command if <paramref name="args"/> selects it.</summary>
@@ -110,8 +109,6 @@ public static class AudioIntegrationSmokeCommand
         using var source = AacDecoder.Create(configuration);
         var rate = source.SampleRate;
         var options = new TranscodingOptions();
-        options.Audio.Engine = TranscodingAudioEngine.ManagedAacLc;
-        var factory = new RefusingProcessFactory();
         var downstream = new RecordingStage();
         using var meters = new MeterFactory();
         var handler = new TranscodingPublishSessionHandler(
@@ -119,7 +116,6 @@ public static class AudioIntegrationSmokeCommand
             Microsoft.Extensions.Options.Options.Create(new MediaOptions()),
             Microsoft.Extensions.Options.Options.Create(new HlsOptions()),
             downstream,
-            factory,
             new TranscodingMetrics(meters),
             NullLogger<TranscodingPublishSessionHandler>.Instance);
 
@@ -140,7 +136,6 @@ public static class AudioIntegrationSmokeCommand
         var samples = audio.Where(static m => m.Payload is [0xAF, 0x01, ..]).ToList();
         var canonical = (long)Math.Ceiling((units.Count * 1024.0 * AacEncoder.SampleRate / rate) - 1e-9);
         var expected = ((canonical + 1023) / 1024) + 1;
-        Check(factory.Starts == 0, $"{factory.Starts} transcoder process(es) were requested");
         Check(downstream.Ended, "the downstream publish did not end");
         Check(downstream.Other == 0, $"{downstream.Other} non-audio message(s) were delivered");
         Check(audio.Count > 0 && audio[0].Payload.AsSpan().SequenceEqual(AacSequenceHeader), "the first audio message is not the 48 kHz stereo AAC-LC sequence header");
@@ -169,7 +164,7 @@ public static class AudioIntegrationSmokeCommand
         Check(decoded == samples.Count * 1024L, $"decoded {decoded} samples, expected {samples.Count * 1024L}");
         Check(handler.BufferedBytes == 0 && handler.Budget.Used == 0, "buffers were not released");
         output.WriteLine($"Input: AAC-LC {rate} Hz, {source.Layout.Length} channel(s), {units.Count} access units");
-        output.WriteLine($"Output: AAC-LC {AacEncoder.SampleRate} Hz, 2 channels, {samples.Count} access units, {decoded} decoded samples, {factory.Starts} transcoder processes");
+        output.WriteLine($"Output: AAC-LC {AacEncoder.SampleRate} Hz, 2 channels, {samples.Count} access units, {decoded} decoded samples");
         output.WriteLine($"Timeline: first {(samples.Count > 0 ? (int)samples[0].Timestamp : 0)} ms, last {(samples.Count > 0 ? (int)samples[^1].Timestamp : 0)} ms (RTMP timestamps; the first unit primes the encoder before the anchor)");
         output.WriteLine($"Digest: delivered audio {digest:x16}");
         return failures;
@@ -268,23 +263,6 @@ public static class AudioIntegrationSmokeCommand
         {
             Volatile.Write(ref _ended, 1);
             return ValueTask.CompletedTask;
-        }
-    }
-
-    /// <summary>Counts and refuses process starts: an audio-only managed publish must start none.</summary>
-    private sealed class RefusingProcessFactory : ITranscoderProcessFactory
-    {
-        /// <summary>The start count.</summary>
-        private int _starts;
-
-        /// <summary>Gets the number of starts requested.</summary>
-        public int Starts => Volatile.Read(ref _starts);
-
-        /// <inheritdoc />
-        public ITranscoderProcess Start(IReadOnlyList<string> arguments)
-        {
-            Interlocked.Increment(ref _starts);
-            throw new TranscodingFailedException(TranscodingStage.Process, true, "The smoke run must not start a transcoder process.");
         }
     }
 

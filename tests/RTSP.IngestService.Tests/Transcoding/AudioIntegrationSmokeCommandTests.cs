@@ -6,7 +6,7 @@ namespace RTSP.IngestService.Tests.Transcoding;
 /// <summary>Tests for <see cref="AudioIntegrationSmokeCommand"/>.</summary>
 public sealed class AudioIntegrationSmokeCommandTests
 {
-    /// <summary>Each fixture publishes through the managed stage and multiplexer and passes every check without starting a process.</summary>
+    /// <summary>Each fixture publishes through the managed stage and multiplexer and passes every check.</summary>
     /// <param name="fixture">The ADTS fixture.</param>
     /// <param name="rate">Its sample rate.</param>
     /// <param name="channels">Its channel count.</param>
@@ -27,7 +27,6 @@ public sealed class AudioIntegrationSmokeCommandTests
         Assert.Equal(string.Empty, stderr.ToString());
         Assert.Contains($"Input: AAC-LC {rate} Hz, {channels} channel(s)", stdout.ToString(), StringComparison.Ordinal);
         Assert.Contains("Output: AAC-LC 48000 Hz, 2 channels", stdout.ToString(), StringComparison.Ordinal);
-        Assert.Contains(", 0 transcoder processes", stdout.ToString(), StringComparison.Ordinal);
         Assert.Contains("Digest: delivered audio ", stdout.ToString(), StringComparison.Ordinal);
     }
 

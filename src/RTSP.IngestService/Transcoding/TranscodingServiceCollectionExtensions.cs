@@ -1,8 +1,7 @@
 // Registers the transcoding stage as the RTMP publish session handler, in front of media processing. Registrations
-// use TryAdd, so a host that registers its own IPublishSessionHandler or ITranscoderProcessFactory first replaces
-// them. The capability check and shutdown service are hosted services registered here, ahead of the RTMP listener,
-// so FFmpeg is verified before publishers can connect and any leftover transcoder is terminated after the listener
-// has ended its sessions.
+// use TryAdd, so a host that registers its own IPublishSessionHandler first replaces it. The lifecycle service is a
+// hosted service registered here, ahead of the RTMP listener, so it reports the transcoding configuration before
+// publishers can connect and stops any leftover pipeline after the listener has ended its sessions.
 
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
@@ -34,19 +33,16 @@ public static class TranscodingServiceCollectionExtensions
 
         services.AddMetrics();
         services.TryAddSingleton<TranscodingMetrics>();
-        services.TryAddSingleton<ITranscoderProcessFactory, FfmpegProcessFactory>();
         services.TryAddSingleton(static sp => new TranscodingPublishSessionHandler(
             sp.GetRequiredService<IOptions<TranscodingOptions>>(),
             sp.GetRequiredService<IOptions<MediaOptions>>(),
             sp.GetRequiredService<IOptions<HlsOptions>>(),
             sp.GetRequiredService<MediaPublishSessionHandler>(),
-            sp.GetRequiredService<ITranscoderProcessFactory>(),
             sp.GetRequiredService<TranscodingMetrics>(),
             sp.GetRequiredService<ILogger<TranscodingPublishSessionHandler>>(),
             sp.GetService<TimeProvider>()));
         services.TryAddSingleton<IPublishSessionHandler>(static sp => sp.GetRequiredService<TranscodingPublishSessionHandler>());
-        services.AddHostedService<FfmpegCapabilityCheck>();
-        services.AddHostedService(static sp => new TranscodingShutdownService(sp.GetRequiredService<TranscodingPublishSessionHandler>()));
+        services.AddHostedService<TranscodingLifecycleService>();
 
         return services;
     }

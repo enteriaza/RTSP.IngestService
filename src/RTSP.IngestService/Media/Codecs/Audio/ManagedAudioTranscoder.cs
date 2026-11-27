@@ -1,6 +1,7 @@
 // The complete managed audio path from any supported AAC-LC stream to the canonical output: managed AAC decode,
-// stereo downmix, resampling to 48 kHz, clipping and AAC-LC encode. It is not connected to the ingest transcoding
-// session, which still uses FFmpeg; it backs the codec smoke command and the end-to-end tests.
+// stereo downmix, resampling to 48 kHz, clipping and AAC-LC encode, as one synchronous call. The ingest transcoding
+// session uses the same codecs through ManagedAudioStage; this type backs the codec smoke command and the end-to-end
+// tests.
 
 using RTSP.IngestService.Media.Codecs.Audio.Aac.Decoder;
 using RTSP.IngestService.Media.Codecs.Audio.Aac.Encoder;

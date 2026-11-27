@@ -1,206 +1,147 @@
-// Real-FFmpeg regression of the transcoder output path: fixture FLV files are published through the transcoding stage
-// with the real FFmpeg process factory into the real media and HLS stages on a fake clock. Each transcoder's FLV
-// output is teed, and the media messages that reach the media stage must be exactly that output in FFmpeg's order,
-// with the session timeline mapping (offset removed, process base added, sequence headers clamped to the base) and
-// overlap rule applied: the same messages, in the same order, the pre-multiplexer reader delivered. Setting
-// RTSP_TRANSCODING_HLS_DUMP to a directory writes each scenario's playlist and segments there, so HLS output can be
-// compared byte for byte across builds. The tests need FFmpeg and skip without it unless RTSP_FFMPEG_REQUIRED=true.
+// Regression of the production transcoding path into HLS: fixture FLV files (H.264 Main with B-frames and AAC-LC)
+// are published through the managed transcoding stage into the real media and HLS stages, with no FFmpeg anywhere.
+// The canonical video reaching the media stage is decoded with the Phase 3 managed decoder and must hold every source
+// picture at its source presentation time (minus pictures a back-to-back fixture overlaps), and the stored HLS
+// presentation is decoded independently of the packager and must hold the same pictures, bit for bit by mean luma,
+// on the same relative timeline, with audio starting at the first picture. Setting RTSP_TRANSCODING_HLS_DUMP to a
+// directory writes each scenario's playlist and segments there, so HLS output can be compared across builds. FFmpeg,
+// when present, adds an ffprobe and full-decode oracle.
 
-using System.Buffers;
-using System.Buffers.Binary;
-using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Testing;
-using RTSP.IngestService.Configuration;
 using RTSP.IngestService.Hls;
-using RTSP.IngestService.Rtmp.Protocol;
+using RTSP.IngestService.Media.Codecs;
 using RTSP.IngestService.Rtmp.Publishing;
 using RTSP.IngestService.Tests.Hls;
 using RTSP.IngestService.Tests.Media;
-using RTSP.IngestService.Transcoding;
 using FlvTag = RTSP.IngestService.Tests.Media.FlvTag;
 
 namespace RTSP.IngestService.Tests.Transcoding;
 
-/// <summary>Real-FFmpeg regression of the messages and HLS output produced from transcoder output.</summary>
+/// <summary>Regression of the managed transcoding output through the media and HLS stages.</summary>
 public sealed class TranscodingHlsRegressionTests
 {
     /// <summary>The environment variable naming the dump directory.</summary>
     private const string DumpVariable = "RTSP_TRANSCODING_HLS_DUMP";
 
-    /// <summary>Gets the scenarios: a name and the fixtures published one after another.</summary>
-    public static TheoryData<string, string[]> Scenarios => new()
+    /// <summary>One AAC frame at 48 kHz plus 1 ms of rounding: the A/V alignment tolerance.</summary>
+    private static readonly double AlignmentToleranceMilliseconds = (1024 * 1000.0 / 48_000) + 1;
+
+    /// <summary>Gets the scenarios: a name, the fixtures published one after another, and whether video timing is made variable.</summary>
+    public static TheoryData<string, string[], bool> Scenarios => new()
     {
-        { "h264-aac", ["h264-aac.flv"] },
-        { "h264-aac-4s", ["h264-aac-4s.flv"] },
-        { "hevc", ["hevc.flv"] },
-        { "hevc-pq", ["hevc-pq.flv"] },
-        { "av1", ["av1.flv"] },
-        { "vp9", ["vp9.flv"] },
-        { "opus", ["opus.flv"] },
-        { "flac", ["flac.flv"] },
-        { "mp3", ["mp3.flv"] },
-        { "ac3", ["ac3.flv"] },
-        { "eac3", ["eac3.flv"] },
-        { "restart", ["h264-aac-4s.flv", "hevc.flv"] },
-        { "long", ["h264-aac-4s.flv", "h264-aac-4s.flv", "h264-aac-4s.flv"] },
+        { "h264-aac", ["h264-aac.flv"], false },
+        { "h264-aac-4s", ["h264-aac-4s.flv"], false },
+        { "restart", ["h264-aac-4s.flv", "h264-aac.flv"], false },
+        { "long", ["h264-aac-4s.flv", "h264-aac-4s.flv", "h264-aac-4s.flv"], false },
+        { "vfr", ["h264-aac-4s.flv"], true },
     };
 
     /// <summary>
-    /// The media stage receives exactly the transcoders' output, in order, on the session timeline, and the HLS
-    /// presentation is complete.
+    /// Every source picture reaches the media stage as canonical H.264 at its presentation time, and the HLS
+    /// presentation decodes to exactly those pictures with audio aligned to the first one.
     /// </summary>
     /// <param name="name">The scenario.</param>
     /// <param name="fixtures">The fixtures, published back to back on one timeline.</param>
+    /// <param name="variable">Whether to stretch the video timeline irregularly (variable frame rate).</param>
     /// <returns>A task that completes when the test is finished.</returns>
     [Theory]
     [MemberData(nameof(Scenarios))]
-    public async Task TranscoderOutput_ReachesTheMediaStageVerbatim(string name, string[] fixtures)
+    public async Task ManagedOutput_ReachesHlsIntact(string name, string[] fixtures, bool variable)
     {
-        var ffmpeg = HlsFfmpegInteropTests.Tools().Ffmpeg;
-        var hlsOptions = new HlsOptions { TargetSegmentDuration = TimeSpan.FromSeconds(2), MaxSegmentDuration = TimeSpan.FromSeconds(4) };
-        using var hls = new HlsHarness(hlsOptions);
-        var recorder = new RecordingStage(hls.Processor);
-        var options = new TranscodingOptions { FfmpegPath = ffmpeg, OverloadPolicy = TranscodingOverloadPolicy.Backpressure };
-        var factory = new TeeProcessFactory(new FfmpegProcessFactory(Microsoft.Extensions.Options.Options.Create(options)));
-        using var services = new ServiceCollection().AddMetrics().BuildServiceProvider();
-        using var loggerFactory = new LoggerFactory([new FakeLoggerProvider(new FakeLogCollector())]);
-        var handler = new TranscodingPublishSessionHandler(
-            Microsoft.Extensions.Options.Options.Create(options),
-            Microsoft.Extensions.Options.Options.Create(new MediaOptions()),
-            Microsoft.Extensions.Options.Options.Create(hlsOptions),
-            recorder,
-            factory,
-            new TranscodingMetrics(services.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>()),
-            loggerFactory.CreateLogger<TranscodingPublishSessionHandler>());
+        using var run = new ManagedHlsRun();
+        var session = await run.StartAsync();
+        var inputs = fixtures.Select(f => variable ? VariableFrameRate(FlvFile.ReadFixture(f)) : FlvFile.ReadFixture(f)).ToArray();
+        var sent = await run.PublishAsync(session, inputs);
+        await run.EndAsync(session);
 
-        var session = new PublisherSession(1, null, "live", "camera1", "live", 1, DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch);
-        await handler.OnSessionStartedAsync(session, TestContext.Current.CancellationToken);
-        uint shift = 0;
-        foreach (var fixture in fixtures)
+        run.AssertReleased();
+        Assert.DoesNotContain(run.EventIds(), static id => id is 10001 or 10003 or 10011 or 10012);
+        var expected = ExpectedPresentationTimes(inputs);
+        var delivered = ManagedVideoTestSupport.Decode(run.Downstream.Events(session, PublishedMessageKind.Video));
+        ManagedVideoTestSupport.AssertCanonical(delivered, 160, 120);
+        Assert.Equal(expected, delivered.Pictures.Select(static p => p.Timestamp));
+        Assert.NotEmpty(run.Downstream.Events(session, PublishedMessageKind.Audio));
+
+        var (playlist, periods) = run.DecodeEnded();
+        var pictures = periods.SelectMany(static p => p.Pictures).ToList();
+        Assert.Equal(delivered.Pictures.Select(static p => p.MeanLuma), pictures.Select(static p => p.MeanLuma));
+        Assert.All(pictures, static p => Assert.Equal((160, 120, VideoColorInfo.Bt709), (p.Width, p.Height, p.Color)));
+        var index = 0;
+        foreach (var period in periods)
         {
-            var tags = FlvFile.ReadFixture(fixture);
-            foreach (var tag in tags)
+            Assert.NotNull(period.AvcRecord);
+            Assert.NotEmpty(period.Pictures);
+            Assert.True(period.Pictures[0].IsKeyframe, $"Period {period.Initialization} starts with an IDR picture.");
+            var source = expected.Skip(index).Take(period.Pictures.Count).ToList();
+            Assert.Equal(source.Select(t => t - source[0]), period.Pictures.Select(p => p.Timestamp - period.Pictures[0].Timestamp));
+            index += period.Pictures.Count;
+        }
+
+        var first = periods[0];
+        var sourceAudio = sent.First(static t => t.Type == 8 && t.Body.Length > 2 && t.Body[1] == 1).Timestamp;
+        double expectedOffset = Math.Max(0, sourceAudio - expected[0]);
+        Assert.InRange(first.AudioStarts[0] - first.Pictures[0].Timestamp, expectedOffset - 1, expectedOffset + AlignmentToleranceMilliseconds);
+        Dump(name, run.Hls, playlist, run.Downstream.Messages);
+        await run.OracleAsync(playlist, video: true);
+    }
+
+    /// <summary>
+    /// The presentation times the canonical output must hold: each fixture's pictures in presentation order, shifted
+    /// as the run shifts them, without pictures at or before the previous fixture's last (the stage drops overlap).
+    /// </summary>
+    /// <param name="fixtures">The fixtures as published.</param>
+    /// <returns>The times in milliseconds.</returns>
+    private static List<long> ExpectedPresentationTimes(IReadOnlyList<FlvTag>[] fixtures)
+    {
+        var expected = new List<long>();
+        uint shift = 0;
+        foreach (var tags in fixtures)
+        {
+            foreach (var pts in ManagedVideoTestSupport.SourcePresentationTimes(tags))
             {
-                await handler.OnMessageAsync(session, Message(tag, shift, hls.Pool), TestContext.Current.CancellationToken);
+                if (expected.Count == 0 || pts + shift > expected[^1])
+                {
+                    expected.Add(pts + shift);
+                }
             }
 
             shift += tags.Max(static t => t.Timestamp) + 40;
         }
 
-        session.TryEnd(PublishEndReason.Unpublished, DateTimeOffset.UnixEpoch);
-        await handler.OnSessionEndedAsync(session, TestContext.Current.CancellationToken).AsTask().WaitAsync(TimeSpan.FromSeconds(60), TestContext.Current.CancellationToken);
-
-        Assert.Null(handler.FindSession(session.SessionId));
-        Assert.Equal(0, handler.BufferedBytes);
-        Assert.Equal(0, hls.Pool.Outstanding);
-        Assert.NotEmpty(factory.Outputs);
-
-        var delivered = recorder.Messages.Where(static m => m.Kind != PublishedMessageKind.Data).ToList();
-        var expected = Expected(factory.Outputs.Select(static o => o.ToArray()).ToList(), delivered);
-        Assert.Equal(expected.Count, delivered.Count);
-        for (var i = 0; i < expected.Count; i++)
-        {
-            Assert.True(expected[i].Kind == delivered[i].Kind && expected[i].Timestamp == delivered[i].Timestamp && expected[i].Payload.AsSpan().SequenceEqual(delivered[i].Payload), $"Message {i}: expected {expected[i].Kind} at {expected[i].Timestamp}, delivered {delivered[i].Kind} at {delivered[i].Timestamp}.");
-        }
-
-        var playlist = hls.Playlist();
-        Assert.NotNull(playlist);
-        Assert.True(playlist.Ended);
-        Assert.NotEmpty(playlist.Segments);
-        Dump(name, hls, playlist, recorder.Messages);
-    }
-
-    /// <summary>Builds a pooled message from a fixture tag.</summary>
-    /// <param name="tag">The tag.</param>
-    /// <param name="shift">Added to its timestamp.</param>
-    /// <param name="pool">The pool.</param>
-    /// <returns>The message.</returns>
-    private static PublishedMessage Message(FlvTag tag, uint shift, ArrayPool<byte> pool)
-    {
-        var buffer = new PooledBuffer(pool);
-        buffer.EnsureCapacity(Math.Max(tag.Body.Length, 1));
-        buffer.Append(new ReadOnlySequence<byte>(tag.Body));
-        var kind = TranscodingHarness.Kind(tag);
-        return new PublishedMessage(kind, tag.Type, tag.Timestamp + shift, buffer);
-    }
-
-    /// <summary>
-    /// Maps the teed transcoder output to the messages the pre-multiplexer reader delivered: audio and video tags in
-    /// output order, at the output timestamp minus <see cref="FfmpegArguments.TimestampOffset"/> plus the process base
-    /// (sequence headers clamped to the base), dropping samples that do not advance their track's timeline.
-    /// </summary>
-    /// <param name="outputs">Each process's FLV output, in start order.</param>
-    /// <param name="delivered">The delivered media messages, which give each process's base: its first message is a sequence header at the base.</param>
-    /// <returns>The expected messages.</returns>
-    private static List<Delivered> Expected(List<byte[]> outputs, List<Delivered> delivered)
-    {
-        var expected = new List<Delivered>();
-        long? lastVideo = null;
-        long? lastAudio = null;
-        foreach (var output in outputs)
-        {
-            var tags = ReadFlv(output).Where(static t => t.Type is 8 or 9).ToList();
-            Assert.NotEmpty(tags);
-            Assert.True(tags[0].Body.Length >= 2 && tags[0].Body[1] == 0, "Each transcoder output starts with a sequence header.");
-            Assert.True(expected.Count < delivered.Count, "A transcoder's output was not delivered.");
-            long baseTimestamp = delivered[expected.Count].Timestamp;
-            foreach (var tag in tags)
-            {
-                var video = tag.Type == 9;
-                var kind = video ? PublishedMessageKind.Video : PublishedMessageKind.Audio;
-                var timestamp = (long)tag.Timestamp - FfmpegArguments.TimestampOffset + baseTimestamp;
-                if (tag.Body.Length < 2 || tag.Body[1] != 1)
-                {
-                    expected.Add(new Delivered(kind, (uint)Math.Max(timestamp, baseTimestamp), tag.Body));
-                    continue;
-                }
-
-                var last = video ? lastVideo : lastAudio;
-                if (last is { } previous && (video ? timestamp <= previous : timestamp < previous))
-                {
-                    continue;
-                }
-
-                if (video)
-                {
-                    lastVideo = timestamp;
-                }
-                else
-                {
-                    lastAudio = timestamp;
-                }
-
-                expected.Add(new Delivered(kind, (uint)timestamp, tag.Body));
-            }
-        }
-
         return expected;
     }
 
-    /// <summary>Parses an FLV file.</summary>
-    /// <param name="data">The bytes.</param>
-    /// <returns>Its tags.</returns>
-    private static List<FlvTag> ReadFlv(byte[] data)
+    /// <summary>
+    /// Stretches the video timeline irregularly: every decode and presentation time t becomes t + 20 * floor(t / 300),
+    /// which is strictly increasing, so frame intervals vary between 100 and 120 ms and composition offsets stay valid.
+    /// Audio keeps its timing.
+    /// </summary>
+    /// <param name="tags">The fixture.</param>
+    /// <returns>The retimed fixture.</returns>
+    private static List<FlvTag> VariableFrameRate(IReadOnlyList<FlvTag> tags)
     {
-        Assert.True(data.Length >= 13 && data[0] == (byte)'F' && data[1] == (byte)'L' && data[2] == (byte)'V', "The transcoder output is not FLV.");
-        var tags = new List<FlvTag>();
-        var position = (int)BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(5)) + 4;
-        while (position + 11 <= data.Length)
+        static long Warp(long t) => t + (20 * (t / 300));
+        var result = new List<FlvTag>();
+        foreach (var tag in tags)
         {
-            var type = (byte)(data[position] & 0x1F);
-            var size = (data[position + 1] << 16) | (data[position + 2] << 8) | data[position + 3];
-            var timestamp = (uint)((data[position + 7] << 24) | (data[position + 4] << 16) | (data[position + 5] << 8) | data[position + 6]);
-            Assert.True(position + 11 + size + 4 <= data.Length, "Truncated FLV tag.");
-            tags.Add(new FlvTag(type, timestamp, data[(position + 11)..(position + 11 + size)]));
-            position += 11 + size + 4;
+            if (tag.Type != 9 || tag.Body.Length < 5 || tag.Body[1] != 1)
+            {
+                result.Add(tag.Type == 9 ? tag with { Timestamp = (uint)Warp(tag.Timestamp) } : tag);
+                continue;
+            }
+
+            var cto = ((tag.Body[2] << 24) | (tag.Body[3] << 16) | (tag.Body[4] << 8)) >> 8;
+            var dts = Warp(tag.Timestamp);
+            var warped = (int)(Warp(tag.Timestamp + cto) - dts);
+            var body = (byte[])tag.Body.Clone();
+            body[2] = (byte)(warped >> 16);
+            body[3] = (byte)(warped >> 8);
+            body[4] = (byte)warped;
+            result.Add(new FlvTag(9, (uint)dts, body));
         }
 
-        Assert.Equal(data.Length, position);
-        return tags;
+        return result;
     }
 
     /// <summary>Writes the playlist, segments and delivered message digest when <see cref="DumpVariable"/> is set.</summary>
@@ -208,7 +149,7 @@ public sealed class TranscodingHlsRegressionTests
     /// <param name="hls">The harness.</param>
     /// <param name="playlist">The playlist.</param>
     /// <param name="messages">Every delivered message.</param>
-    private static void Dump(string name, HlsHarness hls, HlsPlaylistSnapshot playlist, IReadOnlyList<Delivered> messages)
+    private static void Dump(string name, HlsHarness hls, HlsPlaylistSnapshot playlist, IReadOnlyList<ManagedHlsRun.Delivered> messages)
     {
         var root = Environment.GetEnvironmentVariable(DumpVariable);
         if (string.IsNullOrEmpty(root))
@@ -232,148 +173,5 @@ public sealed class TranscodingHlsRegressionTests
         }
 
         File.WriteAllText(Path.Combine(directory, "messages.txt"), digest.ToString());
-    }
-
-    /// <summary>A delivered message.</summary>
-    /// <param name="Kind">Its kind.</param>
-    /// <param name="Timestamp">Its timestamp.</param>
-    /// <param name="Payload">A copy of its payload.</param>
-    private sealed record Delivered(PublishedMessageKind Kind, uint Timestamp, byte[] Payload);
-
-    /// <summary>Records every message and forwards it to the media stage.</summary>
-    /// <param name="inner">The media stage.</param>
-    private sealed class RecordingStage(IPublishSessionHandler inner) : IPublishSessionHandler
-    {
-        /// <summary>Gets the messages, in delivery order.</summary>
-        public List<Delivered> Messages { get; } = [];
-
-        /// <inheritdoc />
-        public ValueTask OnSessionStartedAsync(PublisherSession session, CancellationToken cancellationToken) => inner.OnSessionStartedAsync(session, cancellationToken);
-
-        /// <inheritdoc />
-        public ValueTask OnMessageAsync(PublisherSession session, PublishedMessage message, CancellationToken cancellationToken)
-        {
-            lock (Messages)
-            {
-                Messages.Add(new Delivered(message.Kind, message.Timestamp, message.Payload.ToArray()));
-            }
-
-            return inner.OnMessageAsync(session, message, cancellationToken);
-        }
-
-        /// <inheritdoc />
-        public ValueTask OnSessionEndedAsync(PublisherSession session, CancellationToken cancellationToken) => inner.OnSessionEndedAsync(session, cancellationToken);
-    }
-
-    /// <summary>Starts processes whose output is copied as it is read.</summary>
-    /// <param name="inner">The real factory.</param>
-    private sealed class TeeProcessFactory(ITranscoderProcessFactory inner) : ITranscoderProcessFactory
-    {
-        /// <summary>Gets each process's output copy, in start order.</summary>
-        public ConcurrentQueue<MemoryStream> Outputs { get; } = new();
-
-        /// <inheritdoc />
-        public ITranscoderProcess Start(IReadOnlyList<string> arguments)
-        {
-            var copy = new MemoryStream();
-            Outputs.Enqueue(copy);
-            return new TeeProcess(inner.Start(arguments), copy);
-        }
-    }
-
-    /// <summary>A process whose output is copied.</summary>
-    /// <param name="inner">The real process.</param>
-    /// <param name="copy">Receives the output.</param>
-    private sealed class TeeProcess(ITranscoderProcess inner, MemoryStream copy) : ITranscoderProcess
-    {
-        /// <inheritdoc />
-        public Stream Input => inner.Input;
-
-        /// <inheritdoc />
-        public Stream Output { get; } = new TeeStream(inner.Output, copy);
-
-        /// <inheritdoc />
-        public Task<int> Exited => inner.Exited;
-
-        /// <inheritdoc />
-        public string Diagnostics => inner.Diagnostics;
-
-        /// <inheritdoc />
-        public void CompleteInput() => inner.CompleteInput();
-
-        /// <inheritdoc />
-        public void Kill() => inner.Kill();
-
-        /// <inheritdoc />
-        public ValueTask DisposeAsync() => inner.DisposeAsync();
-    }
-
-    /// <summary>A read-only stream that copies what is read.</summary>
-    /// <param name="inner">The source.</param>
-    /// <param name="copy">Receives the bytes.</param>
-    private sealed class TeeStream(Stream inner, MemoryStream copy) : Stream
-    {
-        /// <inheritdoc />
-        public override bool CanRead => true;
-
-        /// <inheritdoc />
-        public override bool CanSeek => false;
-
-        /// <inheritdoc />
-        public override bool CanWrite => false;
-
-        /// <inheritdoc />
-        public override long Length => throw new NotSupportedException();
-
-        /// <inheritdoc />
-        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
-
-        /// <inheritdoc />
-        public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
-
-        /// <inheritdoc />
-        public override int Read(Span<byte> buffer)
-        {
-            var read = inner.Read(buffer);
-            copy.Write(buffer[..read]);
-            return read;
-        }
-
-        /// <inheritdoc />
-        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
-            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
-
-        /// <inheritdoc />
-        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-        {
-            var read = await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-            copy.Write(buffer.Span[..read]);
-            return read;
-        }
-
-        /// <inheritdoc />
-        public override void Flush()
-        {
-        }
-
-        /// <inheritdoc />
-        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-
-        /// <inheritdoc />
-        public override void SetLength(long value) => throw new NotSupportedException();
-
-        /// <inheritdoc />
-        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-
-        /// <inheritdoc />
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                inner.Dispose();
-            }
-
-            base.Dispose(disposing);
-        }
     }
 }

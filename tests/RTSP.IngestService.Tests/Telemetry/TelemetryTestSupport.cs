@@ -193,7 +193,7 @@ internal static class TelemetryTestSupport
     {
         string[] track = ["video", "audio"];
         string[] mode = ["unicast", "multicast"];
-        string[] stage = ["decoder", "encoder", "process"];
+        string[] stage = ["decoder", "encoder", "pipeline"];
         string[] resource = ["playlist", "initialization", "segment", "other"];
         string[] eventType = ["published", "media_described", "ended", "playlist_withdrawn", "drained"];
         static IReadOnlyDictionary<string, string[]> None() => new Dictionary<string, string[]>();
@@ -222,7 +222,8 @@ internal static class TelemetryTestSupport
             ["media.timestamp_discontinuities"] = Tags(("track", track), ("kind", ["regression", "jump"])),
             ["media.sessions.active"] = None(),
             ["transcoding.sessions.active"] = None(),
-            ["transcoding.process.starts"] = Tags(("reason", ["initial", "configuration", "discontinuity", "timeline"])),
+            ["transcoding.video.streams"] = Tags(("reason", ["initial", "configuration", "discontinuity"])),
+            ["transcoding.video.decoder.recreations"] = None(),
             ["transcoding.initialization.failures"] = Tags(("stage", stage)),
             ["transcoding.failures"] = Tags(("stage", stage)),
             ["transcoding.rejections"] = Tags(("reason", ["capacity", "disabled", "unsupported_codec", "codec_not_accepted", "resolution_limit", "frame_rate_limit"])),

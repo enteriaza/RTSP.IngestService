@@ -1,6 +1,6 @@
 // Fixed-matrix downmix of any decoder channel layout to stereo, selected by channel position rather than by index, so
 // the bitstream channel order (for AAC: C L R ... LFE) cannot cause a swap. Coefficients follow ITU-R BS.775 and the
-// FFmpeg/libswresample defaults that the FFmpeg transcoder uses today:
+// FFmpeg/libswresample defaults, so output matches what the service produced when it transcoded with FFmpeg:
 //   front left / right            -> same side, 1
 //   front centre                  -> both sides, 1/sqrt(2)   (-3 dB; a mono source is a lone centre channel)
 //   front left / right wide       -> same side, 1

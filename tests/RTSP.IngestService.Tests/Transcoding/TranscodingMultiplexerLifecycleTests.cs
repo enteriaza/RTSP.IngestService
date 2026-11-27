@@ -1,4 +1,4 @@
-// Lifecycle tests of the media multiplexer inside a transcoding session, with the echoing fake transcoder: a
+// Lifecycle tests of the media multiplexer inside a transcoding session, with the managed video and audio stages: a
 // downstream failure faults only that session, and a downstream stage that stops accepting media cannot hold a kill
 // or an expired drain, with every buffer and budget byte released either way.
 
@@ -27,12 +27,14 @@ public sealed class TranscodingMultiplexerLifecycleTests
         await Assert.ThrowsAsync<TranscodingFailedException>(() => harness.SendTagsAsync(session, tags.Skip(tags.Count / 2)));
         await harness.EndAsync(session, PublishEndReason.HandlerFailed);
 
-        Assert.True(Assert.Single(harness.Factory.Started).Killed);
         Assert.Equal("ended", harness.Downstream.Events.Last().Kind);
         AssertReleased(harness);
     }
 
-    /// <summary>A kill ends the session while the downstream stage is blocked, discarding what the multiplexer holds.</summary>
+    /// <summary>
+    /// A kill ends the session while the downstream stage is blocked, discarding what the multiplexer holds, and is not
+    /// reported as a failure.
+    /// </summary>
     /// <returns>A task that completes when the test is finished.</returns>
     [Fact]
     public async Task Kill_WithABlockedDownstream_Completes()
@@ -46,6 +48,7 @@ public sealed class TranscodingMultiplexerLifecycleTests
         await harness.EndAsync(session, PublishEndReason.ConnectionError);
 
         Assert.Empty(harness.Delivered(session, PublishedMessageKind.Video));
+        Assert.DoesNotContain(10001, harness.EventIds());
         Assert.Equal("ended", harness.Downstream.Events.Last().Kind);
         AssertReleased(harness);
     }
@@ -63,7 +66,7 @@ public sealed class TranscodingMultiplexerLifecycleTests
 
         await harness.EndAsync(session);
 
-        Assert.True(Assert.Single(harness.Factory.Started).Disposed);
+        Assert.Contains(10002, harness.EventIds());
         Assert.Equal("ended", harness.Downstream.Events.Last().Kind);
         AssertReleased(harness);
     }

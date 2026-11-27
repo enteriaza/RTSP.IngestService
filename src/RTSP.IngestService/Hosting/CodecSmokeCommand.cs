@@ -5,15 +5,23 @@
 // managed decoder, checks sample counts and levels (exit code 1 on a mismatch), and prints representative samples
 // and digests for comparing JIT and AOT builds. The "h264" form decodes an H.264 Annex B elementary stream with the
 // managed video decoder, writes the frames as raw planar 4:2:0, decodes the stream a second time after a reset, and
-// checks frame counts, geometry, determinism and that every frame and pooled buffer is released. It does not build the
-// host or read configuration, and it prints only stream properties, counts, levels, sample values and digests.
+// checks frame counts, geometry, determinism and that every frame and pooled buffer is released. The "h264-encode"
+// form decodes an Annex B stream, converts each frame to BT.709 4:2:0 (unspecified colour assumed BT.709, HDR tone
+// mapped), encodes it with the managed encoder (constrained VBR, 2 s IDR cadence at 25 frames per second, Annex B),
+// decodes its own output with the managed decoder and checks that every frame equals the encoder's reconstruction,
+// that the IDR cadence holds, that the stream continued after Reset decodes as one stream, that a second encoder
+// produces a byte-identical stream and that nothing is left allocated.
+// It does not build the host or read configuration, and it prints only stream properties, counts, levels, sample
+// values and digests.
 
 using RTSP.IngestService.Media.Codecs;
 using RTSP.IngestService.Media.Codecs.Audio;
 using RTSP.IngestService.Media.Codecs.Audio.Aac;
 using RTSP.IngestService.Media.Codecs.Audio.Aac.Encoder;
 using RTSP.IngestService.Media.Codecs.Audio.Processing;
+using RTSP.IngestService.Media.Codecs.Video.Color;
 using RTSP.IngestService.Media.Codecs.Video.H264;
+using RTSP.IngestService.Media.Codecs.Video.H264.Encoder;
 
 namespace RTSP.IngestService.Hosting;
 
@@ -29,6 +37,12 @@ public static class CodecSmokeCommand
     /// <summary>The command name.</summary>
     public const string CommandName = "codec-smoke";
 
+    /// <summary>The frame rate of the h264-encode timeline.</summary>
+    private const int FramesPerSecond = 25;
+
+    /// <summary>The frame duration of the h264-encode timeline, in 1/90000 s.</summary>
+    private const long FrameTicks = 90000 / FramesPerSecond;
+
     /// <summary>The largest accepted input file.</summary>
     private const long MaxInputBytes = 64L * 1024 * 1024;
 
@@ -38,9 +52,11 @@ public static class CodecSmokeCommand
         Usage:
           RTSP.IngestService codec-smoke <input.aac> <output.aac>
           RTSP.IngestService codec-smoke h264 <input.h264> <output.yuv>
+          RTSP.IngestService codec-smoke h264-encode <input.h264> <output.h264>
         Transcodes an ADTS AAC-LC file with the managed decoder, downmixer, resampler and encoder to 48 kHz stereo
-        AAC-LC (ADTS), or decodes an H.264 Annex B stream with the managed decoder to raw planar 4:2:0 frames.
-        Diagnostic only; the service's transcoding does not use these paths.
+        AAC-LC (ADTS), decodes an H.264 Annex B stream with the managed decoder to raw planar 4:2:0 frames, or
+        re-encodes one with the managed decoder, colour converter and encoder to canonical H.264 High (Annex B).
+        Diagnostic only: the same managed codecs the service's transcoding uses, run on a file outside a publish.
         """;
 
     /// <summary>Runs the command if <paramref name="args"/> selects it.</summary>
@@ -64,6 +80,12 @@ public static class CodecSmokeCommand
         if (args.Length == 4 && string.Equals(args[1], "h264", StringComparison.OrdinalIgnoreCase))
         {
             exitCode = RunH264(args[2], args[3], output, error);
+            return true;
+        }
+
+        if (args.Length == 4 && string.Equals(args[1], "h264-encode", StringComparison.OrdinalIgnoreCase))
+        {
+            exitCode = RunH264Encode(args[2], args[3], output, error);
             return true;
         }
 
@@ -256,6 +278,199 @@ public static class CodecSmokeCommand
         }
     }
 
+    /// <summary>Re-encodes an H.264 Annex B file with the managed decoder, colour converter and encoder and verifies the output.</summary>
+    /// <param name="inputPath">The elementary stream.</param>
+    /// <param name="outputPath">Receives the first encode as an Annex B stream.</param>
+    /// <param name="output">Standard output.</param>
+    /// <param name="error">Standard error.</param>
+    /// <returns>The exit code.</returns>
+    private static int RunH264Encode(string inputPath, string outputPath, TextWriter output, TextWriter error)
+    {
+        try
+        {
+            var info = new FileInfo(inputPath);
+            if (!info.Exists || info.Length > MaxInputBytes)
+            {
+                error.WriteLine($"The input must be an existing file of at most {MaxInputBytes} bytes.");
+                return ExitCodes.UsageError;
+            }
+
+            var units = SplitAccessUnits(File.ReadAllBytes(info.FullName));
+            using var decoder = new H264Decoder();
+            decoder.Configure(H264DecoderConfiguration.AnnexB);
+            var failures = new List<string>();
+            var source = DecodeH264(decoder, units, null, failures);
+            if (source.Frames == 0)
+            {
+                error.WriteLine("codec-smoke failed: the input decodes to no frames.");
+                return ExitCodes.Failure;
+            }
+
+            var options = new H264EncoderOptions
+            {
+                Width = source.Width,
+                Height = source.Height,
+                KeyframeInterval = TimeSpan.FromSeconds(2),
+                RateControl = H264RateControlMode.AverageBitrate,
+                BaseQp = 26,
+                TargetBitrateKilobits = 1000,
+                MaxBitrateKilobits = 2000,
+                MaxFrameRate = 25,
+                Format = H264OutputFormat.AnnexB,
+            };
+            using var encoder = new H264Encoder(options);
+            decoder.Reset();
+            var first = EncodeH264(decoder, encoder, units);
+            File.WriteAllBytes(outputPath, first.Stream);
+            decoder.Reset();
+            encoder.Reset();
+            var reset = EncodeH264(decoder, encoder, units);
+            decoder.Reset();
+            H264EncodeResult fresh;
+            using (var other = new H264Encoder(options))
+            {
+                fresh = EncodeH264(decoder, other, units);
+            }
+
+            using var check = new H264Decoder();
+            check.Configure(H264DecoderConfiguration.AnnexB);
+            var decoded = new List<(ulong Digest, bool IsKeyframe)>();
+            var frames = new List<VideoFrame>();
+            var encodedUnits = SplitAccessUnits([.. first.Stream, .. reset.Stream]);
+            for (var i = 0; i <= encodedUnits.Count; i++)
+            {
+                if (i < encodedUnits.Count)
+                {
+                    check.Decode(new EncodedPacket(encodedUnits[i], i * FrameTicks, H264Encoder.TimeBase), frames);
+                }
+                else
+                {
+                    check.Drain(frames);
+                }
+
+                foreach (var frame in frames)
+                {
+                    using (frame)
+                    {
+                        decoded.Add((FrameDigest(frame), frame.IsKeyframe));
+                    }
+                }
+
+                frames.Clear();
+            }
+
+            Check(first.Reconstructions.Count == source.Frames, $"encoded {first.Reconstructions.Count} frames of {source.Frames} decoded");
+            Check(decoded.Count == first.Reconstructions.Count + reset.Reconstructions.Count, $"the output and its continuation after Reset decode to {decoded.Count} frames, expected {first.Reconstructions.Count + reset.Reconstructions.Count}");
+            Check(decoded.Select(static d => d.Digest).SequenceEqual(first.Reconstructions.Concat(reset.Reconstructions)), "the decoded output differs from the encoder's reconstruction");
+            Check(decoded.Select(static d => d.IsKeyframe).SequenceEqual(first.Keyframes.Concat(reset.Keyframes)), "the decoded keyframes differ from the encoded IDR pictures");
+            var streamFrames = first.Keyframes.Count;
+            Check(first.Keyframes.Concat(reset.Keyframes).Select((k, n) => k == (n % streamFrames % (2 * FramesPerSecond) == 0)).All(static ok => ok), "IDR pictures are not exactly every 2 seconds from each stream start");
+            Check(first.Stream.AsSpan().SequenceEqual(fresh.Stream) && first.Reconstructions.SequenceEqual(fresh.Reconstructions), "a second encoder with the same options produced a different stream");
+            Check(check.SkippedPictures == 0, $"{check.SkippedPictures} output pictures were skipped");
+            Check(decoder.OutstandingFrames == 0 && decoder.AllocatedPictures == 0 && check.OutstandingFrames == 0, "frames or pooled pictures were not released");
+
+            var seconds = first.Reconstructions.Count / (double)FramesPerSecond;
+            output.WriteLine($"Input: H.264 Annex B, {units.Count} access units, {source.Frames} frames, {source.Width}x{source.Height}");
+            output.WriteLine($"Output: H.264 High level {encoder.LevelIdc / 10.0:F1} Annex B, {first.Reconstructions.Count} access units, {first.Keyframes.Count(static k => k)} IDR, {first.Stream.Length} bytes, {first.Stream.Length * 8 / seconds / 1000:F0} kbit/s average");
+            output.WriteLine($"Rate control: QP {first.MinQp} to {first.MaxQp}, {first.Overflows} VBV overflows, {first.PcmMacroblocks} I_PCM macroblocks");
+            output.WriteLine($"Digest: output {Fnv1a(first.Stream):x16}, reconstruction {first.Reconstructions.Aggregate(14695981039346656037UL, static (h, d) => (h ^ d) * 1099511628211UL):x16}");
+            foreach (var failure in failures)
+            {
+                error.WriteLine($"codec-smoke check failed: {failure}");
+            }
+
+            return failures.Count == 0 ? ExitCodes.Success : ExitCodes.Failure;
+
+            void Check(bool condition, string message)
+            {
+                if (!condition)
+                {
+                    failures.Add(message);
+                }
+            }
+        }
+        catch (Exception exception) when (exception is CodecException or IOException or UnauthorizedAccessException)
+        {
+            error.WriteLine($"codec-smoke failed: {exception.Message}");
+            return ExitCodes.Failure;
+        }
+    }
+
+    /// <summary>Decodes access units, converts each frame to canonical BT.709 and encodes it at 25 frames per second.</summary>
+    /// <param name="decoder">The configured decoder, at the start of a stream.</param>
+    /// <param name="encoder">The encoder, at the start of a stream.</param>
+    /// <param name="units">The access units.</param>
+    /// <returns>The encoded stream and reconstruction digests.</returns>
+    private static H264EncodeResult EncodeH264(H264Decoder decoder, H264Encoder encoder, List<byte[]> units)
+    {
+        var conversion = new VideoColorConversionOptions { Unspecified = UnspecifiedColorPolicy.AssumeBt709, Hdr = HdrPolicy.ToneMap };
+        var result = new H264EncodeResult();
+        var frames = new List<VideoFrame>();
+        var encoded = new List<H264EncodedAccessUnit>();
+        using var stream = new MemoryStream();
+        for (var i = 0; i <= units.Count; i++)
+        {
+            if (i < units.Count)
+            {
+                decoder.Decode(new EncodedPacket(units[i], i, new MediaTimeBase(1, 25)), frames);
+            }
+            else
+            {
+                decoder.Drain(frames);
+            }
+
+            foreach (var frame in frames)
+            {
+                using (frame)
+                {
+                    var timestamp = result.Reconstructions.Count * FrameTicks;
+                    using var canonical = new VideoFrame(frame.Width, frame.Height, timestamp, H264Encoder.TimeBase, VideoColorInfo.Bt709);
+                    VideoColorConverter.Convert(VideoImage.FromFrame(frame), canonical, conversion);
+                    encoder.Encode(canonical, encoded);
+                    foreach (var unit in encoded)
+                    {
+                        using (unit)
+                        {
+                            stream.Write(unit.Data.Span);
+                            result.Keyframes.Add(unit.IsKeyframe);
+                            result.MinQp = Math.Min(result.MinQp, unit.Statistics.Qp);
+                            result.MaxQp = Math.Max(result.MaxQp, unit.Statistics.Qp);
+                            result.Overflows += unit.Statistics.VbvOverflow ? 1 : 0;
+                            result.PcmMacroblocks += unit.Statistics.PcmMacroblocks;
+                        }
+                    }
+
+                    encoded.Clear();
+                    using var reconstruction = new VideoFrame(frame.Width, frame.Height, timestamp, H264Encoder.TimeBase, VideoColorInfo.Bt709);
+                    encoder.CopyReconstruction(reconstruction);
+                    result.Reconstructions.Add(FrameDigest(reconstruction));
+                }
+            }
+
+            frames.Clear();
+        }
+
+        result.Stream = stream.ToArray();
+        return result;
+    }
+
+    /// <summary>Returns the FNV-1a digest of a frame's planes.</summary>
+    /// <param name="frame">The frame.</param>
+    /// <returns>The digest.</returns>
+    private static ulong FrameDigest(VideoFrame frame)
+    {
+        var hash = 14695981039346656037UL;
+        for (var plane = 0; plane < 3; plane++)
+        {
+            foreach (var value in frame.GetPlane(plane))
+            {
+                hash = (hash ^ value) * 1099511628211UL;
+            }
+        }
+
+        return hash;
+    }
+
     /// <summary>Decodes access units and drains, checking each frame and disposing it.</summary>
     /// <param name="decoder">The configured decoder.</param>
     /// <param name="units">The access units.</param>
@@ -401,6 +616,32 @@ public static class CodecSmokeCommand
         /// <summary>Gets or sets the FNV-1a digest of all frames.</summary>
         public ulong Digest { get; set; }
     }
+
+    /// <summary>The outcome of one h264-encode pass.</summary>
+    private sealed class H264EncodeResult
+    {
+        /// <summary>Gets or sets the Annex B stream.</summary>
+        public byte[] Stream { get; set; } = [];
+
+        /// <summary>Gets the FNV-1a digest of each picture's reconstruction.</summary>
+        public List<ulong> Reconstructions { get; } = [];
+
+        /// <summary>Gets whether each access unit is an IDR picture.</summary>
+        public List<bool> Keyframes { get; } = [];
+
+        /// <summary>Gets or sets the lowest picture QP.</summary>
+        public int MinQp { get; set; } = int.MaxValue;
+
+        /// <summary>Gets or sets the highest picture QP.</summary>
+        public int MaxQp { get; set; }
+
+        /// <summary>Gets or sets the number of pictures that overflowed the VBV buffer.</summary>
+        public int Overflows { get; set; }
+
+        /// <summary>Gets or sets the I_PCM macroblock count.</summary>
+        public int PcmMacroblocks { get; set; }
+    }
+
     /// <summary>The 64-bit FNV-1a hash, a stable digest that needs no cryptographic library.</summary>
     /// <param name="data">The bytes.</param>
     /// <returns>The hash.</returns>
