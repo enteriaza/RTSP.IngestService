@@ -169,8 +169,61 @@ internal static class VideoColorConverter
         }
     }
 
+    /// <summary>
+    /// The first linearisation step (see <see cref="Pipeline.Light"/>) of 8-bit Y'CbCr: of R' by Y' and Cr code, and of B'
+    /// by Y' and Cb code, each entry computed from its codes by the per-sample path's own functions. Built on first use
+    /// and shared; one per transfer function, luma coefficients, component and range, so the set is fixed (at most 84
+    /// tables of 512 KiB).
+    /// </summary>
+    private static class LightTables
+    {
+        /// <summary>The tables, by <see cref="Index"/>.</summary>
+        private static readonly double[]?[] Tables = new double[]?[7 * 3 * 2 * 2];
+
+        /// <summary>Gets the table of a component.</summary>
+        /// <param name="color">The resolved colour of an 8-bit Y'CbCr source.</param>
+        /// <param name="blue">B' by Y' and Cb rather than R' by Y' and Cr.</param>
+        /// <returns>The table, indexed by (Y' code &lt;&lt; 8) | chroma code.</returns>
+        public static double[] Get(VideoColorInfo color, bool blue)
+        {
+            var index = Index(color, blue);
+            return Volatile.Read(ref Tables[index]) ?? Interlocked.CompareExchange(ref Tables[index], Build(color, blue), null) ?? Tables[index]!;
+        }
+
+        /// <summary>Returns the slot of a table; transfers and matrices with the same functions share one.</summary>
+        /// <param name="color">The colour.</param>
+        /// <param name="blue">The component.</param>
+        /// <returns>The slot.</returns>
+        private static int Index(VideoColorInfo color, bool blue)
+        {
+            var transfer = color.Transfer switch { 4 => 1, 5 => 2, 8 => 3, 13 => 4, 16 => 5, 18 => 6, _ => 0 };
+            var matrix = color.Matrix switch { 1 => 0, 9 => 2, _ => 1 };
+            return (((((transfer * 3) + matrix) * 2) + (blue ? 1 : 0)) * 2) + (color.FullRange ? 1 : 0);
+        }
+
+        /// <summary>Builds a table.</summary>
+        /// <param name="color">The colour.</param>
+        /// <param name="blue">The component.</param>
+        /// <returns>The table.</returns>
+        private static double[] Build(VideoColorInfo color, bool blue)
+        {
+            var (kr, kb) = ColorPrimaries.LumaCoefficients(color.Matrix);
+            var table = new double[256 * 256];
+            for (var luma = 0; luma < 256; luma++)
+            {
+                for (var chroma = 0; chroma < 256; chroma++)
+                {
+                    var (r, _, b) = Pipeline.FromYCbCr(8, color.FullRange, kr, kb, luma, blue ? chroma : 0, blue ? 0 : chroma);
+                    table[(luma << 8) | chroma] = Pipeline.Light(color.Transfer, blue ? b : r);
+                }
+            }
+
+            return table;
+        }
+    }
+
     /// <summary>The per-image conversion state.</summary>
-    private sealed class Pipeline
+    internal sealed class Pipeline
     {
         /// <summary>The source.</summary>
         private readonly VideoImage _source;
@@ -199,10 +252,14 @@ internal static class VideoColorConverter
         /// <summary>The PQ value of zero light.</summary>
         private readonly double _pqBlack;
 
+        /// <summary>The <see cref="LightTables"/> of R' and B' for 8-bit Y'CbCr that is linearised, else null.</summary>
+        private readonly double[]? _lightR, _lightB;
+
         /// <summary>Initializes a new instance of the <see cref="Pipeline"/> class.</summary>
         /// <param name="source">The source.</param>
         /// <param name="color">The resolved colour.</param>
-        public Pipeline(VideoImage source, VideoColorInfo color)
+        /// <param name="lightTables">Whether 8-bit Y'CbCr may use the <see cref="LightTables"/>; false computes every sample.</param>
+        public Pipeline(VideoImage source, VideoColorInfo color, bool lightTables = true)
         {
             _source = source;
             _color = color;
@@ -220,7 +277,56 @@ internal static class VideoColorConverter
             _pqPeak = TransferFunctions.PqInverse(_peak);
             _maxLum = (TransferFunctions.PqInverse(SdrPeakNits) - _pqBlack) / (_pqPeak - _pqBlack);
             _knee = (1.5 * _maxLum) - 0.5;
+            if (lightTables && _linear && source.BitDepth == 8 && source.Layout != VideoImageLayout.Rgb)
+            {
+                _lightR = LightTables.Get(color, blue: false);
+                _lightB = LightTables.Get(color, blue: true);
+            }
         }
+
+        /// <summary>
+        /// Normalises Y'CbCr codes to non-linear R'G'B'; R' depends only on Y' and Cr, B' only on Y' and Cb. Must stay
+        /// operation for operation the Y'CbCr branch of <see cref="Pixel"/>, which keeps its own copy because the call
+        /// slows the unlinearised path.
+        /// </summary>
+        /// <param name="depth">The bit depth.</param>
+        /// <param name="fullRange">Whether the codes are full range.</param>
+        /// <param name="kr">The luma coefficient Kr.</param>
+        /// <param name="kb">The luma coefficient Kb.</param>
+        /// <param name="a">Y'.</param>
+        /// <param name="b">Cb.</param>
+        /// <param name="c">Cr.</param>
+        /// <returns>R', G' and B'.</returns>
+        internal static (double R, double G, double B) FromYCbCr(int depth, bool fullRange, double kr, double kb, int a, int b, int c)
+        {
+            var scale = (double)(1 << (depth - 8));
+            var max = (double)((1 << depth) - 1);
+            double yn, cbn, crn;
+            if (fullRange)
+            {
+                var mid = (double)(1 << (depth - 1));
+                (yn, cbn, crn) = (a / max, (b - mid) / max, (c - mid) / max);
+            }
+            else
+            {
+                (yn, cbn, crn) = ((a - (16 * scale)) / (219 * scale), (b - (128 * scale)) / (224 * scale), (c - (128 * scale)) / (224 * scale));
+            }
+
+            var r = yn + (2 * (1 - kr) * crn);
+            var bl = yn + (2 * (1 - kb) * cbn);
+            return (r, (yn - (kr * r) - (kb * bl)) / (1 - kr - kb), bl);
+        }
+
+        /// <summary>The first linearisation step of one component: the SDR EOTF, the PQ EOTF or the HLG inverse OETF.</summary>
+        /// <param name="transfer">The transfer code.</param>
+        /// <param name="v">The non-linear value.</param>
+        /// <returns>Relative display light (SDR), cd/m2 (PQ) or relative scene light (HLG).</returns>
+        internal static double Light(int transfer, double v) => transfer switch
+        {
+            16 => TransferFunctions.PqEotf(v),
+            18 => TransferFunctions.HlgInverseOetf(v),
+            _ => TransferFunctions.SdrEotf(transfer, v),
+        };
 
         /// <summary>Converts into the destination.</summary>
         /// <param name="destination">The destination.</param>
@@ -274,7 +380,7 @@ internal static class VideoColorConverter
         /// <param name="b">Cb or G'.</param>
         /// <param name="c">Cr or B'.</param>
         /// <returns>Y', Cb and Cr.</returns>
-        private (double Y, double Cb, double Cr) Pixel(int a, int b, int c)
+        internal (double Y, double Cb, double Cr) Pixel(int a, int b, int c)
         {
             var depth = _source.BitDepth;
             var scale = (double)(1 << (depth - 8));
@@ -304,7 +410,7 @@ internal static class VideoColorConverter
 
             if (_linear)
             {
-                (r, g, bl) = Linearize(r, g, bl);
+                (r, g, bl) = Linearize(a, b, c, r, g, bl);
                 if (_gamut is { } m)
                 {
                     (r, g, bl) = ((m[0] * r) + (m[1] * g) + (m[2] * bl), (m[3] * r) + (m[4] * g) + (m[5] * bl), (m[6] * r) + (m[7] * g) + (m[8] * bl));
@@ -320,26 +426,33 @@ internal static class VideoColorConverter
         }
 
         /// <summary>Returns relative linear light (1 = the SDR peak), tone mapped for HDR.</summary>
+        /// <param name="a">Y' or R' code.</param>
+        /// <param name="b">Cb or G' code.</param>
+        /// <param name="c">Cr or B' code.</param>
         /// <param name="r">R'.</param>
         /// <param name="g">G'.</param>
-        /// <param name="b">B'.</param>
+        /// <param name="bl">B'.</param>
         /// <returns>Linear R, G, B.</returns>
-        private (double R, double G, double B) Linearize(double r, double g, double b)
+        private (double R, double G, double B) Linearize(int a, int b, int c, double r, double g, double bl)
         {
             var transfer = _color.Transfer;
-            if (!TransferFunctions.IsHdr(transfer))
-            {
-                return (TransferFunctions.SdrEotf(transfer, r), TransferFunctions.SdrEotf(transfer, g), TransferFunctions.SdrEotf(transfer, b));
-            }
-
             double lr, lg, lb;
-            if (transfer == 16)
+            if (_lightR is { } lightR)
             {
-                (lr, lg, lb) = (TransferFunctions.PqEotf(r), TransferFunctions.PqEotf(g), TransferFunctions.PqEotf(b));
+                (lr, lg, lb) = (lightR[(a << 8) | c], Light(transfer, g), _lightB![(a << 8) | b]);
             }
             else
             {
-                (lr, lg, lb) = (TransferFunctions.HlgInverseOetf(r), TransferFunctions.HlgInverseOetf(g), TransferFunctions.HlgInverseOetf(b));
+                (lr, lg, lb) = (Light(transfer, r), Light(transfer, g), Light(transfer, bl));
+            }
+
+            if (!TransferFunctions.IsHdr(transfer))
+            {
+                return (lr, lg, lb);
+            }
+
+            if (transfer == 18)
+            {
                 var ys = (0.2627 * lr) + (0.6780 * lg) + (0.0593 * lb);
                 var gain = ys > 0 ? _peak * DeterministicMath.Pow(ys, _hlgGamma - 1) : 0;
                 (lr, lg, lb) = (lr * gain, lg * gain, lb * gain);

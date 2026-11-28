@@ -52,14 +52,22 @@ internal static class DeterministicMath
             e++;
         }
 
-        // ln m = 2 atanh s, s = (m - 1) / (m + 1), |s| <= 0.1716.
+        // ln m = 2 atanh s, s = (m - 1) / (m + 1), |s| <= 0.1716: Horner over 1/k for k = 23, 21, ..., 3. Written out
+        // because the loop is several times slower; each step's operations and their order define the result bit for
+        // bit, and each constant 1.0 / k is the correctly rounded quotient the loop computed.
         var s = (m - 1) / (m + 1);
         var s2 = s * s;
-        var sum = 0.0;
-        for (var k = 23; k >= 3; k -= 2)
-        {
-            sum = (sum * s2) + (1.0 / k);
-        }
+        var sum = 1.0 / 23;
+        sum = (sum * s2) + (1.0 / 21);
+        sum = (sum * s2) + (1.0 / 19);
+        sum = (sum * s2) + (1.0 / 17);
+        sum = (sum * s2) + (1.0 / 15);
+        sum = (sum * s2) + (1.0 / 13);
+        sum = (sum * s2) + (1.0 / 11);
+        sum = (sum * s2) + (1.0 / 9);
+        sum = (sum * s2) + (1.0 / 7);
+        sum = (sum * s2) + (1.0 / 5);
+        sum = (sum * s2) + (1.0 / 3);
 
         var lnM = 2 * (s + (s * s2 * sum));
         return (e * Ln2Hi) + ((e * Ln2Lo) + lnM);
@@ -88,12 +96,25 @@ internal static class DeterministicMath
         var k = Math.Floor((x * InvLn2) + 0.5);
         var r = (x - (k * Ln2Hi)) - (k * Ln2Lo);
 
-        // |r| <= 0.347: Taylor series to r^17 / 17!.
-        var sum = 1.0;
-        for (var n = 17; n >= 1; n--)
-        {
-            sum = 1 + (sum * r / n);
-        }
+        // |r| <= 0.347: Taylor series to r^17 / 17!, sum = 1 + (sum * r / n) for n = 17 down to 1. Written out because
+        // the loop is several times slower; each step's operations and their order define the result bit for bit.
+        var sum = 1 + (r / 17);
+        sum = 1 + (sum * r / 16);
+        sum = 1 + (sum * r / 15);
+        sum = 1 + (sum * r / 14);
+        sum = 1 + (sum * r / 13);
+        sum = 1 + (sum * r / 12);
+        sum = 1 + (sum * r / 11);
+        sum = 1 + (sum * r / 10);
+        sum = 1 + (sum * r / 9);
+        sum = 1 + (sum * r / 8);
+        sum = 1 + (sum * r / 7);
+        sum = 1 + (sum * r / 6);
+        sum = 1 + (sum * r / 5);
+        sum = 1 + (sum * r / 4);
+        sum = 1 + (sum * r / 3);
+        sum = 1 + (sum * r / 2);
+        sum = 1 + (sum * r / 1);
 
         return Scale(sum, (int)k);
     }
