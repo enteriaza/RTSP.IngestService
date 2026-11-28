@@ -140,9 +140,16 @@ internal sealed class H264Encoder : IDisposable
     /// <summary>Gets whether the encoder is faulted.</summary>
     public bool IsFaulted => _faulted;
 
-    /// <summary>Gets the bytes of reconstruction and motion-search picture memory the encoder holds.</summary>
+    /// <summary>Gets the bytes of reconstruction, motion-search, macroblock-record and (with test helpers) wavefront picture memory the encoder holds at most.</summary>
     public long PictureBytes =>
-        ((_options.MaxReferenceFrames + 1) * H264EncoderPicture.ByteCount(_layout.WidthInMbs, _layout.HeightInMbs)) + H264HalfSamplePlanes.ByteCount(_layout.WidthInMbs * 16, _layout.HeightInMbs * 16);
+        ((_options.MaxReferenceFrames + 1) * H264EncoderPicture.ByteCount(_layout.WidthInMbs, _layout.HeightInMbs)) + H264HalfSamplePlanes.ByteCount(_layout.WidthInMbs * 16, _layout.HeightInMbs * 16)
+        + H264PictureEncoder.ByteCount(_layout, MaxAccessUnitBytes, _hooks?.Wavefront?.Count ?? 0);
+
+    /// <summary>Gets the pass durations of the last coded attempt (tests and benchmarks).</summary>
+    internal H264PictureTimings LastTimings => _coder.LastTimings;
+
+    /// <summary>Gets the wavefront state of the last coded attempt, or null without test helpers.</summary>
+    internal H264WavefrontJob? Wavefront => _coder.Wavefront;
 
     /// <summary>Gets the most bytes the RBSP buffer may grow to.</summary>
     public int MaxAccessUnitBytes { get; private set; }
@@ -327,7 +334,7 @@ internal sealed class H264Encoder : IDisposable
 
         _options = options;
         _layout = layout;
-        _coder = new H264PictureEncoder(layout, options.SearchRange);
+        _coder = new H264PictureEncoder(layout, options.SearchRange, MaxAccessUnitBytes, _hooks?.Wavefront);
         _rate = new H264RateControl(options);
         _slices = new int[options.SlicesPerPicture + 1];
         for (var s = 0; s <= options.SlicesPerPicture; s++)

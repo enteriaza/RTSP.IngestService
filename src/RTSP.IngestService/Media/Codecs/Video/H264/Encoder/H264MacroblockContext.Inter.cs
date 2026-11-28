@@ -9,7 +9,7 @@ using System.Runtime.Intrinsics;
 namespace RTSP.IngestService.Media.Codecs.Video.H264.Encoder;
 
 /// <summary>Inter mode decision and motion estimation.</summary>
-internal sealed partial class H264PictureEncoder
+internal sealed partial class H264MacroblockContext
 {
     /// <summary>Whether the chosen inter macroblock uses four 8x8 partitions.</summary>
     private bool _split;
@@ -20,7 +20,7 @@ internal sealed partial class H264PictureEncoder
     /// <summary>Scratch for one predicted block.</summary>
     private readonly byte[] _block = new byte[256];
 
-    /// <summary>The half-sample planes of the first reference, for quarter-sample refinement.</summary>
+    /// <summary>The half-sample planes of the first reference, for quarter-sample refinement; owned and prepared by the picture encoder.</summary>
     private readonly H264HalfSamplePlanes _halfSamples;
 
     /// <summary>A neighbouring partition's motion for prediction.</summary>
@@ -52,8 +52,6 @@ internal sealed partial class H264PictureEncoder
                 cost = LumaSatd(_predY);
                 return MbChoice.Skip;
             }
-
-            _halfSamples.Prepare(ref0);
         }
 
         var best = int.MaxValue;

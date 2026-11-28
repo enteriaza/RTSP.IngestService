@@ -2,6 +2,8 @@
 // its buffer (allocated at exact sizes, so the bound is the memory held) up to a fixed bound and can rewind to an earlier position, which the encoder uses to replace a
 // macroblock that exceeded the size limit by I_PCM and to retry a picture at a higher QP.
 
+using System.Buffers.Binary;
+
 namespace RTSP.IngestService.Media.Codecs.Video.H264.Encoder;
 
 /// <summary>A rewindable, bounded bit writer.</summary>
@@ -117,6 +119,56 @@ internal sealed class H264BitWriter : IDisposable
         Ensure(bytes.Length * 8);
         bytes.CopyTo(_buffer.AsSpan((int)(_position >> 3)));
         _position += bytes.Length * 8L;
+    }
+
+    /// <summary>Appends a run of bits copied from a buffer at any bit offset, up to 32 bits at a time.</summary>
+    /// <param name="source">The source bytes, most significant bit first.</param>
+    /// <param name="offset">The bit offset of the first bit in <paramref name="source"/>.</param>
+    /// <param name="count">The number of bits.</param>
+    public void WriteBits(ReadOnlySpan<byte> source, long offset, int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(offset + count, source.Length * 8L, nameof(count));
+        Ensure(count);
+        while (count > 0)
+        {
+            var n = Math.Min(count, 32);
+            var index = (int)(offset >> 3);
+            ulong window;
+            if (index + 8 <= source.Length)
+            {
+                window = BinaryPrimitives.ReadUInt64BigEndian(source[index..]);
+            }
+            else
+            {
+                window = 0;
+                for (var i = 0; index + i < source.Length; i++)
+                {
+                    window |= (ulong)source[index + i] << (56 - (8 * i));
+                }
+            }
+
+            // The bits after the position are zero, so the field is ORed in; at most 7 + 32 bits span the window.
+            var bits = (window << (int)(offset & 7)) >> (64 - n) << (64 - n) >> (int)(_position & 7);
+            var target = (int)(_position >> 3);
+            if (target + 8 <= _buffer.Length)
+            {
+                var span = _buffer.AsSpan(target, 8);
+                BinaryPrimitives.WriteUInt64BigEndian(span, BinaryPrimitives.ReadUInt64BigEndian(span) | bits);
+            }
+            else
+            {
+                for (var i = 0; target + i < _buffer.Length && i < 8; i++)
+                {
+                    _buffer[target + i] |= (byte)(bits >> (56 - (8 * i)));
+                }
+            }
+
+            _position += n;
+            offset += n;
+            count -= n;
+        }
     }
 
     /// <summary>Writes zero bits up to the next byte boundary.</summary>

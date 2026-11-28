@@ -8,7 +8,7 @@
 namespace RTSP.IngestService.Media.Codecs.Video.H264.Encoder;
 
 /// <summary>Residual coding and syntax writing.</summary>
-internal sealed partial class H264PictureEncoder
+internal sealed partial class H264MacroblockContext
 {
     /// <summary>The chosen intra chroma prediction mode.</summary>
     private int _chromaMode;

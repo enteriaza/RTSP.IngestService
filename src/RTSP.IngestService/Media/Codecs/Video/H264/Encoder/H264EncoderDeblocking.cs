@@ -19,33 +19,43 @@ internal static class H264EncoderDeblocking
         {
             for (var mbx = 0; mbx < picture.WidthInMbs; mbx++)
             {
-                for (var dir = 0; dir < 2; dir++)
+                FilterMacroblock(picture, mbx, mby, bs);
+            }
+        }
+    }
+
+    /// <summary>Filters the vertical, then the horizontal edges of one macroblock. The left and top edges also write samples of the left and top neighbours, so a macroblock may be filtered only after its left neighbour and its top-right neighbour (or top, in the last column) to give the raster-order result.</summary>
+    /// <param name="picture">The reconstructed picture.</param>
+    /// <param name="mbx">Macroblock column.</param>
+    /// <param name="mby">Macroblock row.</param>
+    /// <param name="bs">Scratch for 16 bS values.</param>
+    public static void FilterMacroblock(H264EncoderPicture picture, int mbx, int mby, Span<int> bs)
+    {
+        for (var dir = 0; dir < 2; dir++)
+        {
+            for (var edge = 0; edge < 4; edge++)
+            {
+                if (edge == 0 && (dir == 0 ? mbx == 0 : mby == 0))
                 {
-                    for (var edge = 0; edge < 4; edge++)
-                    {
-                        if (edge == 0 && (dir == 0 ? mbx == 0 : mby == 0))
-                        {
-                            continue;
-                        }
+                    continue;
+                }
 
-                        var any = false;
-                        for (var k = 0; k < 4; k++)
-                        {
-                            bs[k] = Strength(picture, mbx, mby, dir, edge, k);
-                            any |= bs[k] != 0;
-                        }
+                var any = false;
+                for (var k = 0; k < 4; k++)
+                {
+                    bs[k] = Strength(picture, mbx, mby, dir, edge, k);
+                    any |= bs[k] != 0;
+                }
 
-                        if (!any)
-                        {
-                            continue;
-                        }
+                if (!any)
+                {
+                    continue;
+                }
 
-                        FilterLuma(picture, mbx, mby, dir, edge, bs);
-                        if ((edge & 1) == 0)
-                        {
-                            FilterChroma(picture, mbx, mby, dir, edge / 2, bs);
-                        }
-                    }
+                FilterLuma(picture, mbx, mby, dir, edge, bs);
+                if ((edge & 1) == 0)
+                {
+                    FilterChroma(picture, mbx, mby, dir, edge / 2, bs);
                 }
             }
         }

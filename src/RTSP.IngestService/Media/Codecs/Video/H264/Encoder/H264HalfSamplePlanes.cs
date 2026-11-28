@@ -2,7 +2,8 @@
 // right of each sample, h (8-242) below it and j (8-243 to 8-245) diagonally, with reference samples outside the
 // picture clamped to the edge (8-228, 8-229). A quarter sample averages two of these or a full sample (Table 8-12).
 // A block whose samples, and the samples one to the right of and below them, lie inside the picture reads only
-// values that equal H264InterPrediction.Luma's; other blocks are left to it.
+// values that equal H264InterPrediction.Luma's; other blocks are left to it. The output rows are independent, so the
+// planes may also be computed in disjoint bands of rows, concurrently, with the same result.
 
 namespace RTSP.IngestService.Media.Codecs.Video.H264.Encoder;
 
@@ -52,29 +53,58 @@ internal sealed class H264HalfSamplePlanes
     /// <returns>The byte count.</returns>
     public static long ByteCount(int width, int height) => (3L * width * height) + (6L * 4 * width);
 
+    /// <summary>Gets the b, h and j planes, for comparison in tests.</summary>
+    public (byte[] B, byte[] H, byte[] J) Planes => (_b, _h, _j);
+
     /// <summary>Computes the planes of a reference unless they are already of it.</summary>
     /// <param name="reference">The reference picture, at the planes' size.</param>
     public void Prepare(H264EncoderPicture reference)
     {
-        if (reference.Id == _id || reference.Width != _width || reference.Height != _height)
+        if (!NeedsPrepare(reference))
         {
             return;
         }
 
-        var g = reference.Luma;
+        PrepareRows(reference.Luma, 0, _height, _sums);
+        Complete(reference);
+    }
+
+    /// <summary>Returns whether the planes must be computed for a reference: they are of another picture and it has the planes' size.</summary>
+    /// <param name="reference">The reference picture.</param>
+    /// <returns>Whether <see cref="Prepare"/> would compute them.</returns>
+    public bool NeedsPrepare(H264EncoderPicture reference) => reference.Id != _id && reference.Width == _width && reference.Height == _height;
+
+    /// <summary>Marks the planes as of no picture while they are rewritten in bands.</summary>
+    public void Invalidate() => _id = -1;
+
+    /// <summary>Marks the planes as of a reference once every row of it is computed.</summary>
+    /// <param name="reference">The reference picture.</param>
+    public void Complete(H264EncoderPicture reference)
+    {
+        _luma = reference.Luma;
+        _id = reference.Id;
+    }
+
+    /// <summary>Computes output rows [first, end) of the planes. Each output row reads the horizontal sums of the six rows around it, so a band computes its own from five rows above its first; disjoint bands may run concurrently, each with its own sums.</summary>
+    /// <param name="g">The reference's full-sample plane.</param>
+    /// <param name="first">The first output row.</param>
+    /// <param name="end">The row after the last.</param>
+    /// <param name="sums">Six rows of horizontal sums, 6 * width ints.</param>
+    public void PrepareRows(byte[] g, int first, int end, Span<int> sums)
+    {
         int w = _width, height = _height;
 
-        // Slot (v + 6) % 6 holds the horizontal sums of row Clamp(v): rows -2 to 2 first, then row y + 3 for output row y.
-        for (var v = -2; v < 3; v++)
+        // Slot (v + 6) % 6 holds the horizontal sums of row Clamp(v): rows first - 2 to first + 2 first, then row y + 3 for output row y.
+        for (var v = first - 2; v < first + 3; v++)
         {
-            HorizontalSums(g, Math.Clamp(v, 0, height - 1), _sums.AsSpan(((v + 6) % 6) * w, w));
+            HorizontalSums(g, Math.Clamp(v, 0, height - 1), sums.Slice(((v + 6) % 6) * w, w));
         }
 
-        for (var y = 0; y < height; y++)
+        for (var y = first; y < end; y++)
         {
-            HorizontalSums(g, Math.Min(y + 3, height - 1), _sums.AsSpan(((y + 3) % 6) * w, w));
-            ReadOnlySpan<int> s0 = _sums.AsSpan(((y + 4) % 6) * w, w), s1 = _sums.AsSpan(((y + 5) % 6) * w, w), s2 = _sums.AsSpan((y % 6) * w, w);
-            ReadOnlySpan<int> s3 = _sums.AsSpan(((y + 1) % 6) * w, w), s4 = _sums.AsSpan(((y + 2) % 6) * w, w), s5 = _sums.AsSpan(((y + 3) % 6) * w, w);
+            HorizontalSums(g, Math.Min(y + 3, height - 1), sums.Slice(((y + 3) % 6) * w, w));
+            ReadOnlySpan<int> s0 = sums.Slice(((y + 4) % 6) * w, w), s1 = sums.Slice(((y + 5) % 6) * w, w), s2 = sums.Slice((y % 6) * w, w);
+            ReadOnlySpan<int> s3 = sums.Slice(((y + 1) % 6) * w, w), s4 = sums.Slice(((y + 2) % 6) * w, w), s5 = sums.Slice(((y + 3) % 6) * w, w);
             ReadOnlySpan<byte> g0 = Row(g, y - 2), g1 = Row(g, y - 1), g2 = Row(g, y), g3 = Row(g, y + 1), g4 = Row(g, y + 2), g5 = Row(g, y + 3);
             Span<byte> b = _b.AsSpan(y * w, w), h = _h.AsSpan(y * w, w), j = _j.AsSpan(y * w, w);
             for (var x = 0; x < w; x++)
@@ -84,10 +114,12 @@ internal sealed class H264HalfSamplePlanes
                 j[x] = Clip((s0[x] - (5 * s1[x]) + (20 * s2[x]) + (20 * s3[x]) - (5 * s4[x]) + s5[x] + 512) >> 10);
             }
         }
-
-        _luma = g;
-        _id = reference.Id;
     }
+
+    /// <summary>Returns the ints <see cref="PrepareRows"/> needs for its sums.</summary>
+    /// <param name="width">The padded luma width.</param>
+    /// <returns>The length.</returns>
+    public static int SumsLength(int width) => 6 * width;
 
     /// <summary>Predicts a square luma block of the prepared reference when every sample it reads is inside the picture.</summary>
     /// <param name="reference">The reference picture.</param>

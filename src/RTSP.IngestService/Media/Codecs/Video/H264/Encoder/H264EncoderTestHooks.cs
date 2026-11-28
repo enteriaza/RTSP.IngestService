@@ -1,8 +1,9 @@
 // Test-only controls that make the encoder emit legal but unusual syntax, so the managed decoder's reference
 // management and slice handling can be checked against FFmpeg on streams no production encoder writes: POC types 0
 // and 1, frame_num gaps, non-reference pictures, long-term references and memory management operations, list
-// modification, forced I_PCM, arbitrary slice order and redundant slices. They are internal, reachable from no
-// configuration, and never set by production code.
+// modification, forced I_PCM, arbitrary slice order and redundant slices; and lend the encoder wavefront helper
+// threads for parallelism tests and benchmarks. They are internal, reachable from no configuration, and never set by
+// production code.
 
 namespace RTSP.IngestService.Media.Codecs.Video.H264.Encoder;
 
@@ -57,4 +58,7 @@ internal sealed class H264EncoderTestHooks
 
     /// <summary>Gets the per-picture control by picture index since the encoder was created.</summary>
     public Func<long, H264PictureControl?>? Control { get; init; }
+
+    /// <summary>Gets helper threads that code each picture as a row wavefront with the encoding thread; the caller owns and disposes them.</summary>
+    public H264WavefrontHelpers? Wavefront { get; init; }
 }

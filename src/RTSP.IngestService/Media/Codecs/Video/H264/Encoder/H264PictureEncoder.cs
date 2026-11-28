@@ -1,9 +1,12 @@
-// Codes one picture: slice headers (7.3.3) and, per macroblock, the mode decision, prediction, transform,
-// quantisation, reconstruction and CAVLC syntax, then the deblocking filter over the finished reconstruction.
-// Mode decision compares SATD plus lambda-weighted header bits of P_Skip, P_L0_16x16, P_8x8 (four 8x8 partitions),
-// Intra_16x16 and Intra_4x4; a macroblock whose coded size would exceed 3200 bits is replaced by I_PCM so every
-// macroblock and therefore every picture has a hard size bound. All scratch is per encoder; nothing is allocated
-// per macroblock.
+// Codes one picture: prepares the half-sample planes of the first reference, codes every macroblock in raster order
+// through the macroblock context into per-macroblock records, serialises each slice (slice header (7.3.3), then
+// slice_data() from the records), then runs the deblocking filter over the finished reconstruction. A macroblock
+// whose coded size would exceed 3200 bits is replaced by I_PCM so every macroblock and therefore every picture has a
+// hard size bound. All scratch is per encoder; nothing is allocated per picture or macroblock. Given helper threads
+// (tests and benchmarks only), the same passes run as a row wavefront (H264WavefrontJob) with one context per worker;
+// the serialiser still writes every slice alone, in raster order, so the output is identical.
+
+using System.Diagnostics;
 
 namespace RTSP.IngestService.Media.Codecs.Video.H264.Encoder;
 
@@ -80,104 +83,89 @@ internal struct H264PictureCounters
     public long Satd;
 }
 
+/// <summary>The duration of each pass of the last coded picture, in Stopwatch ticks, as seen by the encoding thread.</summary>
+/// <param name="Prepare">The half-sample planes.</param>
+/// <param name="Code">The macroblocks.</param>
+/// <param name="Serialise">The slices.</param>
+/// <param name="Deblock">The deblocking filter; in a wavefront picture it starts with the serialiser, which it overlaps.</param>
+internal readonly record struct H264PictureTimings(long Prepare, long Code, long Serialise, long Deblock);
+
 /// <summary>Codes pictures into slice RBSPs.</summary>
-internal sealed partial class H264PictureEncoder
+internal sealed class H264PictureEncoder
 {
     /// <summary>The macroblock size bound: 128 + RawMbBits for 8-bit 4:2:0 (A.3.1).</summary>
     public const int MaxMbBits = 3200;
 
-    /// <summary>Raster 4x4 block index by luma4x4BlkIdx.</summary>
-    private static readonly byte[] BlkRaster = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
-
     /// <summary>The sequence layout.</summary>
     private readonly H264SequenceLayout _layout;
 
-    /// <summary>The integer motion search range.</summary>
-    private readonly int _searchRange;
+    /// <summary>The half-sample planes of the first reference, for quarter-sample refinement.</summary>
+    private readonly H264HalfSamplePlanes _halfSamples;
 
-    /// <summary>Source luma of the macroblock.</summary>
-    private readonly byte[] _srcY = new byte[256];
+    /// <summary>The records of the picture being coded.</summary>
+    private readonly H264MacroblockRecords _records;
 
-    /// <summary>Source chroma of the macroblock: 64 Cb then 64 Cr.</summary>
-    private readonly byte[] _srcC = new byte[128];
+    /// <summary>The macroblock context of the encoding thread.</summary>
+    private readonly H264MacroblockContext _context;
 
-    /// <summary>Inter luma prediction.</summary>
-    private readonly byte[] _predY = new byte[256];
+    /// <summary>The helper threads, or null for serial coding.</summary>
+    private readonly H264WavefrontHelpers? _helpers;
 
-    /// <summary>Inter chroma prediction: 64 Cb then 64 Cr.</summary>
-    private readonly byte[] _predC = new byte[128];
+    /// <summary>The contexts of the encoding thread and every helper; null for serial coding.</summary>
+    private readonly H264MacroblockContext[]? _contexts;
 
-    /// <summary>Best inter luma prediction kept while other modes are tried.</summary>
-    private readonly byte[] _bestPredY = new byte[256];
-
-    /// <summary>Luma levels in scan order by raster block, 16 per block.</summary>
-    private readonly int[] _luma = new int[256];
-
-    /// <summary>Intra16x16 DC levels in scan order.</summary>
-    private readonly int[] _lumaDc = new int[16];
-
-    /// <summary>Chroma DC levels, raster, 4 per component.</summary>
-    private readonly int[] _chromaDc = new int[8];
-
-    /// <summary>Chroma AC levels in scan order (positions 1 to 15), 15 per block, 4 blocks per component.</summary>
-    private readonly int[] _chromaAc = new int[120];
-
-    /// <summary>Intra4x4 modes chosen for the macroblock by raster block.</summary>
-    private readonly sbyte[] _modes = new sbyte[16];
-
-    /// <summary>The partition motion of the macroblock: x, y and reference index per 8x8 partition.</summary>
-    private readonly int[] _partition = new int[12];
-
-    /// <summary>The motion vector predictor of each 8x8 partition (x, y), for the mvd syntax.</summary>
-    private readonly int[] _partitionMvp = new int[8];
-
-    /// <summary>The picture being coded.</summary>
-    private H264EncoderPicture _pic = null!;
-
-    /// <summary>The source frame.</summary>
-    private VideoFrame _source = null!;
-
-    /// <summary>The reference list of the picture; null entries are non-existing frames.</summary>
-    private H264EncoderPicture?[] _refs = [];
-
-    /// <summary>The picture header.</summary>
-    private H264PictureHeader _header = null!;
-
-    /// <summary>The macroblock column.</summary>
-    private int _mbx;
-
-    /// <summary>The macroblock row.</summary>
-    private int _mby;
-
-    /// <summary>The macroblock address.</summary>
-    private int _mbAddr;
-
-    /// <summary>The slice index.</summary>
-    private int _slice;
-
-    /// <summary>The picture QP.</summary>
-    private int _qp;
-
-    /// <summary>sqrt(lambda) * 256 at the picture QP.</summary>
-    private int _lambda;
-
-    /// <summary>The pending mb_skip_run.</summary>
-    private int _skipRun;
-
-    /// <summary>Raster blocks of the current macroblock whose motion is already decided.</summary>
-    private int _doneBlocks;
-
-    /// <summary>The counters of the picture.</summary>
-    private H264PictureCounters _counters;
+    /// <summary>The wavefront state; null for serial coding.</summary>
+    private readonly H264WavefrontJob? _job;
 
     /// <summary>Initializes a new instance of the <see cref="H264PictureEncoder"/> class.</summary>
     /// <param name="layout">The sequence layout.</param>
     /// <param name="searchRange">The motion search range.</param>
-    public H264PictureEncoder(H264SequenceLayout layout, int searchRange)
+    /// <param name="maxPayloadBytes">The bound of the macroblock records' payload: the access-unit RBSP bound.</param>
+    /// <param name="helpers">Helper threads for a row wavefront (tests and benchmarks); null or none selects serial coding.</param>
+    public H264PictureEncoder(H264SequenceLayout layout, int searchRange, int maxPayloadBytes, H264WavefrontHelpers? helpers = null)
     {
         _layout = layout;
-        _searchRange = searchRange;
         _halfSamples = new H264HalfSamplePlanes(layout.WidthInMbs * 16, layout.HeightInMbs * 16);
+        if (helpers is null || helpers.Count == 0)
+        {
+            _records = new H264MacroblockRecords(layout.Macroblocks, maxPayloadBytes);
+            _context = new H264MacroblockContext(layout, searchRange, _halfSamples);
+            return;
+        }
+
+        var workers = 1 + helpers.Count;
+        _helpers = helpers;
+        _records = new H264MacroblockRecords(layout.Macroblocks, maxPayloadBytes, workers);
+        _contexts = new H264MacroblockContext[workers];
+        for (var i = 0; i < workers; i++)
+        {
+            _contexts[i] = new H264MacroblockContext(layout, searchRange, _halfSamples, i, bandSums: true);
+        }
+
+        _context = _contexts[0];
+        _job = new H264WavefrontJob(layout, _halfSamples, _records, _contexts, helpers);
+    }
+
+    /// <summary>Gets the pass durations of the last coded picture.</summary>
+    public H264PictureTimings LastTimings { get; private set; }
+
+    /// <summary>Gets the wavefront state of the last coded picture, or null for serial coding.</summary>
+    public H264WavefrontJob? Wavefront => _job;
+
+    /// <summary>Returns the bytes the picture encoder holds beyond the planes: records, contexts and wavefront state.</summary>
+    /// <param name="layout">The sequence layout.</param>
+    /// <param name="maxPayloadBytes">The bound of each records payload.</param>
+    /// <param name="helpers">The helper count; 0 for serial coding.</param>
+    /// <returns>The bytes.</returns>
+    public static long ByteCount(H264SequenceLayout layout, int maxPayloadBytes, int helpers)
+    {
+        var bytes = H264MacroblockRecords.ByteCount(layout.Macroblocks, maxPayloadBytes, 1 + helpers);
+        if (helpers > 0)
+        {
+            bytes += (helpers * (long)H264MacroblockContext.ScratchBytes) + ((1L + helpers) * 4 * H264HalfSamplePlanes.SumsLength(layout.WidthInMbs * 16)) + H264WavefrontJob.ByteCount(layout, 1 + helpers);
+        }
+
+        return bytes;
     }
 
     /// <summary>Codes a picture into one RBSP per slice and deblocks the reconstruction.</summary>
@@ -192,50 +180,137 @@ internal sealed partial class H264PictureEncoder
     /// <returns>The picture counters.</returns>
     public H264PictureCounters Encode(VideoFrame source, H264EncoderPicture picture, H264EncoderPicture?[] references, H264PictureHeader header, ReadOnlySpan<int> slices, H264BitWriter writer, List<int> sliceEnds, CancellationToken cancellationToken)
     {
-        _source = source;
-        _pic = picture;
-        _refs = references;
-        _header = header;
-        _qp = header.Qp;
-        _lambda = H264EncoderTables.Lambda256[_qp];
-        _counters = default;
-        for (_slice = 0; _slice < slices.Length - 1; _slice++)
+        // Only P macroblocks that are not P_Skip refine against the first reference; a forced-skip picture has none.
+        var ref0 = !header.IsIntra && !header.ForceSkip && references.Length > 0 ? references[0] : null;
+        if (_job is not null)
         {
-            var firstMb = slices[_slice] * _layout.WidthInMbs;
-            var endMb = slices[_slice + 1] * _layout.WidthInMbs;
-            WriteSliceHeader(writer, firstMb);
-            _skipRun = 0;
-            for (_mbAddr = firstMb; _mbAddr < endMb; _mbAddr++)
+            return EncodeWavefront(source, picture, references, ref0, header, slices, writer, sliceEnds, cancellationToken);
+        }
+
+        var started = Stopwatch.GetTimestamp();
+        if (ref0 is not null)
+        {
+            _halfSamples.Prepare(ref0);
+        }
+
+        var prepared = Stopwatch.GetTimestamp();
+        var width = _layout.WidthInMbs;
+        _records.Clear();
+        _context.BeginPicture(source, picture, references, header);
+        for (var slice = 0; slice < slices.Length - 1; slice++)
+        {
+            _context.BeginSlice(slice);
+            for (var mbAddr = slices[slice] * width; mbAddr < slices[slice + 1] * width; mbAddr++)
             {
-                _mbx = _mbAddr % _layout.WidthInMbs;
-                _mby = _mbAddr / _layout.WidthInMbs;
-                if (_mbx == 0)
+                if (mbAddr % width == 0)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                 }
 
-                EncodeMacroblock(writer);
+                _context.Encode(mbAddr, _records);
             }
+        }
 
-            if (_skipRun > 0)
+        var coded = Stopwatch.GetTimestamp();
+        WriteSlices(header, slices, writer, sliceEnds);
+        var serialised = Stopwatch.GetTimestamp();
+        H264EncoderDeblocking.Filter(picture);
+        LastTimings = new H264PictureTimings(prepared - started, coded - prepared, serialised - coded, Stopwatch.GetTimestamp() - serialised);
+        return _context.Counters;
+    }
+
+    /// <summary>Codes a picture as a row wavefront with the helpers; the output equals <see cref="Encode"/>'s serial path.</summary>
+    /// <param name="source">The source frame.</param>
+    /// <param name="picture">Receives the reconstruction and coding state.</param>
+    /// <param name="references">The list 0 references.</param>
+    /// <param name="ref0">The reference whose half-sample planes the picture needs, or null.</param>
+    /// <param name="header">The picture header.</param>
+    /// <param name="slices">The slice start rows, then the row count.</param>
+    /// <param name="writer">Receives the slice RBSPs.</param>
+    /// <param name="sliceEnds">Receives the byte offset after each slice.</param>
+    /// <param name="cancellationToken">Observed at row claims and while waiting.</param>
+    /// <returns>The picture counters.</returns>
+    private H264PictureCounters EncodeWavefront(VideoFrame source, H264EncoderPicture picture, H264EncoderPicture?[] references, H264EncoderPicture? ref0, H264PictureHeader header, ReadOnlySpan<int> slices, H264BitWriter writer, List<int> sliceEnds, CancellationToken cancellationToken)
+    {
+        var job = _job!;
+        var contexts = _contexts!;
+        _records.Clear();
+        foreach (var context in contexts)
+        {
+            context.BeginPicture(source, picture, references, header);
+        }
+
+        job.Begin(picture, ref0, slices, cancellationToken);
+        job.Open();
+        var published = _helpers!.TryPublish(job);
+        long started = job.Started, coded = 0, serialised = 0, deblocked = 0;
+        try
+        {
+            if (job.Code())
             {
-                writer.WriteUe(_skipRun);
+                coded = Stopwatch.GetTimestamp();
+                job.OpenDeblocking();
+                WriteSlices(header, slices, writer, sliceEnds);
+                serialised = Stopwatch.GetTimestamp();
+                if (job.Deblock())
+                {
+                    deblocked = Stopwatch.GetTimestamp();
+                }
             }
+        }
+        catch (Exception e)
+        {
+            job.Fail(e);
+        }
+        finally
+        {
+            job.Close();
+            if (published)
+            {
+                _helpers.Withdraw(job);
+            }
+        }
 
+        job.Complete();
+        var prepare = job.Workers[0].PrepareTicks;
+        LastTimings = new H264PictureTimings(prepare, coded - started - prepare, serialised - coded, deblocked - coded);
+        var counters = default(H264PictureCounters);
+        foreach (var context in contexts)
+        {
+            var c = context.Counters;
+            counters.Intra += c.Intra;
+            counters.Skip += c.Skip;
+            counters.Pcm += c.Pcm;
+            counters.Satd += c.Satd;
+        }
+
+        return counters;
+    }
+
+    /// <summary>Writes every slice of the picture from the records.</summary>
+    /// <param name="header">The picture header.</param>
+    /// <param name="slices">The slice start rows, then the row count.</param>
+    /// <param name="writer">Receives the slice RBSPs.</param>
+    /// <param name="sliceEnds">Receives the byte offset after each slice.</param>
+    private void WriteSlices(H264PictureHeader header, ReadOnlySpan<int> slices, H264BitWriter writer, List<int> sliceEnds)
+    {
+        var width = _layout.WidthInMbs;
+        for (var slice = 0; slice < slices.Length - 1; slice++)
+        {
+            var firstMb = slices[slice] * width;
+            WriteSliceHeader(writer, header, firstMb);
+            _records.WriteSliceData(writer, firstMb, slices[slice + 1] * width, header.IsIntra);
             writer.WriteTrailingBits();
             sliceEnds.Add((int)(writer.Position >> 3));
         }
-
-        H264EncoderDeblocking.Filter(picture);
-        return _counters;
     }
 
     /// <summary>Writes slice_header() (7.3.3) for a slice starting at a macroblock.</summary>
     /// <param name="w">The writer.</param>
+    /// <param name="h">The picture header.</param>
     /// <param name="firstMb">first_mb_in_slice.</param>
-    private void WriteSliceHeader(H264BitWriter w, int firstMb)
+    private void WriteSliceHeader(H264BitWriter w, H264PictureHeader h, int firstMb)
     {
-        var h = _header;
         w.WriteUe(firstMb);
         w.WriteUe(h.IsIntra ? 7 : 5);
         w.WriteUe(0);
@@ -314,173 +389,9 @@ internal sealed partial class H264PictureEncoder
             }
         }
 
-        w.WriteSe(_qp - 26);
+        w.WriteSe(h.Qp - 26);
         w.WriteUe(0);
         w.WriteSe(0);
         w.WriteSe(0);
-    }
-
-    /// <summary>Chooses, codes and writes one macroblock.</summary>
-    /// <param name="w">The writer.</param>
-    private void EncodeMacroblock(H264BitWriter w)
-    {
-        LoadSource();
-        _pic.Slice[_mbAddr] = (short)_slice;
-        _doneBlocks = 0;
-        var forcePcm = _header.ForcePcm?.Invoke(_mbAddr) == true;
-        var cost = 0;
-        var mode = forcePcm ? MbChoice.Pcm : _header.IsIntra ? ChooseIntra(int.MaxValue, out cost) : ChooseInter(out cost);
-        _counters.Satd += cost;
-        if (mode == MbChoice.Skip)
-        {
-            _skipRun++;
-            _counters.Skip++;
-            return;
-        }
-
-        if (!_header.IsIntra)
-        {
-            w.WriteUe(_skipRun);
-            _skipRun = 0;
-        }
-
-        var start = w.Position;
-        if (mode != MbChoice.Pcm)
-        {
-            WriteMacroblock(w, mode);
-            if (w.Position - start <= MaxMbBits)
-            {
-                if (mode != MbChoice.Inter)
-                {
-                    _counters.Intra++;
-                }
-
-                return;
-            }
-
-            w.Rewind(start);
-        }
-
-        WritePcm(w);
-        _counters.Intra++;
-        _counters.Pcm++;
-    }
-
-    /// <summary>Copies the macroblock's source samples, replicating the frame edge into the padding.</summary>
-    private void LoadSource()
-    {
-        int width = _source.Width, height = _source.Height;
-        var y = _source.GetPlane(0);
-        for (var j = 0; j < 16; j++)
-        {
-            var row = Math.Min((_mby * 16) + j, height - 1) * width;
-            for (var i = 0; i < 16; i++)
-            {
-                _srcY[(j * 16) + i] = y[row + Math.Min((_mbx * 16) + i, width - 1)];
-            }
-        }
-
-        int cw = width / 2, ch = height / 2;
-        for (var c = 0; c < 2; c++)
-        {
-            var plane = _source.GetPlane(c + 1);
-            for (var j = 0; j < 8; j++)
-            {
-                var row = Math.Min((_mby * 8) + j, ch - 1) * cw;
-                for (var i = 0; i < 8; i++)
-                {
-                    _srcC[(c * 64) + (j * 8) + i] = plane[row + Math.Min((_mbx * 8) + i, cw - 1)];
-                }
-            }
-        }
-    }
-
-    /// <summary>Writes an I_PCM macroblock and makes its reconstruction the source samples.</summary>
-    /// <param name="w">The writer.</param>
-    private void WritePcm(H264BitWriter w)
-    {
-        w.WriteUe(_header.IsIntra ? 25 : 30);
-        w.AlignZero();
-        w.WriteBytes(_srcY);
-        w.WriteBytes(_srcC);
-        StoreSamples(_srcY, _srcC);
-        SetIntraState(H264MbKind.Pcm);
-        _pic.Qp[_mbAddr] = 0;
-        _pic.TotalCoeff.AsSpan(_mbAddr * 16, 16).Fill(16);
-        _pic.ChromaCoeff.AsSpan(_mbAddr * 8, 8).Fill(16);
-    }
-
-    /// <summary>Writes samples into the macroblock of the reconstruction.</summary>
-    /// <param name="luma">256 luma samples.</param>
-    /// <param name="chroma">64 Cb then 64 Cr samples.</param>
-    private void StoreSamples(ReadOnlySpan<byte> luma, ReadOnlySpan<byte> chroma)
-    {
-        var stride = _pic.Width;
-        for (var j = 0; j < 16; j++)
-        {
-            luma.Slice(j * 16, 16).CopyTo(_pic.Luma.AsSpan((((_mby * 16) + j) * stride) + (_mbx * 16), 16));
-        }
-
-        var cs = stride / 2;
-        for (var j = 0; j < 8; j++)
-        {
-            chroma.Slice(j * 8, 8).CopyTo(_pic.Cb.AsSpan((((_mby * 8) + j) * cs) + (_mbx * 8), 8));
-            chroma.Slice(64 + (j * 8), 8).CopyTo(_pic.Cr.AsSpan((((_mby * 8) + j) * cs) + (_mbx * 8), 8));
-        }
-    }
-
-    /// <summary>Records an intra macroblock's neighbour state: no motion, reference -1.</summary>
-    /// <param name="kind">The kind.</param>
-    private void SetIntraState(H264MbKind kind)
-    {
-        _pic.Kind[_mbAddr] = kind;
-        for (var b = 0; b < 16; b++)
-        {
-            var index = _pic.Block(_mbx, _mby, b & 3, b >> 2);
-            _pic.Mv[2 * index] = 0;
-            _pic.Mv[(2 * index) + 1] = 0;
-            _pic.RefIdx[index] = -1;
-            _pic.RefId[index] = -1;
-            _pic.IntraModes[(_mbAddr * 16) + b] = kind == H264MbKind.Intra4x4 ? _modes[b] : (sbyte)-1;
-        }
-    }
-
-    /// <summary>Converts a lambda-weighted bit count into cost units.</summary>
-    /// <param name="bits">The bits.</param>
-    /// <returns>The cost.</returns>
-    private int BitCost(int bits) => (int)(((long)_lambda * bits) + 128 >> 8);
-
-    /// <summary>Returns whether a macroblock is available to the current one (6.4.8): inside the picture, already coded and in the same slice.</summary>
-    /// <param name="mbx">Column.</param>
-    /// <param name="mby">Row.</param>
-    /// <returns>Whether it is available.</returns>
-    private bool MbAvailable(int mbx, int mby)
-    {
-        if (mbx < 0 || mby < 0 || mbx >= _layout.WidthInMbs || mby >= _layout.HeightInMbs)
-        {
-            return false;
-        }
-
-        var addr = (mby * _layout.WidthInMbs) + mbx;
-        return addr < _mbAddr && _pic.Slice[addr] == _slice;
-    }
-
-    /// <summary>What a macroblock is coded as.</summary>
-    private enum MbChoice
-    {
-        /// <summary>P_Skip.</summary>
-        Skip,
-
-        /// <summary>P_L0_16x16 or P_8x8; the partition state holds the motion.</summary>
-        Inter,
-
-        /// <summary>Intra_16x16.</summary>
-        Intra16x16,
-
-        /// <summary>Intra_4x4.</summary>
-        Intra4x4,
-
-        /// <summary>I_PCM.</summary>
-        Pcm,
     }
 }
