@@ -1,18 +1,26 @@
 # RTSP.IngestService — Proven Performance and Capacity
 
 This document records the performance that RTSP.IngestService has demonstrated, the limits its current implementation
-enforces, and what has not yet been demonstrated. Every measured figure comes from the Phase 1 performance remediation
-programme (November 2026). Targets, estimates and planning values are labelled as such and are not benchmark results.
+enforces, and what has not yet been demonstrated. The measured figures come from two programmes with different
+workloads and methodology. The pass-through ingest figures come from the Phase 1 performance remediation programme
+(November 2026). The figures in [Managed transcoding pipeline](#managed-transcoding-pipeline) come from Phase 6,
+Managed Pipeline Performance and Capacity Engineering (November 2026). Targets, estimates and planning values are
+labelled as such and are not benchmark results.
 
-Source of the measurements: the Phase 1 remediation report and its raw evidence under
+Source of the Phase 1 measurements: the Phase 1 remediation report and its raw evidence under
 `.artifacts/performance/remediation/` (gitignored, local to the benchmark host). Section references such as "report §5"
 point into that report.
 
 ## Overview
 
 RTSP.IngestService is an ingest and HLS origin service. It accepts live H.264/AAC publications, packages them into
-fragmented-MP4 HLS in memory without decoding or re-encoding, retains a bounded window of segments, and serves the
-playlists and segments from one built-in HTTP origin (Kestrel). See [docs/architecture.md](docs/architecture.md).
+fragmented-MP4 HLS in memory, retains a bounded window of segments, and serves the playlists and segments from one
+built-in HTTP origin (Kestrel). See [docs/architecture.md](docs/architecture.md).
+
+When Phase 1 was measured, the service was pass-through: it packaged the publisher's encoded media without decoding
+or re-encoding it, and all Phase 1 results describe that workload. The service has since added managed transcoding,
+which re-encodes every publish to canonical H.264 and AAC in managed code before packaging. Its performance is
+described in [Managed transcoding pipeline](#managed-transcoding-pipeline).
 
 **Ingest protocol.** Despite the service name, the only ingest protocol implemented today is **RTMP** (default port
 1935). There is no RTSP protocol implementation in `src/`. Every connection and ingest result in this document is an
@@ -302,6 +310,108 @@ Results:
   such budget.
 - **Without slow readers.** In the 30-minute soak, CTRL+C under active HTTP, idle and churn load exited with code 0
   in 539 ms.
+
+## Managed transcoding pipeline
+
+The figures in this section come from Phase 6, Managed Pipeline Performance and Capacity Engineering (November 2026).
+Source of the measurements: the Phase 6 report, `.artifacts/performance/managed-pipeline-phase-6-report.md`, and its
+raw evidence under `.artifacts/performance/phase-6/` (gitignored, local to the benchmark host). Section references
+such as "Phase 6 report §8" point into that report.
+
+### Pass-through and managed transcoding are different workloads
+
+The Phase 1 figures earlier in this document measure **pass-through ingest**: the service relays the publisher's
+encoded H.264/AAC media into HLS without decoding or re-encoding it, and the limits are network, packaging, storage
+and memory. **Managed transcoding** decodes and re-encodes every picture (H.264 decode, colour conversion, H.264
+encode) and processes the audio (AAC decode, downmix, resample, encode) in managed code on the CPU, so per-session
+CPU, not bandwidth, limits ingest.
+
+The Phase 1 results remain valid for pass-through ingest. They must not be read as managed-transcoding capacity.
+For example, 10.64 Gbps of ingest or 1,000 publishing streams says nothing about how many streams can be transcoded.
+
+### Benchmark environment
+
+| Item | Value |
+|---|---|
+| Host | The same single workstation as Phase 1: Intel Core i9-12900KF, 8 P-cores (logical 0–15) and 8 E-cores (logical 16–23), 24 logical processors, base 3.2 GHz; 31.8 GiB RAM |
+| OS | Windows 11 Enterprise 10.0.26200, High performance power plan |
+| Runtime | .NET 10 (SDK 10.0.404, runtime 10.0.15), **Windows Native AOT**, Release, win-x64; default instruction set (x86-64-v2, no AVX2) |
+| GC | Default (workstation, concurrent); no GC settings changed |
+| Network path | **Loopback (127.0.0.1)**; the publishers ran on the same host as the service |
+| Encoder configuration | CAVLC High profile, P-frames only, 1 reference, constant quality QP 22, peak 8,000 kbit/s, VBV 2×, IDR every 4 s, search range 16, 1 slice |
+| Service configuration | Raised within the valid ranges for the benchmark, including `Transcoding:MaxConcurrentSessions=256` (default 16) |
+
+Builds compared:
+- **before**: commit `08ff492`, prior to the Phase 6 optimisations.
+- **after**: commit `3b09a9f`, the Phase 6 encoder motion-search optimisations. The encoded bitstream is bit-identical to the before
+  build for every test clip, so output quality is unchanged.
+
+### Per-session real-time performance
+
+Single session, one process pinned to one P-core, Windows Native AOT; mean of 3 runs per build. The margin is the
+frame interval divided by the mean time to decode, colour-convert and encode one picture. A margin above 1 means the
+session keeps up with the source in real time. The colour conversion was the BT.709 identity path for these clips.
+
+| Source | before | after | Result (after) |
+|---|---:|---:|---|
+| 240p25 | 2.97 | 5.10 | Demonstrated |
+| 480p30 | 0.98 | 1.73 | Demonstrated |
+| 720p30-clean | 0.44 | 0.72 | Not demonstrated |
+| 720p30 | 0.39 | 0.66 | Not demonstrated: the first resolution and rate that fails real time |
+| 720p60 | 0.21 | 0.35 | Not demonstrated |
+| 1080p30 | 0.20 | 0.33 | Not demonstrated |
+| 1080p60 | 0.12 | 0.18 | Not demonstrated |
+
+Qualifications:
+- **Native AOT only.** JIT figures are reported separately in the Phase 6 report (§6) and are not shown here.
+- **One P-core.** On an E-core a session is about 1.6–1.8× slower (Phase 6 report §8).
+- **Above real time, frames are dropped.** A session whose margin is below 1 overflows its bounded source queue and
+  drops frames. Every drop is counted and logged, and other sessions are not affected (Phase 6 report §18).
+- **Colour conversion.** Sources that are not BT.709 cost much more. BT.601 conversion takes 24.6 ms per 240p
+  picture and 634 ms per 1080p picture (Phase 6 report §9).
+
+### Demonstrated publisher capacity (managed transcoding)
+
+Paced RTMP publishers with audio and video, 60 s per run, 2 runs unless noted, Windows Native AOT, on the host above.
+CPU is the service process, as a percentage of one core (24 logical processors = 2,400%). Latency is the transcoding
+latency p99.
+
+| Publishers | CPU (% of one core) | Drops | Latency p99 | Result |
+|---|---:|---:|---|---|
+| 16 × 240p25 | 432 | 0 | — | Demonstrated |
+| 24 × 240p25 | 760–798 | 0 | — | Demonstrated |
+| 32 × 240p25 | 998–1,083 | 0 | 0.19 s | Demonstrated |
+| 48 × 240p25 | 1,380–1,559 | 0 | 0.19 s | Demonstrated |
+| 64 × 240p25 | 2,161–2,225 | 0 | 0.50 s / 0.24 s | Demonstrated with limitations: CPU near saturation (measured ceiling) |
+| 8 × 480p30 | 603–607 | 0 | 0.22 s | Demonstrated |
+| 16 × 480p30 | about 1,640 | — | 1.5–1.76 s | Not demonstrated as sustained |
+| Above 64 × 240p25 or 8 × 480p30 | — | — | — | Not tested |
+
+How to read these results:
+- **Sustainable operating point versus measured ceiling.**
+  - Up to 48 × 240p25 and 8 × 480p30, every run had 0 drops and no growing queues. These are demonstrated
+    sustainable operating points on this host.
+  - 64 × 240p25 also had 0 drops, but used 90–93% of all logical processors. Latency p99 doubled in one run, and the
+    thread pool queued work (queue length up to 130). This is the measured ceiling on this host, not a sustainable
+    operating point.
+- **16 × 480p30 fell behind.** It encoded 469.9 and 478 fps of the 480 fps offered. Latency grew (p50 0.55–0.82 s),
+  and the source queues held 2.2–2.7 MiB.
+- **Before comparison.** The before build failed 48 × 240p25: 16,163 drops and latency p99 33.9 s, in 1 run.
+- **Limiting resource.** In every failing case the limit was CPU, specifically encoding. GC pause stayed at or below
+  0.62% of time, and no host throttling was observed.
+- **Memory.** The working set grows by about 10–11 MiB per 240p25 session; 64 sessions peaked at 714–723 MiB.
+- **One workstation.** These are measurements from one i9-12900KF workstation on loopback, not production capacity
+  guarantees. The results depend on the source resolution, frame rate and colour, and on how the operating system
+  schedules sessions between P-cores and E-cores. The publishers were not pinned.
+- **Default concurrency limit.** The default `Transcoding:MaxConcurrentSessions` is 16. The benchmarks raised it to
+  256 within the valid range.
+
+**Not demonstrated or not tested for managed transcoding:**
+- Real-time 720p30 or higher from a single session.
+- Real-time non-BT.709 sources above 240p.
+- Linux Native AOT capacity (Linux AOT was smoke-tested only).
+- Physical-network throughput.
+- More than 400 live HLS viewers of transcoded streams.
 
 ## Current implementation limits
 
