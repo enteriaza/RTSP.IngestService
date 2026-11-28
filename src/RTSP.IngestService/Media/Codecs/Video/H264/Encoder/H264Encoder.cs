@@ -140,8 +140,9 @@ internal sealed class H264Encoder : IDisposable
     /// <summary>Gets whether the encoder is faulted.</summary>
     public bool IsFaulted => _faulted;
 
-    /// <summary>Gets the bytes of reconstruction memory the encoder holds.</summary>
-    public long PictureBytes => (_options.MaxReferenceFrames + 1) * H264EncoderPicture.ByteCount(_layout.WidthInMbs, _layout.HeightInMbs);
+    /// <summary>Gets the bytes of reconstruction and motion-search picture memory the encoder holds.</summary>
+    public long PictureBytes =>
+        ((_options.MaxReferenceFrames + 1) * H264EncoderPicture.ByteCount(_layout.WidthInMbs, _layout.HeightInMbs)) + H264HalfSamplePlanes.ByteCount(_layout.WidthInMbs * 16, _layout.HeightInMbs * 16);
 
     /// <summary>Gets the most bytes the RBSP buffer may grow to.</summary>
     public int MaxAccessUnitBytes { get; private set; }

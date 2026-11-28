@@ -20,6 +20,9 @@ internal sealed partial class H264PictureEncoder
     /// <summary>Scratch for one predicted block.</summary>
     private readonly byte[] _block = new byte[256];
 
+    /// <summary>The half-sample planes of the first reference, for quarter-sample refinement.</summary>
+    private readonly H264HalfSamplePlanes _halfSamples;
+
     /// <summary>A neighbouring partition's motion for prediction.</summary>
     /// <param name="Available">Whether the partition is available.</param>
     /// <param name="Ref">Its reference index, -1 for intra or unavailable.</param>
@@ -49,6 +52,8 @@ internal sealed partial class H264PictureEncoder
                 cost = LumaSatd(_predY);
                 return MbChoice.Skip;
             }
+
+            _halfSamples.Prepare(ref0);
         }
 
         var best = int.MaxValue;
@@ -450,22 +455,18 @@ internal sealed partial class H264PictureEncoder
     private int SatdCost(H264EncoderPicture reference, int x0, int y0, int bx, int by, int size, int mx, int my, int pmx, int pmy)
     {
         var block = _block.AsSpan(0, size * size);
-        H264InterPrediction.Luma(reference.Luma, reference.Width, reference.Height, x0 + (mx >> 2), y0 + (my >> 2), mx & 3, my & 3, size, block);
-        Span<int> diff = stackalloc int[16];
+        int x = x0 + (mx >> 2), y = y0 + (my >> 2);
+        if (!_halfSamples.TryLuma(reference, x, y, mx & 3, my & 3, size, block))
+        {
+            H264InterPrediction.Luma(reference.Luma, reference.Width, reference.Height, x, y, mx & 3, my & 3, size, block);
+        }
+
         var satd = 0;
         for (var j0 = 0; j0 < size; j0 += 4)
         {
             for (var i0 = 0; i0 < size; i0 += 4)
             {
-                for (var j = 0; j < 4; j++)
-                {
-                    for (var i = 0; i < 4; i++)
-                    {
-                        diff[(j * 4) + i] = _srcY[(((by * 4) + j0 + j) * 16) + (bx * 4) + i0 + i] - block[((j0 + j) * size) + i0 + i];
-                    }
-                }
-
-                satd += H264EncoderTables.Satd4x4(diff);
+                satd += H264EncoderTables.Satd4x4(_srcY.AsSpan((((by * 4) + j0) * 16) + (bx * 4) + i0), 16, block[((j0 * size) + i0)..], size);
             }
         }
 
@@ -518,21 +519,11 @@ internal sealed partial class H264PictureEncoder
     /// <returns>SATD.</returns>
     private int LumaSatd(byte[] prediction)
     {
-        Span<int> diff = stackalloc int[16];
         var satd = 0;
         for (var b = 0; b < 16; b++)
         {
-            int bx = b & 3, by = b >> 2;
-            for (var j = 0; j < 4; j++)
-            {
-                for (var i = 0; i < 4; i++)
-                {
-                    var k = (((by * 4) + j) * 16) + (bx * 4) + i;
-                    diff[(j * 4) + i] = _srcY[k] - prediction[k];
-                }
-            }
-
-            satd += H264EncoderTables.Satd4x4(diff);
+            var k = ((b >> 2) * 64) + ((b & 3) * 4);
+            satd += H264EncoderTables.Satd4x4(_srcY.AsSpan(k), 16, prediction.AsSpan(k), 16);
         }
 
         return satd;

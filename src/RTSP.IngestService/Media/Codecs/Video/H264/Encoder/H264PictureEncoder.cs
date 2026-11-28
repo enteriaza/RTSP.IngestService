@@ -177,6 +177,7 @@ internal sealed partial class H264PictureEncoder
     {
         _layout = layout;
         _searchRange = searchRange;
+        _halfSamples = new H264HalfSamplePlanes(layout.WidthInMbs * 16, layout.HeightInMbs * 16);
     }
 
     /// <summary>Codes a picture into one RBSP per slice and deblocks the reconstruction.</summary>

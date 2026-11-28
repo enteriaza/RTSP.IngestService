@@ -242,7 +242,7 @@ public sealed class TranscodingSessionTests
     {
         const int MaxSampleSize = 8192;
         using var harness = new TranscodingHarness(static o => o.Video.Quantizer = 0, new MediaOptions { MaxSampleSize = MaxSampleSize });
-        var tags = ManagedVideoTestSupport.SyntheticTags(SyntheticPattern.Noise, 320, 240, 3, qp: 51);
+        var tags = ManagedVideoTestSupport.SyntheticTags(SyntheticPattern.Noise, 160, 120, 3, qp: 51);
         Assert.All(tags, static t => Assert.True(t.Body.Length < MaxSampleSize, $"source tag of {t.Body.Length} bytes"));
         var session = await harness.StartAsync();
         await harness.SendTagsAsync(session, tags);

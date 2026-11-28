@@ -6,6 +6,9 @@
 // 2003), used as its square root for SATD costs; it and the quantiser step 0.85 * 2^((QP - 12) / 6) are tabulated as
 // integers so the encoder never depends on platform floating-point library rounding.
 
+using System.Buffers.Binary;
+using System.Runtime.Intrinsics;
+
 namespace RTSP.IngestService.Media.Codecs.Video.H264.Encoder;
 
 /// <summary>Quantisation tables, cost multipliers and forward transforms.</summary>
@@ -78,17 +81,49 @@ internal static class H264EncoderTables
     /// <summary>Returns the sum of absolute Hadamard-transformed differences of a 4x4 block, halved.</summary>
     /// <param name="difference">The differences, raster order.</param>
     /// <returns>SATD.</returns>
-    public static int Satd4x4(ReadOnlySpan<int> difference)
-    {
-        Span<int> t = stackalloc int[16];
-        H264Transform.InverseHadamard4x4(difference, t);
-        var sum = 0;
-        for (var i = 0; i < 16; i++)
-        {
-            sum += Math.Abs(t[i]);
-        }
+    /// <remarks>
+    /// The sum of magnitudes does not depend on the order or sign of the transformed values, so the columns are
+    /// transformed across four row vectors and each row within its vector by pairwise butterflies.
+    /// </remarks>
+    public static int Satd4x4(ReadOnlySpan<int> difference) =>
+        Satd4x4(Vector128.Create(difference), Vector128.Create(difference[4..]), Vector128.Create(difference[8..]), Vector128.Create(difference[12..]));
 
-        return (sum + 1) >> 1;
+    /// <summary>Returns the SATD of the difference of two 4x4 sample blocks.</summary>
+    /// <param name="source">The first sample of the source block.</param>
+    /// <param name="sourceStride">The source stride.</param>
+    /// <param name="prediction">The first sample of the predicted block.</param>
+    /// <param name="predictionStride">The prediction stride.</param>
+    /// <returns>SATD of source minus prediction.</returns>
+    public static int Satd4x4(ReadOnlySpan<byte> source, int sourceStride, ReadOnlySpan<byte> prediction, int predictionStride)
+    {
+        return Satd4x4(Row(source, prediction, 0), Row(source, prediction, 1), Row(source, prediction, 2), Row(source, prediction, 3));
+
+        Vector128<int> Row(ReadOnlySpan<byte> s, ReadOnlySpan<byte> p, int j) => Widen(s[(j * sourceStride)..]) - Widen(p[(j * predictionStride)..]);
+
+        static Vector128<int> Widen(ReadOnlySpan<byte> samples) =>
+            Vector128.WidenLower(Vector128.WidenLower(Vector128.CreateScalar(BinaryPrimitives.ReadUInt32LittleEndian(samples)).AsByte())).AsInt32();
+    }
+
+    /// <summary>Returns the SATD of four rows of differences.</summary>
+    /// <param name="r0">Row 0.</param>
+    /// <param name="r1">Row 1.</param>
+    /// <param name="r2">Row 2.</param>
+    /// <param name="r3">Row 3.</param>
+    /// <returns>SATD.</returns>
+    private static int Satd4x4(Vector128<int> r0, Vector128<int> r1, Vector128<int> r2, Vector128<int> r3)
+    {
+        Vector128<int> a0 = r0 + r1, a1 = r0 - r1, a2 = r2 + r3, a3 = r2 - r3;
+        var sum = Vector128.Abs(Rows(a0 + a2)) + Vector128.Abs(Rows(a0 - a2)) + Vector128.Abs(Rows(a1 + a3)) + Vector128.Abs(Rows(a1 - a3));
+        return (Vector128.Sum(sum) + 1) >> 1;
+
+        static Vector128<int> Rows(Vector128<int> v)
+        {
+            var even = Vector128.Create(-1, 0, -1, 0);
+            var pairs = Vector128.Shuffle(v, Vector128.Create(1, 0, 3, 2));
+            var t = Vector128.ConditionalSelect(even, v + pairs, v - pairs);
+            var halves = Vector128.Shuffle(t, Vector128.Create(2, 3, 0, 1));
+            return Vector128.ConditionalSelect(Vector128.Create(-1, -1, 0, 0), t + halves, t - halves);
+        }
     }
 
     /// <summary>Returns the coefficient class of a raster position: 0 for (even, even), 1 for (odd, odd), 2 otherwise.</summary>
